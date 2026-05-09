@@ -1,0 +1,76 @@
+# ---
+# VOLLEBAK_ENGINEERING_METADATA:
+#   PROJECT_ID: PREDATOR-01
+#   TRACK: ECOSYSTEM
+#   PHASE: CHALLENGE_HUB
+#   CONTRIBUTOR_ID: Antigravity AI
+#   THE_DELTA: Dual cascaded S80 pairs (front+rear) providing 768 virtual channels for sub-degree angular resolution and micro-Doppler extraction
+#   FAILURE_MODE: Single S81 pair provided insufficient angular resolution for reliable drone lock at 300m
+#   IP_STATUS: VOLLEBAK_PROPRIETARY
+#   USER_FEEDBACK_REF: None
+#   DEPENDENCIES: [Uhnder S80 SDK, Ethernet]
+# ---
+
+# Uhnder S80 Cascaded Radar Configuration
+# Two cascade pairs: front (2×S80) + rear (2×S80) = 4 chips total
+
+radar:
+  chip_model: "Uhnder S80"
+  frequency_ghz: [76, 81]
+  architecture: "PMCW-DCM"
+  per_chip:
+    tx_channels: 12
+    rx_channels: 16
+    virtual_channels: 192
+  power_per_chip_w: 12.0
+
+arrays:
+  front:
+    name: "front_cascade"
+    chips: 2
+    virtual_channels: 384  # 2 × 192
+    coverage_deg: 180       # Forward hemisphere
+    ethernet_interface: "eth0"
+    zenoh_topic: "predator/radar/pointcloud/front"
+    mounting:
+      position: "SAPI_front"
+      azimuth_center_deg: 0.0
+
+  rear:
+    name: "rear_cascade"
+    chips: 2
+    virtual_channels: 384
+    coverage_deg: 180       # Rear hemisphere
+    ethernet_interface: "eth1"
+    zenoh_topic: "predator/radar/pointcloud/rear"
+    mounting:
+      position: "SAPI_rear"
+      azimuth_center_deg: 180.0
+
+# Combined system
+system:
+  total_chips: 4
+  total_virtual_channels: 768
+  total_power_w: 48.0
+  coverage_deg: 360
+
+# Micro-Doppler extraction
+micro_doppler:
+  stft_window_ms: 50        # STFT window for blade-rate extraction
+  stft_overlap: 0.75
+  min_blade_hz: 50          # Minimum expected blade-pass frequency
+  max_blade_hz: 500         # Maximum (small high-speed props)
+  classification_classes:
+    - "Rotary_UAS"
+    - "Fixed_Wing"
+    - "Bird"
+    - "Clutter"
+
+# Beam steering modes
+beam_steering:
+  wide_scan:
+    description: "Full FOV search using standard beamforming"
+    update_rate_hz: 10
+  narrow_track:
+    description: "Software-defined beam narrowing on confirmed target"
+    update_rate_hz: 50

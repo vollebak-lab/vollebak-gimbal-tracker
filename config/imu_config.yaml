@@ -1,0 +1,69 @@
+# ---
+# VOLLEBAK_ENGINEERING_METADATA:
+#   PROJECT_ID: PREDATOR-01
+#   TRACK: ECOSYSTEM
+#   PHASE: CHALLENGE_HUB
+#   CONTRIBUTOR_ID: Antigravity AI
+#   THE_DELTA: Centralized IMU configuration for multi-source fusion supporting DVXplorer onboard + external IMU
+#   FAILURE_MODE: N/A — initial configuration
+#   IP_STATUS: VOLLEBAK_PROPRIETARY
+#   USER_FEEDBACK_REF: None
+#   DEPENDENCIES: []
+# ---
+
+# Predator IMU Subsystem Configuration
+
+imu:
+  # External dedicated IMU (helmet-mounted, authority source)
+  external:
+    enabled: true
+    type: "BHI260AP"  # Or VectorNav VN-100 for higher grade
+    interface: "zenoh"
+    zenoh_topic: "predator/imu/state"
+    sample_rate_hz: 200
+    stale_threshold_s: 0.1
+    # Noise parameters (BHI260AP conservative estimates)
+    noise:
+      gyro_noise_density_rps_sqrthz: 0.008
+      accel_noise_density_mps2_sqrthz: 0.002
+      gyro_bias_walk: 0.0001
+      accel_bias_walk: 0.0003
+
+  # DVXplorer onboard IMUs (1 per camera, 4 total)
+  dvxplorer_onboard:
+    enabled: true
+    type: "ICM-42688"  # InvenSense, integrated in DVXplorer Micro
+    sample_rate_hz: 200
+    stale_threshold_s: 0.1
+    # These IMUs are lower grade than external but provide
+    # per-camera rigid body reference and redundancy
+
+  # Fusion parameters
+  fusion:
+    # Authority priority: external > dvxplorer[0] > dvxplorer[1] ...
+    authority: "external"
+    fallback_order: ["dvx_cam_front", "dvx_cam_right", "dvx_cam_rear", "dvx_cam_left"]
+    velocity_decay_alpha: 0.95  # Exponential decay for integrated velocity
+
+# Motion compensation
+compensation:
+  enabled: true
+  compensate_radar: true       # Apply to Layer 2 radar point clouds
+  compensate_gimbal: true      # Generate gimbal feed-forward corrections
+  compensate_neuromorphic: true # Apply to Layer 1 event timestamps
+  static_cluster_doppler_max: 0.3  # m/s — for degraded-mode ego estimation
+
+# Operator motion classification thresholds
+motion_classification:
+  stationary_speed_max_mps: 0.3   # Below this = stationary
+  walking_speed_max_mps: 2.5      # Below this = walking, above = running
+  stability_angular_rate_max_dps: 5.0  # Above this = unstable platform
+
+# Gimbal feed-forward
+gimbal_feed_forward:
+  enabled: true
+  # The gimbal PID loop runs at 200Hz in Rust.
+  # This feed-forward is computed at the IMU sample rate (~200Hz)
+  # and published to Zenoh for the Rust gimbal controller.
+  zenoh_topic: "predator/imu/gimbal_feedforward"
+  low_pass_cutoff_hz: 20.0  # Filter high-frequency vibration

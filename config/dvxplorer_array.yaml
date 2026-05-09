@@ -1,0 +1,74 @@
+# ---
+# VOLLEBAK_ENGINEERING_METADATA:
+#   PROJECT_ID: PREDATOR-01
+#   TRACK: ECOSYSTEM
+#   PHASE: CHALLENGE_HUB
+#   CONTRIBUTOR_ID: Antigravity AI
+#   THE_DELTA: 4-camera DVXplorer Micro array with per-camera azimuth offsets for 360-degree neuromorphic tripwire
+#   FAILURE_MODE: GenX320 required OpenMV bridge boards and incompatible SDK; DVXplorer Micro enables direct USB and native dv_processing compatibility
+#   IP_STATUS: VOLLEBAK_PROPRIETARY
+#   USER_FEEDBACK_REF: None
+#   DEPENDENCIES: [dv_processing, DVXplorer Micro, M12 lenses]
+# ---
+
+# DVXplorer Micro 4-Camera Array Configuration
+# Each camera provides ~55° FOV with 6mm M12 lens
+# Combined coverage: ~220° (with overlap zones)
+
+array:
+  sensor_model: "DVXplorer Micro"
+  resolution: [640, 480]  # W×H pixels
+  pixel_pitch_um: 9.0
+  dynamic_range_db: 110
+  interface: "USB 3.1"
+  event_batch_us: 10000  # 10ms batches
+
+cameras:
+  - id: 0
+    name: "cam_front"
+    usb_path: "/dev/dvxplorer0"  # Placeholder — set at deployment
+    azimuth_offset_deg: 0.0      # Forward-looking
+    elevation_offset_deg: 0.0
+    lens_focal_mm: 6.0
+    fov_h_deg: 55.0
+    enabled: true
+
+  - id: 1
+    name: "cam_right"
+    usb_path: "/dev/dvxplorer1"
+    azimuth_offset_deg: 90.0
+    elevation_offset_deg: 0.0
+    lens_focal_mm: 6.0
+    fov_h_deg: 55.0
+    enabled: true
+
+  - id: 2
+    name: "cam_rear"
+    usb_path: "/dev/dvxplorer2"
+    azimuth_offset_deg: 180.0
+    elevation_offset_deg: 0.0
+    lens_focal_mm: 6.0
+    fov_h_deg: 55.0
+    enabled: true
+
+  - id: 3
+    name: "cam_left"
+    usb_path: "/dev/dvxplorer3"
+    azimuth_offset_deg: 270.0
+    elevation_offset_deg: 0.0
+    lens_focal_mm: 6.0
+    fov_h_deg: 55.0
+    enabled: true
+
+# Voxelization parameters (from overlab-kevin defaults)
+voxelization:
+  time_bin_us: 100   # 100µs time slices for z-axis
+  batch_us: 10000    # 10ms event batches
+
+# Detection thresholds
+detection:
+  det_thresh_logit: 1.0      # Logit threshold to trigger detection
+  centre_thresh_logit: 0.0   # Logit threshold for centroid calculation
+  max_misses: 3              # Consecutive misses before tracker resets
+  crop_w: 150                # ROI width when tracking
+  crop_h: 150                # ROI height when tracking

@@ -1,0 +1,88 @@
+# ---
+# VOLLEBAK_ENGINEERING_METADATA:
+#   PROJECT_ID: PREDATOR-01
+#   TRACK: ECOSYSTEM
+#   PHASE: CHALLENGE_HUB
+#   CONTRIBUTOR_ID: Antigravity AI
+#   THE_DELTA: Silent-to-Active engagement pipeline with Thor 2-5W soft-kill laser on self-leveling gimbal
+#   FAILURE_MODE: N/A — initial configuration
+#   IP_STATUS: VOLLEBAK_PROPRIETARY
+#   USER_FEEDBACK_REF: None
+#   DEPENDENCIES: [Jetson Orin NX, Zenoh, DVXplorer Micro, Uhnder S80, Thor Dynamics laser]
+# ---
+
+# Predator System Configuration
+
+system:
+  name: "Predator"
+  version: "0.1.0"
+  compute: "Jetson Orin NX"
+  compute_memory_gb: 16  # TBD — confirm 8 or 16
+
+# Zenoh telemetry fabric
+zenoh:
+  mode: "peer"
+  connect: []  # Empty for standalone; populated for swarm
+  topics:
+    events_aggregated: "predator/events/aggregated"
+    layer1_detection: "predator/layer1/detection"
+    radar_pointcloud_front: "predator/radar/pointcloud/front"
+    radar_pointcloud_rear: "predator/radar/pointcloud/rear"
+    radar_classification: "predator/radar/classification"
+    fusion_track: "predator/fusion/track"
+    system_state: "predator/system/state"
+    engagement_command: "predator/engagement/command"
+    engagement_status: "predator/engagement/status"
+
+# State machine
+state_machine:
+  states:
+    - SILENT
+    - ALERT
+    - RADAR_ACTIVE
+    - TRACKING
+    - ENGAGEMENT
+    - BDA
+  transitions:
+    SILENT_to_ALERT:
+      trigger: "layer1_detection"
+      condition: "any camera detects propeller flicker"
+    ALERT_to_RADAR_ACTIVE:
+      trigger: "confirmed_detection"
+      condition: ">=2 consecutive detections OR >=2 cameras"
+    RADAR_ACTIVE_to_TRACKING:
+      trigger: "radar_acquisition"
+      condition: "radar acquires target, EKF initialized"
+    TRACKING_to_ENGAGEMENT:
+      trigger: "threat_score"
+      condition: "threat_score > threshold AND safety_zones_clear"
+    ENGAGEMENT_to_BDA:
+      trigger: "laser_fire"
+      condition: "fire command sent to Thor laser module"
+    BDA_to_SILENT:
+      trigger: "kill_assessment"
+      condition: "flicker_cessation OR engagement_timeout"
+
+# Safety
+safety:
+  keep_out_cone_deg: 30.0   # Cone around operator head
+  engagement_timeout_s: 10.0
+  max_engagement_range_m: 300.0
+  min_engagement_range_m: 10.0
+
+# Engagement
+engagement:
+  laser:
+    provider: "Thor Dynamics"
+    type: "soft-kill"
+    optical_power_w: [2.0, 5.0]  # Range
+    claimed_range_km: 10.0
+    interface: "GPIO/serial"  # TBD — confirm with Thor
+    mount: "robotic arm + self-leveling gimbal"
+  gimbal:
+    servo_rate_hz: 200
+    controller_language: "Rust"
+    scan_patterns:
+      - "Lissajous"
+      - "Rosette"
+      - "Raster"

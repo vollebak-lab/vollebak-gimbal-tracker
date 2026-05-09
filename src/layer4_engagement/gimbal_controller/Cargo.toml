@@ -1,0 +1,25 @@
+[package]
+name = "predator-gimbal-controller"
+version = "0.1.0"
+edition = "2021"
+description = "High-frequency PID gimbal controller for Predator C-UAS laser engagement"
+authors = ["Vollebak Engineering"]
+
+[dependencies]
+# Zenoh for pub/sub telemetry
+zenoh = { version = "1.0", features = ["unstable"] }
+# Serde for config/message serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Math
+nalgebra = "0.33"
+
+[profile.release]
+opt-level = 3
+lto = true
