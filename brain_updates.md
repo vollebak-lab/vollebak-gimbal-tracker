@@ -328,6 +328,20 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
 - **Production Deployment**:
   - Updated `/home/orin/ev_deploy/bin/ev_flicker_detector` with integrated Tier 1 Gyro Warper, Tier 2 TensorRT Dynamic Suppression Engine, and upgraded Web HUD / JSON telemetry endpoint at `http://10.0.0.34:8080/`.
 
+---
+
+### 15. Repository Synchronization & Upstream Release
+- **Target Repository**: `https://github.com/vollebak-lab/predator` (Branch: `main`)
+- **Commit Hash**: `b197dc5`
+- **Scope of Update**: 91 files (+37,477 lines, -147 lines).
+- **Core Components Synchronized**:
+  1. `ev_ingestion_cpp/`: OpenEB 5.2.0 driver integration, 4000Hz frequency DSP, continuous gyro homography warper, UZH RSS 2026 TensorRT FP16 engine, live Web HUD visualizer, unit test suites (`test_flicker_dsp`, `test_ego_motion`).
+  2. `crates/`: `predator-messages` & `predator-orchestrator` (72/72 tests passing).
+  3. `src/`: Python EKF/IMM fusion engine, JPDA association, safety interlocks (48/48 tests passing).
+  4. `models/`: PyTorch model export script for UZH RSS 2026 ConvGRU + ATC network.
+  5. `docs/` & `PSF_Engineering/`: Complete technical documentation, kill-chain latency audit, waiter mode specs, and point-spread-function engineering research.
+  6. `README.md` & `.gitignore`: Updated with system architecture and vendor package exclusions.
+
 
 
 
