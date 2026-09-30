@@ -8,7 +8,14 @@
 #include <mutex>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
 
 #include "flicker_dsp.hpp"
 
@@ -415,6 +422,149 @@ private:
 
     mutable std::mutex imu_mutex_;
     std::deque<ImuSample> imu_buffer_;
+};
+
+/**
+ * @brief High-Rate USB CDC Serial Reader for Arduino Nicla Sense ME
+ * Reads 200 Hz binary IMU packets from /dev/ttyACM0 and automatically feeds ContinuousGyroWarper
+ */
+class NiclaSerialReader {
+public:
+    explicit NiclaSerialReader(ContinuousGyroWarper& warper, std::string port = "/dev/ttyACM0", int baud = 115200)
+        : warper_(warper), port_(std::move(port)), baud_(baud) {}
+
+    ~NiclaSerialReader() {
+        stop();
+    }
+
+    bool start() {
+        if (running_.load()) return true;
+        running_.store(true);
+        thread_ = std::thread(&NiclaSerialReader::read_loop, this);
+        return true;
+    }
+
+    void stop() {
+        if (!running_.load()) return;
+        running_.store(false);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    bool is_connected() const { return connected_.load(); }
+    uint64_t packet_count() const { return packets_received_.load(); }
+
+private:
+    void read_loop() {
+        while (running_.load()) {
+            int fd = open(port_.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+            if (fd < 0) {
+                connected_.store(false);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            struct termios tty{};
+            if (tcgetattr(fd, &tty) != 0) {
+                close(fd);
+                connected_.store(false);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            cfsetospeed(&tty, B115200);
+            cfsetispeed(&tty, B115200);
+
+            tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+            tty.c_iflag &= ~IGNBRK;
+            tty.c_lflag = 0;
+            tty.c_oflag = 0;
+            tty.c_cc[VMIN]  = 1;
+            tty.c_cc[VTIME] = 1;
+
+            tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+            tty.c_cflag |= (CLOCAL | CREAD);
+            tty.c_cflag &= ~(PARENB | PARODD);
+            tty.c_cflag &= ~CSTOPB;
+            tty.c_cflag &= ~CRTSCTS;
+
+            if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+                close(fd);
+                connected_.store(false);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            connected_.store(true);
+            std::cout << "[INFO] Nicla Sense ME IMU connected on " << port_ << "\n";
+
+            uint64_t sync_offset_us = 0;
+            bool first_sync = true;
+
+            while (running_.load()) {
+                uint8_t b1 = 0;
+                if (read(fd, &b1, 1) <= 0) {
+                    break; // Error or disconnect
+                }
+
+                if (b1 == 0xAA) {
+                    uint8_t b2 = 0;
+                    if (read(fd, &b2, 1) <= 0) break;
+                    if (b2 == 0x55) {
+                        uint8_t payload[30];
+                        size_t bytes_read = 0;
+                        while (bytes_read < 30 && running_.load()) {
+                            ssize_t n = read(fd, payload + bytes_read, 30 - bytes_read);
+                            if (n <= 0) break;
+                            bytes_read += n;
+                        }
+
+                        if (bytes_read == 30) {
+                            uint32_t t_nicla_us = 0;
+                            float wx = 0, wy = 0, wz = 0;
+                            float ax = 0, ay = 0, az = 0;
+                            uint16_t chk = 0;
+
+                            std::memcpy(&t_nicla_us, payload + 0, 4);
+                            std::memcpy(&wx, payload + 4, 4);
+                            std::memcpy(&wy, payload + 8, 4);
+                            std::memcpy(&wz, payload + 12, 4);
+                            std::memcpy(&ax, payload + 16, 4);
+                            std::memcpy(&ay, payload + 20, 4);
+                            std::memcpy(&az, payload + 24, 4);
+                            std::memcpy(&chk, payload + 28, 2);
+
+                            uint64_t host_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+
+                            if (first_sync) {
+                                sync_offset_us = host_now_us - t_nicla_us;
+                                first_sync = false;
+                            }
+
+                            uint64_t syncd_timestamp_us = t_nicla_us + sync_offset_us;
+                            warper_.ingest_imu_raw(syncd_timestamp_us, wx, wy, wz, ax, ay, az);
+                            packets_received_++;
+                        }
+                    }
+                }
+            }
+
+            close(fd);
+            connected_.store(false);
+            std::cout << "[WARN] Nicla Sense ME IMU disconnected. Retrying in 500ms...\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+
+    ContinuousGyroWarper& warper_;
+    std::string port_;
+    int baud_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> connected_{false};
+    std::atomic<uint64_t> packets_received_{0};
+    std::thread thread_;
 };
 
 } // namespace predator

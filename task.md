@@ -53,3 +53,11 @@
   - [x] Benchmark end-to-end latency ($14.0\text{ ms}$ TensorRT GPU compute, 71.0 FPS) and MEv/s throughput under simulated and live camera ego-motion.
   - [x] Update Web HUD and `/flicker_stats` JSON telemetry with ego-motion status, angular velocity, and suppressed event metrics.
 
+- [x] **Phase 11: Arduino Nicla Sense ME Live IMU Streaming & Hardware Lock**
+  - [x] Develop binary protocol firmware (`nicla_predator_imu.ino`) streaming 200 Hz 32-byte gyro/accel packets over USB CDC serial.
+  - [x] Apply coordinate frame transformations on Nicla for rear-mount optical axis alignment ($\omega_x^{\text{cam}} = +\omega_y^{\text{nicla}}$, $\omega_y^{\text{cam}} = +\omega_x^{\text{nicla}}$, $\omega_z^{\text{cam}} = -\omega_z^{\text{nicla}}$).
+  - [x] Configure OpenOCD CMSIS-DAP flashing permissions (`/dev/hidraw0`) and flash Nicla Sense ME over USB from Orin Nano.
+  - [x] Build and verify live standalone C++ receiver (`test_nicla_live`) on Jetson Orin hardware.
+  - [x] Integrate threaded non-blocking `NiclaSerialReader` into `ev_flicker_detector` service with live 200 Hz ingestion into `ContinuousGyroWarper`.
+  - [x] Update Web UI and JSON telemetry endpoint with live IMU lock status and angular rate metrics.
+

@@ -45,6 +45,10 @@ target_link_libraries(test_flicker_dsp PRIVATE pthread)
 add_executable(test_ego_motion test_ego_motion.cpp)
 target_link_libraries(test_ego_motion PRIVATE pthread)
 
+# 6b. Build Live Nicla Sense ME Stream Verifier
+add_executable(test_nicla_live test_nicla_live.cpp)
+target_link_libraries(test_nicla_live PRIVATE pthread)
+
 # 7. Build Real-Time Propeller Flicker Detector Engine (with Ego-Motion Suppression & TensorRT FP16)
 add_executable(ev_flicker_detector ev_flicker_detector.cpp)
 target_link_libraries(ev_flicker_detector PRIVATE 

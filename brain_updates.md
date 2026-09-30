@@ -353,6 +353,34 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
   - `SpMiniUNet` uses 3D spatial voxel convolutions requiring extended spatial pixel spans ($>20\text{--}50\text{ px}$) to resolve blade morphology, suffering complete feature collapse at standoff ranges where blades project to sub-pixel or $<5\text{ px}$.
   - Project Predator's C++ Frequency-Domain DSP Engine (`flicker_dsp.hpp`) is purely *temporal* ($4000\text{ Hz}$ sampling, 512-sample coherent FFT integration, Harmonic Product Spectrum). It detects temporal photon flux modulation at sub-pixel scale without requiring resolved spatial blade geometry, making it the sole operational Layer 1 tripwire.
 
+---
+
+### 17. Arduino Nicla Sense ME (Bosch BHI260AP) Live IMU Integration & Flashing
+- **Hardware Profile**:
+  - Board: Arduino Nicla Sense ME (`2341:0060`) with Bosch Sensortec BHI260AP 6-DoF IMU & FuserCore DSP.
+  - Interface: High-speed USB CDC serial at `/dev/ttyACM0` + CMSIS-DAP debugger on `/dev/hidraw0`.
+  - Sampling Rate: $200\text{ Hz}$ ($5000\ \mu\text{s}$ interval).
+- **Physical Mounting & Optical Coordinate Mapping**:
+  - Sensor mounted on rear plate of IDS camera housing with $90^\circ$ clockwise rotation:
+    $$\omega_x^{\text{cam}} = +\omega_y^{\text{nicla}} \quad (\text{Camera Pitch / Tilt UP})$$
+    $$\omega_y^{\text{cam}} = +\omega_x^{\text{nicla}} \quad (\text{Camera Yaw / Pan RIGHT})$$
+    $$\omega_z^{\text{cam}} = -\omega_z^{\text{nicla}} \quad (\text{Camera Roll CW})$$
+  - Handedness and parity are preserved ($\hat{Y} \times \hat{X} = -\hat{Z}$).
+- **Binary Wire Protocol (32 Bytes / Packet)**:
+  - Header: `0xAA, 0x55` (2 bytes)
+  - Timestamp: `uint32_t` microsecond timer (4 bytes)
+  - Angular Rates: 3x `float32` $[\omega_x, \omega_y, \omega_z]$ in $\text{rad/s}$ (12 bytes)
+  - Linear Acceleration: 3x `float32` $[a_x, a_y, a_z]$ in $\text{m/s}^2$ (12 bytes)
+  - Checksum: `uint16_t` Fletcher-16 sum (2 bytes)
+- **Flashing & Deployment Pipeline**:
+  - Installed `arduino-cli` (v1.5.1), `mbed_nicla` core (v4.6.0), and `Arduino_BHY2` (v1.0.8) on Jetson Orin Nano.
+  - Added `/etc/udev/rules.d/98-arduino-hidraw.rules` granting CMSIS-DAP access to `plugdev`.
+  - Compiled and flashed firmware directly from Orin Nano via OpenOCD.
+- **Hardware Verification & Telemetry Output**:
+  - C++ stream receiver (`test_nicla_live`): Verified 200 Hz continuous packet reception with $< 150\ \mu\text{s}$ jitter.
+  - Service deployment: Active in `predator-camera.service` feeding continuous angular velocities directly into `ContinuousGyroWarper` and `/flicker_stats` JSON endpoint.
+
+
 
 
 

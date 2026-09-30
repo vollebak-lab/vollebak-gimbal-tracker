@@ -119,6 +119,8 @@ class DetectionManager {
 public:
     struct EgoMotionStats {
         bool trt_suppression_active{false};
+        bool imu_connected{false};
+        uint64_t imu_packets{0};
         double gyro_wx{0.0};
         double gyro_wy{0.0};
         double gyro_wz{0.0};
@@ -155,6 +157,8 @@ public:
            << "  \"timestamp_ms\": " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\n"
            << "  \"lens\": {\"model\": \"Edmund Optics 8mm f/8 M12\", \"fl_mm\": 8.0, \"hfov_deg\": 44.5, \"vfov_deg\": 25.1},\n"
            << "  \"ego_motion\": {\n"
+           << "    \"imu_connected\": " << (ego_stats_.imu_connected ? "true" : "false") << ",\n"
+           << "    \"imu_packets\": " << ego_stats_.imu_packets << ",\n"
            << "    \"trt_suppression_active\": " << (ego_stats_.trt_suppression_active ? "true" : "false") << ",\n"
            << "    \"gyro_rad_s\": [" << ego_stats_.gyro_wx << ", " << ego_stats_.gyro_wy << ", " << ego_stats_.gyro_wz << "],\n"
            << "    \"suppressed_events_pct\": " << ego_stats_.suppressed_pct << ",\n"
@@ -221,11 +225,14 @@ void display_encoder_thread_func(int width, int height) {
             cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
 
             // Ego-Motion & Suppression HUD Badge
-            char ego_badge[128];
-            snprintf(ego_badge, sizeof(ego_badge), "GYRO STAB: ON | TRT SUPPRESS: %s (%.0f%% REJECTED)",
-                     ego_stats.trt_suppression_active ? "ACTIVE" : "PASS-THRU", ego_stats.suppressed_pct);
+            char ego_badge[160];
+            snprintf(ego_badge, sizeof(ego_badge), "NICLA IMU: %s (%lu PKTS) | TRT SUPPRESS: %s (%.0f%% REJECTED)",
+                     ego_stats.imu_connected ? "LOCKED 200Hz" : "OFFLINE",
+                     (unsigned long)ego_stats.imu_packets,
+                     ego_stats.trt_suppression_active ? "ACTIVE" : "PASS-THRU",
+                     ego_stats.suppressed_pct);
             cv::putText(frame, ego_badge, cv::Point(16, 56), cv::FONT_HERSHEY_SIMPLEX, 0.48,
-                        ego_stats.trt_suppression_active ? cv::Scalar(0, 255, 200) : cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
+                        ego_stats.imu_connected ? cv::Scalar(0, 255, 200) : cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
 
             std::vector<uchar> jpeg_buf;
             cv::imencode(".jpg", frame, jpeg_buf, encode_params);
@@ -400,11 +407,19 @@ static const char* HTML_DASHBOARD = R"html(
         </div>
         <div class="sidebar">
             <div class="card">
-                <div class="card-title">Ego-Motion Compensation & Gating</div>
+                <div class="card-title">Ego-Motion & IMU Gyro Gating</div>
                 <div class="metric-grid">
                     <div class="metric-box">
+                        <div class="metric-label">Nicla IMU (BHI260)</div>
+                        <div class="metric-value" id="val-imu" style="font-size:13px; color:var(--accent-green);">LOCKED</div>
+                    </div>
+                    <div class="metric-box">
                         <div class="metric-label">TRT Suppression</div>
-                        <div class="metric-value" id="val-trt">ON</div>
+                        <div class="metric-value" id="val-trt" style="font-size:13px;">ACTIVE</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Gyro Rates (rad/s)</div>
+                        <div class="metric-value" id="val-gyro" style="font-size:12px; color:var(--accent-cyan);">[0.0, 0.0, 0.0]</div>
                     </div>
                     <div class="metric-box">
                         <div class="metric-label">Suppressed Events</div>
@@ -439,7 +454,11 @@ static const char* HTML_DASHBOARD = R"html(
                 const res = await fetch('/stats');
                 if (res.ok) {
                     const data = await res.json();
+                    document.getElementById('val-imu').textContent = data.ego_motion.imu_connected ? ("200Hz (" + (data.ego_motion.imu_packets || 0) + ")") : "OFFLINE";
+                    document.getElementById('val-imu').style.color = data.ego_motion.imu_connected ? "var(--accent-green)" : "var(--accent-red)";
                     document.getElementById('val-trt').textContent = data.ego_motion.trt_suppression_active ? "ACTIVE" : "PASS-THRU";
+                    const g = data.ego_motion.gyro_rad_s || [0,0,0];
+                    document.getElementById('val-gyro').textContent = `[${g[0].toFixed(2)}, ${g[1].toFixed(2)}, ${g[2].toFixed(2)}]`;
                     document.getElementById('val-suppressed').textContent = (data.ego_motion.suppressed_events_pct || 0).toFixed(0) + "%";
                     document.getElementById('target-count').textContent = data.num_targets;
                     
@@ -618,6 +637,10 @@ int main(int argc, char* argv[]) {
         // Continuous Gyroscope Warper & Stabilization Engine
         predator::ContinuousGyroWarper gyro_warper(lens_params);
 
+        // Connect to Arduino Nicla Sense ME IMU reader on /dev/ttyACM0
+        predator::NiclaSerialReader imu_reader(gyro_warper, "/dev/ttyACM0");
+        imu_reader.start();
+
         // 2-Bin Temporal Event Stack Accumulator for TensorRT Dynamic Suppression
         predator::TemporalEventStackAccumulator event_stack_acc(640, 360, 40000); // 40ms frames
 
@@ -703,6 +726,8 @@ int main(int argc, char* argv[]) {
 
             DetectionManager::EgoMotionStats ego_stats;
             ego_stats.trt_suppression_active = suppression_engine.is_ready();
+            ego_stats.imu_connected = imu_reader.is_connected();
+            ego_stats.imu_packets = imu_reader.packet_count();
             ego_stats.total_events = total_events;
             ego_stats.retained_events = retained_events;
             ego_stats.suppressed_pct = suppressed_pct;
@@ -768,8 +793,9 @@ int main(int argc, char* argv[]) {
             g_detection_mgr.update_detections(filtered_detections);
         }
 
-        std::cout << "[INFO] Shutting down camera...\n";
+        std::cout << "[INFO] Shutting down camera & IMU reader...\n";
         g_running = false;
+        imu_reader.stop();
         g_frame_mgr.notify_all();
         g_stream_broadcaster.notify_all();
 
