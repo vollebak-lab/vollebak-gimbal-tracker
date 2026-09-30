@@ -30,9 +30,19 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+
+from src.layer3_fusion.imm_tracker import IMMConfig, IMMTrack, MotionModel
+from src.layer3_fusion.jpda_associator import (
+    JPDAAssociator,
+    JPDAConfig,
+    JPDAResult,
+    NeuromorphicPrior,
+    TrackUpdate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +65,10 @@ class AerialTrackerConfig:
     measurement_noise_pos_std: float = 0.5  # m — radar measurement noise
     measurement_noise_vel_std: float = 0.3  # m/s — Doppler noise
     dt: float = 0.1                    # 10Hz update rate
+    use_imm: bool = True               # Use IMM instead of single CA model
+    use_jpda: bool = True              # Use JPDA instead of Hungarian
+    imm_config: Optional[IMMConfig] = None   # IMM-specific config (auto-built if None)
+    jpda_config: Optional[JPDAConfig] = None  # JPDA-specific config (auto-built if None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,10 +281,18 @@ class AerialKalmanTrack:
 
 
 class AerialMultiTargetTracker:
-    """Multi-target tracker for aerial drones with Hungarian assignment.
+    """Multi-target tracker with IMM motion models and JPDA association.
 
-    Mirrors ``MultiTargetTracker`` from ``radar_belt_engine`` with
-    aerial-specific tuning.
+    Tracking Pipeline Architecture:
+        1. **IMM** (motion model): Runs 4 parallel Kalman models
+           (CV, CJ, MSM, STS) per track with Bayesian mixing.
+           Replaces single constant-acceleration filter.
+        2. **JPDA** (data association): Computes probabilistic
+           measurement-to-track associations. Replaces Hungarian.
+           Supports neuromorphic bearing as a Bayesian prior.
+
+    Falls back to original single-Kalman + Hungarian when
+    ``use_imm=False`` and ``use_jpda=False`` in config.
 
     Args:
         config: AerialTrackerConfig.
@@ -278,8 +300,24 @@ class AerialMultiTargetTracker:
 
     def __init__(self, config: Optional[AerialTrackerConfig] = None) -> None:
         self._config = config or AerialTrackerConfig()
-        self._tracks: list[AerialKalmanTrack] = []
+        self._tracks: list = []  # IMMTrack or AerialKalmanTrack
         self._next_id: int = 0
+
+        # Build JPDA associator if enabled
+        self._jpda: Optional[JPDAAssociator] = None
+        if self._config.use_jpda:
+            jpda_cfg = self._config.jpda_config or JPDAConfig(
+                gate_threshold=self._config.gate_threshold,
+            )
+            self._jpda = JPDAAssociator(config=jpda_cfg)
+
+        # Build IMM config if enabled but not provided
+        if self._config.use_imm and self._config.imm_config is None:
+            self._config.imm_config = IMMConfig(
+                dt=self._config.dt,
+                measurement_noise_pos_std=self._config.measurement_noise_pos_std,
+                measurement_noise_vel_std=self._config.measurement_noise_vel_std,
+            )
 
     @property
     def active_track_count(self) -> int:
@@ -292,14 +330,26 @@ class AerialMultiTargetTracker:
         dopplers: np.ndarray,
         rcs_values: np.ndarray,
         detection_counts: np.ndarray,
+        neuromorphic_priors: Optional[list[NeuromorphicPrior]] = None,
+        current_timestamp_us: int = 0,
     ) -> list[AerialTarget]:
         """Process a radar frame of detections.
+
+        Supports two modes:
+        - **IMM + JPDA** (default): Probabilistic association with
+          multi-model tracking and optional neuromorphic bearing priors.
+        - **Legacy** (use_imm=False, use_jpda=False): Single CA Kalman
+          with Hungarian assignment.
 
         Args:
             positions: (M, 3) array of detection positions [x, y, z].
             dopplers: (M,) array of Doppler velocities.
             rcs_values: (M,) array of RCS values.
             detection_counts: (M,) array of detection counts per cluster.
+            neuromorphic_priors: Optional list of concurrent Layer 1
+                detections for bearing correlation (JPDA mode only).
+            current_timestamp_us: Current frame timestamp for L1
+                correlation age check.
 
         Returns:
             List of AerialTarget for all active tracks.
@@ -316,11 +366,88 @@ class AerialMultiTargetTracker:
             return []
 
         if num_tracks == 0:
-            return self._spawn_tracks(positions, dopplers, rcs_values, detection_counts)
+            return self._spawn_tracks(
+                positions, dopplers, rcs_values, detection_counts,
+            )
 
         if num_measurements == 0:
             self._coast_all()
             return self._get_targets()
+
+        # Route to JPDA or legacy Hungarian
+        if self._jpda is not None:
+            return self._update_jpda(
+                positions, dopplers, rcs_values, detection_counts,
+                neuromorphic_priors, current_timestamp_us,
+            )
+        else:
+            return self._update_hungarian(
+                positions, dopplers, rcs_values, detection_counts,
+            )
+
+    def _update_jpda(
+        self,
+        positions: np.ndarray,
+        dopplers: np.ndarray,
+        rcs_values: np.ndarray,
+        detection_counts: np.ndarray,
+        neuromorphic_priors: Optional[list[NeuromorphicPrior]],
+        current_timestamp_us: int,
+    ) -> list[AerialTarget]:
+        """JPDA-based update with neuromorphic bearing correlation.
+
+        Replaces Hungarian assignment with probabilistic multi-hypothesis
+        association. Measurements correlating with neuromorphic bearings
+        receive boosted association probability.
+        """
+        result = self._jpda.associate(
+            tracks=self._tracks,
+            measurements=positions,
+            measurement_dopplers=dopplers,
+            measurement_rcs=rcs_values,
+            measurement_counts=detection_counts,
+            neuromorphic_priors=neuromorphic_priors,
+            current_timestamp_us=current_timestamp_us,
+        )
+
+        # Apply JPDA updates to tracks
+        for update in result.track_updates:
+            track = self._tracks[update.track_idx]
+            if update.has_update and update.weighted_measurement is not None:
+                track.update(
+                    measurement=update.weighted_measurement,
+                    doppler=update.weighted_doppler,
+                    rcs=update.weighted_rcs,
+                    num_detections=update.weighted_count,
+                )
+            else:
+                track.coast()
+
+        # Spawn new tracks for unassociated measurements
+        for j in result.unassociated_meas:
+            self._spawn_single_track(
+                positions[j], float(dopplers[j]),
+                float(rcs_values[j]), int(detection_counts[j]),
+            )
+
+        # Prune dead tracks
+        self._tracks = [
+            t for t in self._tracks
+            if t.missed_frames <= self._config.max_coast_frames
+        ]
+
+        return self._get_targets()
+
+    def _update_hungarian(
+        self,
+        positions: np.ndarray,
+        dopplers: np.ndarray,
+        rcs_values: np.ndarray,
+        detection_counts: np.ndarray,
+    ) -> list[AerialTarget]:
+        """Legacy Hungarian assignment update (backward compatibility)."""
+        num_tracks = len(self._tracks)
+        num_measurements = positions.shape[0]
 
         # Build cost matrix
         cost_matrix = np.full((num_tracks, num_measurements), _GATE_COST)
@@ -356,16 +483,10 @@ class AerialMultiTargetTracker:
         # Spawn new tracks for unmatched measurements
         for j in range(num_measurements):
             if j not in matched_meas:
-                track = AerialKalmanTrack(
-                    initial_position=positions[j],
-                    initial_doppler=float(dopplers[j]),
-                    initial_rcs=float(rcs_values[j]),
-                    track_id=self._next_id,
-                    config=self._config,
+                self._spawn_single_track(
+                    positions[j], float(dopplers[j]),
+                    float(rcs_values[j]), int(detection_counts[j]),
                 )
-                track.num_detections = int(detection_counts[j])
-                self._tracks.append(track)
-                self._next_id += 1
 
         # Prune dead tracks
         self._tracks = [
@@ -374,6 +495,34 @@ class AerialMultiTargetTracker:
         ]
 
         return self._get_targets()
+
+    def _spawn_single_track(
+        self,
+        position: np.ndarray,
+        doppler: float,
+        rcs: float,
+        detection_count: int,
+    ) -> None:
+        """Spawn a single new track (IMM or legacy Kalman)."""
+        if self._config.use_imm:
+            track = IMMTrack(
+                initial_position=position,
+                initial_doppler=doppler,
+                initial_rcs=rcs,
+                track_id=self._next_id,
+                config=self._config.imm_config,
+            )
+        else:
+            track = AerialKalmanTrack(
+                initial_position=position,
+                initial_doppler=doppler,
+                initial_rcs=rcs,
+                track_id=self._next_id,
+                config=self._config,
+            )
+        track.num_detections = detection_count
+        self._tracks.append(track)
+        self._next_id += 1
 
     def _spawn_tracks(
         self,
@@ -385,17 +534,11 @@ class AerialMultiTargetTracker:
         """Create tracks for all measurements when none exist."""
         targets = []
         for j in range(positions.shape[0]):
-            track = AerialKalmanTrack(
-                initial_position=positions[j],
-                initial_doppler=float(dopplers[j]),
-                initial_rcs=float(rcs_values[j]),
-                track_id=self._next_id,
-                config=self._config,
+            self._spawn_single_track(
+                positions[j], float(dopplers[j]),
+                float(rcs_values[j]), int(detection_counts[j]),
             )
-            track.num_detections = int(detection_counts[j])
-            self._tracks.append(track)
-            self._next_id += 1
-            targets.append(track.to_aerial_target())
+            targets.append(self._tracks[-1].to_aerial_target())
         return targets
 
     def _coast_all(self) -> None:

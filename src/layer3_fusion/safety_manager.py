@@ -42,6 +42,11 @@ class SafetyConfig:
     max_engagements_per_minute: int = 10
     cooldown_between_engagements_s: float = 2.0
 
+    # L1-only sweep engagement constraints (Waiter mode)
+    l1_sweep_min_elevation_deg: float = -20.0   # Floor for vertical sweep
+    l1_sweep_max_elevation_deg: float = 15.0    # Ceiling for vertical sweep
+    l1_sweep_max_range_m: float = 50.0          # L1-only range limit
+
 
 @dataclass(frozen=True, slots=True)
 class SafetyCheck:
@@ -155,6 +160,117 @@ class SafetyManager:
         now = time.monotonic()
         self._engagement_timestamps.append(now)
         self._last_engagement_time = now
+
+    def check_l1_sweep_engagement(
+        self,
+        bearing_deg: float,
+        sweep_el_min: float,
+        sweep_el_max: float,
+        estimated_range_m: float,
+        operator_heading_deg: float = 0.0,
+    ) -> SafetyCheck:
+        """Evaluate whether an L1-only vertical sweep engagement is safe.
+
+        L1-only (Waiter mode) engagements target ground-level drones
+        with a vertical sweep pattern. Standard elevation checks
+        (min 5° above horizon) do not apply — instead we enforce:
+
+        1. Keep-out cone: sweep column must be outside operator cone.
+        2. Elevation floor: sweep must not go below -20°.
+        3. Elevation ceiling: sweep must not exceed +15°.
+        4. Range gate: estimated range must be within [0, 50 m].
+        5. Rate limiting (same as standard).
+
+        Args:
+            bearing_deg: Fixed azimuth for the vertical sweep.
+            sweep_el_min: Lower elevation bound (degrees, negative).
+            sweep_el_max: Upper elevation bound (degrees).
+            estimated_range_m: Ground-plane range estimate.
+            operator_heading_deg: Operator facing direction.
+
+        Returns:
+            SafetyCheck with authorization result.
+        """
+        now = time.monotonic()
+        cfg = self._config
+
+        # Keep-out cone: use sweep column bearing
+        delta_bearing = self._angular_diff(bearing_deg, operator_heading_deg)
+        keep_out_clear = delta_bearing > cfg.keep_out_cone_deg
+
+        # Elevation bounds: sweep must stay within safety floor/ceiling
+        el_floor_clear = sweep_el_min >= cfg.l1_sweep_min_elevation_deg
+        el_ceil_clear = sweep_el_max <= cfg.l1_sweep_max_elevation_deg
+        elevation_clear = el_floor_clear and el_ceil_clear
+
+        # Range gate: L1-only range limit
+        range_clear = 0.0 <= estimated_range_m <= cfg.l1_sweep_max_range_m
+
+        # Rate limiting
+        cutoff = now - 60.0
+        self._engagement_timestamps = [
+            t for t in self._engagement_timestamps if t > cutoff
+        ]
+        rate_clear = (
+            len(self._engagement_timestamps)
+            < cfg.max_engagements_per_minute
+        )
+        cooldown_clear = (
+            (now - self._last_engagement_time)
+            >= cfg.cooldown_between_engagements_s
+        )
+        rate_clear = rate_clear and cooldown_clear
+
+        authorized = (
+            keep_out_clear and range_clear
+            and elevation_clear and rate_clear
+        )
+
+        self.checks_total += 1
+        if not authorized:
+            self.vetoes_total += 1
+            reasons = []
+            if not keep_out_clear:
+                reasons.append(
+                    f"keep-out cone ({delta_bearing:.1f}° < "
+                    f"{cfg.keep_out_cone_deg}°)"
+                )
+            if not el_floor_clear:
+                reasons.append(
+                    f"sweep floor ({sweep_el_min:.1f}° < "
+                    f"{cfg.l1_sweep_min_elevation_deg}°)"
+                )
+            if not el_ceil_clear:
+                reasons.append(
+                    f"sweep ceiling ({sweep_el_max:.1f}° > "
+                    f"{cfg.l1_sweep_max_elevation_deg}°)"
+                )
+            if not range_clear:
+                reasons.append(
+                    f"L1 range ({estimated_range_m:.1f}m > "
+                    f"{cfg.l1_sweep_max_range_m}m)"
+                )
+            if not rate_clear:
+                reasons.append("rate limit / cooldown")
+            reason = "L1 SWEEP VETOED: " + "; ".join(reasons)
+            logger.warning("Safety veto: %s", reason)
+        else:
+            reason = "L1 SWEEP AUTHORIZED"
+
+        # Use sweep midpoint for elevation in result
+        sweep_midpoint_el = (sweep_el_min + sweep_el_max) / 2.0
+
+        return SafetyCheck(
+            authorized=authorized,
+            reason=reason,
+            target_bearing_deg=bearing_deg,
+            target_elevation_deg=sweep_midpoint_el,
+            target_range_m=estimated_range_m,
+            keep_out_clear=keep_out_clear,
+            range_clear=range_clear,
+            elevation_clear=elevation_clear,
+            rate_clear=rate_clear,
+        )
 
     @staticmethod
     def _angular_diff(a: float, b: float) -> float:

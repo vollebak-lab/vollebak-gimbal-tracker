@@ -299,23 +299,58 @@ class ThreatClassifier:
             is_primer_only=False,
         )
 
-    def _compute_rcs_score(self, rcs_dbsm: float) -> float:
+    def _compute_rcs_score(
+        self,
+        rcs_dbsm: float,
+        hcr_margin_db: float = 0.0,
+    ) -> float:
         """Score radar cross-section for drone-like signature.
 
-        Drone-like RCS: -30 to 0 dBsm → 0.8 score.
-        Below -30 dBsm (very small): 0.3 score.
-        Above 0 dBsm (too large for drone): 0.1 score.
+        With HCR (High Contrast Resolution) exploitation from PMCW
+        code-domain sidelobe suppression. When a small-RCS target is
+        detected with high HCR margin near a large reflector, the
+        detection is almost certainly real (not a sidelobe artifact).
+
+        RCS Bands:
+            Drone-like (-30 to 0 dBsm): 0.8 base score.
+            Very small (< -30 dBsm): 0.3 base score.
+            Too large (> 0 dBsm): 0.1 base score.
+
+        HCR Boost:
+            High HCR margin (>25 dB) on a small-RCS target near
+            large reflectors → +0.15 confidence boost. This exploits
+            PMCW's ~35dB sidelobe suppression to confirm drone
+            detections in urban near-structure scenarios.
 
         Args:
             rcs_dbsm: Radar cross-section in dBsm.
+            hcr_margin_db: Delta between target correlation peak and
+                nearest large reflector sidelobe (from PMCW processing).
+                Higher = more confident the target is distinct from clutter.
 
         Returns:
             RCS score (0.0–1.0).
         """
         cfg = self._config
+
+        # Base RCS band scoring
         if cfg.min_rcs_dbsm <= rcs_dbsm <= cfg.max_rcs_dbsm:
-            return 0.8
+            base_score = 0.8
         elif rcs_dbsm < cfg.min_rcs_dbsm:
-            return 0.3
+            base_score = 0.3
         else:
-            return 0.1
+            base_score = 0.1
+
+        # HCR exploitation: high sidelobe suppression margin on
+        # drone-sized targets provides confident near-structure
+        # detection. PMCW RoC spec: ~35dB sidelobe suppression.
+        hcr_boost = 0.0
+        if hcr_margin_db > 25.0 and rcs_dbsm <= cfg.max_rcs_dbsm:
+            # Scale boost: 25dB → 0.0, 35dB → 0.15
+            hcr_boost = min(0.15, (hcr_margin_db - 25.0) * 0.015)
+            logger.debug(
+                "HCR boost: %.1f dB margin → +%.3f RCS confidence",
+                hcr_margin_db, hcr_boost,
+            )
+
+        return float(np.clip(base_score + hcr_boost, 0.0, 1.0))

@@ -1,0 +1,1577 @@
+HelixTrack:
+Event-Based Tracking and RPM Estimation of Propeller-like Objects
+Radim Spetlik Michal Pliska V ojt ˇech Vrba Jiri Matas
+Faculty of Electrical Engineering
+Czech Technical University in Prague
+Abstract
+Safety-critical perception for unmanned aerial vehicles and
+rotating machinery requires microsecond-latency tracking
+of fast, periodic motion under egomotion and strong dis-
+tractors. Frame- and event-based trackers drift or break
+on propellers because periodic signatures violate their
+smooth-motion assumptions. We tackle this gap with He-
+lixTrack, a fully event-driven method that jointly tracks
+propeller-like objects and estimates their rotations per
+minute (RPM). Incoming events are back-warped from the
+image plane into the rotor plane via a homography es-
+timated on the fly. A Kalman Filter maintains instanta-
+neous estimates of phase. Batched iterative updates refine
+the object pose by coupling phase residuals to geometry.
+To our knowledge, no public dataset targets joint tracking
+and RPM estimation of propeller-like objects. We there-
+fore introduce the Timestamped Quadcopter with Egomo-
+tion (TQE) dataset with 13 high-resolution event sequences,
+containing 52 rotating objects in total, captured at distances
+of 2 m / 4 m, with increasing egomotion and microsecond
+RPM ground truth. On TQE, HelixTrack processes full-
+rate events≈11.8×faster than real time and microsec-
+ond latency. It consistently outperforms per-event and
+aggregation-based baselines adapted for RPM estimation.
+1. Introduction
+Tracking propellers and reading their instantaneous RPM
+is a practical capability for working with and around small
+aerial vehicles. In radio-denied or silent settings, blade
+phase and RPM provide a communication-free signal for
+leader-follower behavior, intent (spool-up/spool-down), and
+collision avoidance, and act as a diagnostic or identifica-
+tion cue when other channels fail. However, fast rotors pro-
+duce dense, strictly periodic patterns and visually similar
+distractors that violate the motion assumptions of conven-
+tional frame-based and event-based trackers, motivating an
+event-native, propeller-aware solution.
+In recent years, event-stream tracking has attracted in-
+z u
+r= 1
+rin
+rout
+Figure 1.HelixTrack– tracking and instantaneous rotations per
+minute estimation of propeller-like objects from asynchronous
+events. Incoming events are back-warped from the image plane
+“z” into the rotor plane “u” by a homography. Rotor-plane coor-
+dinates are gated withr in andr out to a ring-shaped band and used
+for: (i) per-event phase update via Kalman filter, and (ii) batched
+pose refinement via iterative homography update.
+creasing attention, with research advancing from feature-
+level tracking to single- and multi-object tracking, sup-
+ported by new datasets and strong baselines [3, 4, 10, 12–
+14]. Two families of approaches have proven particu-
+larly effective.Per-eventmethods process each event as
+it arrives and update the state continuously, yielding very
+low latency and strong robustness in high-speed regimes
+[15, 16]. Examples include asynchronous continuous opti-
+mization over event constellations [16] and Kalman-filtered
+blob tracking that embraces native, event-driven timing
+[15].Aggregation-basedmethods store events in spatiotem-
+poral tensors — event frames, time surfaces, or voxel grids
+— which can be processed by modern deep networks and
+sequence models [10, 12–14]. Such aggregation enables the
+use of powerful learned backbones (e.g., transformers and
+state-space models) which have delivered competitive ac-
+curacy across single- and multi-object tracking benchmarks
+[10, 12–14]. Thus, both paradigms have established them-
+selves as viable choices for event-based tracking, trading off
+latency, modeling flexibility, and learning capacity.
+However, an important set of phenomena remains
+under-explored: objects that exhibit fast, periodic mo-
+1
+arXiv:2603.09235v1  [cs.CV]  10 Mar 2026
+tion. Rotating propellers are archetypal: they generate
+dense, structured, highly periodic event patterns that violate
+the “smooth translational motion” assumptions implicit in
+many trackers. Rapid movement of blades, strong distrac-
+tors (e.g., in the case of multiple propellers), and repetitive
+textures challenge both per-event and aggregation-based ob-
+ject trackers, leading to drift and failures. Event-based rate
+estimation for periodic phenomena has been studied [2, 7],
+but prior work focused on estimating frequency in static
+scenes where no tracking is required. To our knowledge,
+no prior work explicitly formulates and solves the tracking
+of objects exhibiting periodic motion while jointly estimat-
+ing their rotation rate (RPM) from raw events.
+We address this gap withHelixTrack, an event-based
+framework forpropeller tracking and RPM estimation. Our
+key insight is that a rotating blade induces ahelical signa-
+turein the event space when lifted to appropriate spatiotem-
+poral coordinates anchored on the rotor hub. HelixTrack is
+afully event-driven,real-time,low-latencyframework for
+tracking and measuring spinning propeller-like objects with
+an event camera (see Fig. 1). HelixTrack: (i) back-warps
+each event through a homography onto the rotor plane while
+applying various hard and soft gates, (ii) uses an Extended
+Kalman Filter (EKF) to estimate the instantaneous phase,
+angular speed, and acceleration, and (iii) iteratively updates
+the homography, minimizing a set of refined loss terms. The
+outcome is a stream of phase and pose updates from which
+RPM follows directly. Conceptually, HelixTrack bridges
+both families of prior work: it runs nativelyasynchronously,
+retaining the latency benefits of event cameras, yet itslifted,
+structured representationadmits aggregation for frame- or
+batch-based pipelines.
+We also overcome a common limitation of event-based
+tracking — the absence of reliable ground-truth posi-
+tions. Annotating the trajectories of rapidly spinning pro-
+peller hubs observed by a moving camera presents sig-
+nificant challenges and requires substantial time invest-
+ment. To address this, we introduce a dataset that pro-
+vides microsecond-level accurate ground-truth RPM mea-
+surements for each propeller, enabling evaluation through
+the mean absolute error of the predicted RPM, which is a
+dependable indicator of the tracker’s precision.
+Beyond drone propellers, the formulation is applicable
+to other periodic, radially symmetric actuators (e.g., fans,
+rotors), offering a principled path to track-and-measure be-
+haviors that are challenging for conventional trackers.
+In summary, our contributions are:
+(i)Problem formulation.We specify the task and evalu-
+ation protocol for event-based tracking with joint RPM
+estimation of propeller-like objects exhibiting periodic,
+high-speed motion. This fits in-between the general
+event-based trackers [10, 12–16] and rate-only estima-
+tors that are not object-centric [2, 7].
+(ii) TheHelixTrack model.We propose an event-driven
+tracker that back-warps events to the rotor plane via a
+homography, fits a helical phase model, and jointly in-
+fers RPM, with a per-event EKF, and pose, using the
+Gauss-Newton (GN) algorithm on event batches.
+(iii) TheTQE Dataset.We collect 13 high-resolution se-
+quences captured at 2 m / 4 m distances with seven ego-
+motion levels, and synchronized IR-RPM ground truth.
+(iv)Benchmark.We adapt asynchronous [15] and
+learned [4] trackers for RPM estimation and show that
+HelixTrack achieves the best performance.
+(v)Ablations & Runtime analysis.We ablate loss terms,
+test tolerance to coarse pose/scale/RPM initialization,
+and profile speed — processing at≈11.8×real time
+with accuracy/throughput trade-offs under subsampling.
+HelixTrack turns an adversarial motion pattern into a fea-
+ture that can be modeled, localized, and measured.
+2. Related Work
+The review oftrackingliterature relevant to HelixTrack is
+organized by tracking paradigms and sensing modalities.
+Event cameras natively support low-latency motion
+perception, which has motivated blob- and feature-level
+trackers as well as general single-object tracking (SOT)
+pipelines. Asynchronous blob trackers operate directly on
+the event stream, i.e. without frames, maintaining object
+hypotheses with simple motion and shape cues [3, 4, 15,
+16]. At the feature level, data-driven formulations learn
+to follow high-speed structures through the spatio-temporal
+event volume, improving robustness over hand-crafted rules
+[3, 4]. Benchmarks for event-based visual object tracking
+(VOT) enable comparison across VOT methods [13, 14].
+Tracking-by-detection and joint detection-tracking have
+also been explored in the event domain. Recent work
+demonstrates end-to-end multi-object tracking on events
+with learned association and sparsity-aware motion mod-
+els [12]. Beyond local heuristics, sequence models capture
+long-range temporal dependencies in asynchronous data.
+State-space models and transformer-style architectures have
+been adapted to event streams for VOT, producing stronger
+appearance modeling under severe motion and illumination
+change [10, 14]. Several approaches fuse events with inten-
+sity frames (or other modalities) to reduce failure modes of
+either sensor alone, typically with transformer-based fusion
+and hybrid feature pipelines [10]. In contrast, our method is
+fully event-driven, which preserves very low latency.
+Event cameras have also been used for geometry-
+aware tracking — e.g., 3D feature trajectories and object-
+grounded motion constraints — which is particularly rel-
+evant when the target exhibits structured dynamics [3].
+Our formulation continues this line by embedding a
+physics/geometry prior in the tracker state.
+An orthogonal thread optimizes a continuous-time ob-
+2
+jective directly over events for tracking and registration, of-
+fering drift control and accurate sub-frame localization [16].
+We instead cast tracking as online filtering with an explicit
+dynamical phase model, which trades some global optimal-
+ity for latency and simplicity.
+Previous unmanned aerial vehicle (UA V) tracking work
+has focused on estimating drone position or pose rather than
+measuring propeller attributes. Frame-based methods often
+rely on standard cameras and CNN-based pipelines [11, 17,
+18], providing velocities and accelerations with significant
+latency. Event-based techniques for high-speed UA V inter-
+ception or localization [5, 6, 8, 9] sometimes detect pro-
+peller patterns in real time at modest rates (e.g., 35 Hz [6]).
+However, they rarely localize individual propellers or mea-
+sure angular velocity at microsecond temporal precision,
+and typically leverage low-resolution sensors, hampering
+performance in cluttered scenes or for small targets. In [1]
+propeller speeds are measured but no tracking is performed.
+Relation to our work.Unlike detection-oriented pipelines
+that classify or localize events on a per-frame basis, our
+tracker maintains thephase and poseof a specific object
+continuously over time, using only asynchronous events.
+3. Method
+High-level summary.Given an approximate pose and
+RPM from [7], the tracker estimates two coupled quanti-
+ties: (i) an image-to-rotor-plane homography (geometry),
+and (ii) a latent phase statex(t) = [ϕ(t), ω(t), α(t)] ⊤
+(phase and its first and second derivatives). Asynchronously
+arriving events are processed in two loops:
+1.Per-event phase tracking.An EKF updatesx(t)from
+each event using a wrapped phase residual.
+2.Batched pose refinement.Periodically, Gauss-Newton
+(GN) updates homography parameters by minimizing a
+robust, weighted objective with analytic Jacobians.
+The EKF gives microsecond-scale phase and RPM tracking,
+while GN accumulates evidence to estimate pose.
+3.1. Problem Setup and Notation
+Camera observes an event streamei = (zi, ti, pi)with pixel
+locationz i = (x i, yi)⊤, timestampt i, and polarityp i ∈
+{+1,−1}. Vectors are bold; we reservexfor the phase
+state andzfor image points.
+Homography parameterization (image↔rotor plane).
+A planar pointu= (u x, uy)⊤ in the rotor plane projects to
+the image via a6-DoF homography
+H(q) =
+
+
+scosψ−ssinψ t x
+ssinψ scosψ t y
+p31 p32 1
+
+ (1)
+z∼H(q) [u; 1],q=
+
+s, ψ, tx, ty, p31, p32
+⊤
+,(2)
+wheres >0(in-plane scale),ψ(in-plane rotation),
+(tx, ty)(translation), and(p 31, p32)(small perspective
+terms). Given an event locationz i,
+˜ui =H(q) −1[zi; 1],u i = 1
+˜ui,3
+˜ui,1
+˜ui,2
+
+, ∂ui
+∂q ∈R 2×6.
+3.2. Generative Phase Model
+We map each event to a common phase coordinate that is
+invariant to arbitrary in-plane camera rotation and respects
+theB-fold symmetry of aB-blade rotor. Letζ∈ {±1}be
+therotation sign, estimated from circular statistics over a
+short prefix of events. The signed azimuth is
+θζ(u) = atan2(ζ uy, ux)∈(−π, π].
+To absorb the image-plane rotationψ(2) into the rotor
+phaseϕ(t)(radians), we define the effective phase
+ϕeff(t) =ϕ(t)−B ψ.
+ϕeff is the tracked phase after accounting forψ. Given the
+timestept i and the back-wraped positionu i of an evente i,
+we form the wrappedphase residual
+εϕ
+i = wrap π
+ 
+ϕeff(ti)−B θζ(ui)
+
+.(3)
+wherewrap π(θ) = mod(θ+π,2π)−π. By construction,
+εϕ
+i is theπ-wrapped, signed phase error betweenϕ eff(ti)
+and the blade phase implied by the event,B θζ(ui). Ignor-
+ing wrap discontinuities, the residual is first-order invariant
+to global in-plane rotation:
+∂εϕ
+i
+∂ψ = ∂ϕeff
+∂ψ −B ∂θζ
+∂ψ =−B−B(−1) = 0,
+since a global rotation shifts all azimuths by−ψso that
+∂θζ/∂ψ=−1.
+3.3. Phase-State Dynamics: Constant Acceleration
+with White Jerk
+We want to stay predictive between irregular event times.
+We therefore use a continuous-time acceleration prior
+whose uncertainty grows with elapsed time. Note thatt,t ′
+are continuous. By definition of angular kinematics,
+ω(t) = ˙ϕ(t), α(t) = ˙ω(t) =¨ϕ(t), j(t) = ˙α(t) =
+...
+ϕ(t),
+unitsω[rad/s],α[rad/s 2],j[rad/s 3]. We modelj(t)as
+“white jerk”,i.e., zero-mean white Gaussian noise with
+spectral densityq jerk, i.e.E[j(t)j(t ′)] =q jerkδ(t−t ′), cap-
+turing torque fluctuations giving the continuous-time SDE
+˙x(t) =A x(t) +Lw(t), w(t)∼ N(0, qjerkδ(t−t ′)),
+A=
+
+
+0 1 0
+0 0 1
+0 0 0
+
+ ,L=
+
+
+0
+0
+1
+
+ .
+3
+Mego = 1
+Mego = 7
+00 : 00,000−00 : 00,010 s00 : 01,000−00 : 01,010 s00 : 02,000−00 : 02,010 s00 : 03,000−00 : 03,010 s00 : 04,000−00 : 04,010 s
+Figure 2. Aggregated events from two sequences in the Timestamped Quadcopter with Egomotion dataset. Top row: smallest egomotion
+(Mego = 1); bottom row: largest egomotion (Mego = 7). Events are aggregated from the first 10 ms of five 1-second intervals.
+UsingE[j(t)j(t ′)] =qjerkδ(t−t′)and integrating the process
+noise through the continuous-time model yieldsQ d(∆ti) =R ∆ti
+0 [ τ 2
+2 ,τ,1]qjerk[ τ 2
+2 ,τ,1]⊤dτ,∆t i =t i−ti−1, evaluating to
+Qd =q jerk
+
+
+∆t5
+i
+20
+∆t4
+i
+8
+∆t3
+i
+6
+∆t4
+i
+8
+∆t3
+i
+3
+∆t2
+i
+2
+∆t3
+i
+6
+∆t2
+i
+2 ∆ti
+
+ .
+We discretize the continuous-time state by the event times
+ti. Thus,x i−1 is the state immediatelyafterassimilating
+evente i−1. It is propagated over∆t i to form
+xi =F(∆t i)x i−1,
+Pi =F(∆t i)P i−1 F(∆ti)⊤ +Q d(∆ti),
+F= exp(A∆t i) =
+
+
+1 ∆t i 1
+2 ∆t2
+i
+0 1 ∆t i
+0 0 1
+
+ .
+3.4. Extended Kalman Filter Update
+We gate events by a von Mises windoww vm(εϕ) =
+exp{κ(cos(εϕ)−1)}, whereκcontrols angular selectivity
+(κ= 0means no gating). We make the innovation variance
+heteroscedastic using the gates:
+Ri = σ2
+0
+max{wvm(εϕ
+i )wring(ri;σ ring), ϵ}
+,
+whereσ 2
+0 is a nominal phase noise,ε ϕ
+i is the phase resid-
+ual (3), andϵ >0prevents division by zero. A smooth spa-
+tial gate emphasizes the blade-tip neighborhood (normal-
+ized nearr= 1):
+wring(r;σ ring) = exp
+
+− 1
+2
+
+r−1
+σring
+2
+.
+The evente i yields the EKF update
+Ki =P iC⊤ 
+CPiC⊤ +R i
+−1
+,
+xi ←x i −K i εϕ
+i ,P i ←(I−K iC)Pi,
+whereC= [ 1 0 0 ].
+3.5. Gauss–Newton Pose Refinement
+We refineqon mini-batches of eventsB ⊂ {1, . . . , N}us-
+ing GN with analytic Jacobians. Letr i =∥u i∥. In addition
+to phase residualε ϕ
+i , we define theradial residual
+εr
+i =r i −1,
+which pushes the average radius of projected events to the
+unit radiusr= 1.
+Next, we add thepolarity residual
+εpol
+i =c pol sin
+
+1
+2 wrapπ
+ 
+εϕ
+i −θ pol(p)
+
+,
+to align the event polaritypwith the expected edge phase.
+θpol(+) =c +,θ pol(−) =c −, andc pol are constants.
+We focus on an informative annulusr in ≤r i ≤r out (see
+Fig. 1) and incorporatesoft annulus residuals
+εin
+i =c b softplusτ (rin−ri), ε out
+i =c b softplusτ (ri−rout),
+withsoftplus τ (s) =τlog(1 + e s/τ ), (τ >0), andc b ∈R
+is a constant.
+Since scale and perspective can drift when more events
+fall justoutsidethaninsidethe expected tip radius, we add
+the Balanced Tip Occupancy (BTO) regularizer that en-
+courages a balanced fraction of events around the unit ra-
+diusr=1. We accumulate the event countsC core,C in, and
+Cout, which are the numbers of events in three narrow radial
+bands around the tip — core atr= 1, inside at1−∆, and
+outside at1 + ∆. Rate-invariant inside/outside fractions are
+pin = Cin
+Ccore +ε , p out = Cout
+Ccore +ε ,
+withϵ >0. TheBTO penaltyis
+ℓBTO = softplusτ
+ 
+pout − pout
+
++ softplusτ
+ 
+pin −p in
+
+,
+pout andp in are constants. Gradients flow through the radial
+channel, stabilizing scale and perspective at the blade tips.
+Objective function for pose estimation.Letρ 2(s) =
+1
+2 s2 and define event gatesg ϕ
+i =λ ϕ wϕ
+i ,g r
+i =λ r wr
+i with
+w•
+i =w vm(εϕ
+i )w ring(ri;σ ring)w Huber(ε•
+i ;c •),• ∈ {ϕ, r},
+4
+wherew Huber(ε;c) = min{1, c/|ε|}with thresholdc >0.
+The batch objective is
+L(q) =
+X
+i∈B
+h
+gϕ
+i ρ2
+ 
+εϕ
+i
+
++g r
+i ρ2
+ 
+εr
+i
+ i
++λ pol
+X
+i∈B
+ρ2
+ 
+εpol
+i
+
++λ band
+ X
+i∈B
+ρ2
+ 
+εin
+i
+
++
+X
+i∈B
+ρ2
+ 
+εout
+i
+
+!
++λ BTO ℓBTO(pin, pout) +λ reg ℓreg(q).(4)
+Interpretation.The first line ties phase to geometry
+(viaε ϕ
+i ) and centers the working ring atr=1(viaε r
+i ). The
+gatesw vm andw ring downweight azimuthally inconsistent
+or off-band events, andwHuber reduces heavy-tailed outliers.
+The second line adds weak supervision (polarity alignment,
+soft band barriers). BTO inhibits degenerate “only-inside”
+or “only-outside” fits. Finally,ℓ reg regularizes weakly ob-
+servable directions (e.g.,∥p 31∥2 +∥p 32∥2). We choose
+λϕ ≈1/σ 2
+ϕ andλ r ≈1/σ 2
+r, and set Huber thresholdsc ϕ, cr
+at1∼2standard deviations.
+GN system and update.Linearizing the residuals in (4)
+yields normal equations that we omit from the main paper
+for brevity (see supplementary Sec. S1 for the full system).
+We solve the equations in the least-square sense with Gauss-
+Newton algorithm and update
+q←q+Γ ∆q,Γ = diag(γ scale, γrot, γtx, γty, γpersp, γpersp),
+whereΓsets the update step size for each homography
+parameter. A pose update is triggered if
+(ϕ−ϕ base −
+B(ψ−ψ base))/B
+ ≥π, defining the latency of the
+pose estimation. Note that gradient descent in the di-
+rection ofL(q)minimization is also possible, in this
+small 6-DoF least-squares tracker, Gauss-Newton is prefer-
+able. It exploits the residual/Jacobian structure to take
+curvature-aware, parameter-coupled steps.
+3.6. RPM Estimation
+Instantaneous angular speed and RPM are
+ˆω=|ω|, [RPM = 60
+2π ˆω,RPM shaft = [RPM/B,
+sinceω= ˙ϕ.
+Implementation DetailsWe process events sequentially:
+1.Predict(x i,P i)with(F,Q d).
+2.Update EKFwithε ϕ
+i using gatesw vm, wring.
+3.Accumulate GN termsusing analytic∂u/∂q.
+4.Pose stepApply a batched GN update when triggered.
+Assumptions.(i) A single planar homography adequately
+models the rotor; (ii) the helical phase model is accurate
+within the informative ring.
+4. Experiments
+We first introduce the newly collected Timestamped Quad-
+copter with Egomotion (TQE) dataset, then detail the evalu-
+ation protocol and metrics, and finally present experiments.
+Unless otherwise specified, results are reported using 4-fold
+cross-validation over the four propellers in TQE recordings
+(one training propeller per fold).
+4.1. Dataset
+Timestamped Quadcopter with Egomotion (TQE)
+dataset contains 13 sequences of a quadcopter with four pro-
+pellers, recorded at distances of 2 and 4 meters, containing
+52 rotating objects in total. Sequences are captured with
+Metavision EVK4HD event camera. Each sequence shows
+the quadcopter moving progressively faster, starting with
+near-hovering to mimic light wind and progressing to rapid,
+shaky movements similar to drone racing. The level of ego-
+motion of the camera is indicated byM ego ∈ {1, . . . ,7},
+where higher values represent a greater intensity of motion
+(see Fig. 2). Camera settings, such as aperture and focus,
+were tuned for varying distances. The Arduino-regulated
+propeller speeds were calibrated to a spiral path, simulat-
+ing real flight, with motor speeds ranging from 30-80% of
+maximum. An infrared sensor aimed at reflective tape on
+the rotor measured the values, with its analog output passed
+to the camera’s trigger input. In all recordings, the quad-
+copter is mounted on a table and the camera is held in hand.
+4.2. Accuracy metrics
+We evaluate a tracker by the mean absolute error (MAE),
+mean absolute relative error (MArE), and root mean
+squared error (RMSE) between its instantaneous shaft
+speed and the infrared (IR) sensor ground truth. The tracker
+internally estimates angular speed (ω(t)) (rad/s) (Sec. 3.6),
+and we convert it to RPM and to shaft RPM. The IR setup
+produces time-synchronized, microsecond-accurate shaft-
+speed measurements for each propeller (the comparator out-
+put is synchronized with the camera clock), which we treat
+as the ground truth (RPM GT(t)). We compute the per-
+sequence errors as
+MAEseq = 1
+|T |
+X
+t∈T
+ [RPMshaft(t)−RPM GT(t)
+ ,
+MArEseq = 1
+|T |
+X
+t∈T
+ [RPMshaft(t)−RPM GT(t)
+
+|RPMGT(t)| ,
+RMSEseq =
+s
+1
+|T |
+X
+t∈T
+
+[RPMshaft(t)−RPM GT(t)
+2
+,
+where (T) is the set of tracker update times (asynchronous
+for per-event methods, discrete for aggregation baselines).
+Unless stated otherwise, all results are reported as shaft
+RPM.
+5
+MArE (%)↓MAE (RPM)↓RMSE (RPM)↓
+d M ego l(s) propeller oursAEB [15] DeepEv [4]oursAEB [15] DeepEv [4]oursAEB [15] DeepEv [4]
+2m
+1 28.7
+rear right1.361.4 8564.8 93.7 5980.8 652423.7 215.9 7186.8 785896.2
+rear left 1.30.9402.4 81.4 73.0 32090.3 241.4 241.2 46466.0
+front left1.535.3 4132.0 118.4 2487.0 303141.3 194.1 3302.9 359054.3
+front right1.265.5 94.6 77.8 5650.8 8759.2 186.3 7673.3 9700.4
+3 27.7
+rear right1.21198.7 5013.6 85.1 102482.5 386360.6 223.2 192935.8 437954.9
+rear left 31.715.02059.8 2137.8 1696.4 151319.8 4518.8 3482.9 184206.2
+front left4.2467.5 5236.2 230.2 37691.4 376231.1 763.8 81016.3 448776.7
+front right4.81347.9 195.7 267.9 110056.2 14595.8 1031.9 202948.8 18910.5
+5 28.8
+rear right62.3531.3 106.7 6347.2 41415.3 9244.0 7842.7 79321.0 10241.1
+rear left100.9480.0 117.9 9689.7 30491.9 10624.2 10899.5 67097.7 12239.0
+front left65.0389.8 99.3 5045.3 33458.3 8963.0 6266.7 69659.2 9836.3
+front right97.71122.0 398.5 8871.4 77151.0 32523.2 9710.6 111267.4 56823.0
+4m
+1 28.7
+rear right73.1285.5 834.5 6616.3 21029.7 57801.3 8517.8 46759.1 73901.3
+rear left1.257.2 89.6 76.4 6038.7 8341.9 158.4 20115.0 9422.8
+front left1.448.9 88.7 104.8 4676.4 7853.7 255.3 16769.4 8925.9
+front right1.3165.4 835.4 87.8 13041.8 58054.3 319.4 36853.1 74833.5
+3 28.9
+rear right 70.958.895.8 5770.0 5904.9 9773.3 7008.1 11479.0 10725.7
+rear left1.346.8 1801.4 85.0 3960.0 140787.4 211.7 4845.4 181653.8
+front left1.3303.1 1937.2 109.4 21349.0 146814.9 210.8 51357.9 174482.0
+front right 79.839.797.4 7832.8 4091.3 9594.5 9394.6 5306.3 10465.4
+5 27.2
+rear right95.3994.6 97.8 9688.6 83816.5 9942.3 10614.2 127547.1 10817.5
+rear left93.91043.3 94.8 9316.3 76882.9 9332.0 10400.6 133235.2 10351.1
+front left1.71092.8 3339.1 119.1 81598.8 260136.5 241.1 126119.1 310936.4
+front right88.31126.9 95.6 8752.7 93336.6 9351.7 9711.9 134050.9 10281.2
+Table 1. Benchmark on selected recordings of Timestamped Quadcopter with Egomotion (TQE). For each presented method and setting
+(camera-target distanced, egomotion levelM ego), the average shaft-RPM mean absolute relative error (MArE), mean absolute error (MAE),
+and root mean squared error (RMSE) are reported over 4-fold cross-validation across the four propellers (one training propeller per fold).
+Both AEB-Tracker [15] and DeepEv [4] methods were modified to allow RPM estimation (see Sec. 4.3). TQE ground-truth RPM has
+µ±σ= 11193±3540,min 917,max 15768. Durationlof recording reported in seconds.M ego = 1roughly means “slow camera
+movement”, whileM ego = 5means “fast camera movement” (see Fig. 2). AsM ego increases, the camera experiences stronger egomotion,
+leading to increase of the number of events generated in the background. Complete results are provided in supplementary Table S3.
+4.3. Benchmarking against existing trackers
+In our benchmarks, we include the asynchronous blob
+tracker [15] and the data-driven feature tracker [4] be-
+cause they represent complementary, strong event-native
+baselines that map directly to rotor-RPM estimation with
+minimal changes. The tracker [15] operates purely asyn-
+chronously on raw events and tracks compact “event blobs”.
+In contrast, the deep tracker [4] produces high-rate point
+trajectories. Both methods have mature public implemen-
+tations, are designed for fast, high-dynamic-range motion,
+and together bracket the model-based vs. learned design
+space, enabling comparisons with minimal adaptations to
+the propeller-tracking setting of RPM estimation. The next
+two sections detail these task-specific modifications.
+4.3.1. AEB-Tracker modifications
+We adapted the original event tracker [15] to rotor targets
+by (i) using an ellipse-aligned gate for event association and
+(ii) estimating RPM directly from the tracked ellipse orien-
+tation. Specifically, for an event at(c, r)and trackiwith
+center(z xi , zyi ), semi-axes(λ 1,i, λ2,i)and orientationθ i,
+we compute the ellipse-frame residual
+ex
+ey
+
+=
+ cosθ i sinθ i
+−sinθ i cosθ i
+ c−z xi
+r−z yi
+
+,
+di =
+r
+ex
+λ1,i
+2
++
+
+ey
+λ2,i
+2
+,
+and accept the event ifd i < τ(adaptiveτ). This re-
+places the original Euclidean pixel gate, making the associ-
+ation geometry-aware for slender blades. We also initialize
+(zx, zy, λ1, λ2)to match the rotor footprint.
+RPM from orientation.The filter tracks the ellipse
+orientationθ(t)∈[0, π). We unwrap it with∆θ k =
+wrap(−π/2,π/2] (θk −θ k−1)andΦ k = Φk−1 + ∆θk. When-
+ever|Φ|increases by2πbetween timest 1 andt 2 we update
+an instantaneous RPM estimate
+[RPM = B·60
+t2 −t 1
+,
+6
+where the factorBcompensates theπ-periodicity ofθ.
+Equivalently, [RPM(t) = 60
+π
+˙θ(t)using the unwrappedθ.
+In addition to the task-specific changes described above,
+we tuned the tracker’s parameters one by one. After qual-
+itatively confirming that this setup produced correct tracks
+for about10ms at the start of each sequence, we ran a grid
+search around these values (see supplementary Sec. S3).
+4.3.2. DeepEv Tracker Modifications
+Given DeepEv [4] trackletsT={(t i,z i)}N
+i=1 withz i =
+(zxi , zyi ), we adopt the same EKF used by HelixTrack for
+phase estimation and reuse the homographyH∈R 3×3 esti-
+mated by HelixTrack. To preserve the estimated perspective
+and scale while anchoring the warp to the DeepEv image-
+plane measurements, we overwrite the translation entries of
+Hfor each observationz i:
+H13 ←z xi H33,(5)
+H23 ←z yi H33.(6)
+This keeps the projective scaleH 33 fixed and injects the
+DeepEv positions into the homography. Our rationale is
+that, even when our homography estimate degrades in some
+recordings, accurate DeepEv tracklets should produce re-
+sults comparable to those of HelixTrack.
+We could not fine-tune the model (no ground-truth tracks
+or camera poses are available), and we could not modify the
+method due to its deep network nature. We used the EDS-
+fine-tuned weights, which showed gains on higher-motion
+data in [4]. We qualitatively confirmed the correctness of
+our modifications on the first 10ms of recordings.
+4.4. Benchmark
+All three methods were initialized with the same starting
+positions and scale estimates provided by [7]. In deploy-
+ment, initialization can be performed by a standard RGB
+camera, it does not require a high frame rate or low latency.
+When a tracker fails,i.e., begins to report a wrong RPM, we
+do not reinitialize. HelixTrack parameters were found by
+element-wise descent and a grid search around these values
+(see supplementary Sec. S4). In every fold, the parameters
+that minimized the training error of HelixTrack were iden-
+tical, unlike those of AEB-Tracker.
+Despite our best-effort adaptations for RPM estimation,
+the results in Table 1 show that the strongly periodic pro-
+peller setting, outside the intended design space of AEB-
+Tracker and DeepEv, leads to very high failure rates for
+both methods. The best performance is achieved by Helix-
+Track. As expected, errors grow with stronger egomotion
+Mego and with larger capture distanced. IncreasingM ego
+raises the number of background events, further stressing
+the trackers. In the sequences where HelixTrack fails, we
+observe abrupt camera movements that coincide with a very
+low rotation speed (≈1352 RPM). Under these conditions,
+Event
+Stride MAE (RPM)↓RTF est ↑U evt/UGN
+1105.6±48.8 13.6±3.6 775.00±249.17
+21382.2±3277.8 30.3±12.5 1520.84±1477.22
+31339.7±2933.5 42.8±12.2 1081.24±854.28
+42492.1±3520.2 53.1±22.8 559.09±645.35
+Table 2. Runtime-accuracy trade-off for event subsampling. We
+report mean±standard deviation across 4-fold cross-validation
+on the 23 successfully tracked propellers (MAE≤300 RPM)
+from Timestamped Quadcopter with Egomotion dataset. Met-
+rics: Mean Absolute Error (MAE, RPM; lower is better), the es-
+timated real-time factor RTF est (higher is better) computed as se-
+quence duration divided by the total compute time (per-event EKF
+updates plus batched Gauss-Newton (GN) solves), and the mean
+per-update costsU evt/UGN for a single event update and a single
+GN pose solve, respectively. “Event stride = k” means only every
+k-th event is processed. See Sec. 4.5 for the details and definitions.
+the phase advance needed to trigger a pose update — half a
+shaft rotation for a two-blade rotor (i.e.,2πin helical phase)
+— accumulates too slowly relative to the image-plane mo-
+tion, so the pose estimate lags and the track can break.
+Visualization of HelixTrack tracklets and final projec-
+tions of per-propeller unit circles is available in Fig. 3, com-
+plete results and all parameters in supplementary Sec. S5
+and Table S3, and qualitative results in the supplementary
+video, theC++implementation in the supplementary codes.
+4.5. Runtime Analysis
+Theevent stridemeans processing everyk-th event
+(stride = 1,2,3,4). The RTFest is computed as
+RTFest =
+P
+s durations
+Uevt +U GN
+,
+i.e., the ratio of total sequence time to the sumU evt of all
+per-event update times and the sumU GN of all GN-solve
+times (all inµs). We also reportU evt/UGN exposing the
+cost profile of the loops. All runtime experiments were ex-
+ecuted single-threaded on machines equipped with AMD
+EPYC 7543 processors. The single-propeller tracker used
+under20MB of memory, including all benchmark storage
+routines.
+The results reported in Table 2 are computed over the 23
+successfully tracked propellers (MAE≤300 RPM) from
+TQE (Sec. 4.1), indicated by✓in supplementary Table S3.
+Processing all events (stride = 1) achieves RTFest ≈13.6±
+3.6(full dataset RTF est ≈11.8±4.4), which is comfort-
+ably faster than real time, with MAE =105.6±48.8RPM.
+Subsampling increases throughput, but degrades accuracy.
+7
+Mego = 1
+d= 2 m
+Mego = 2
+d= 2 m
+Mego = 1
+d= 4 m
+Mego = 2
+d= 4 m
+Mego = 4
+d= 4 m
+Figure 3. Projection of per-propeller unit circles under the final homography estimate, overlaid with HelixTrack trajectories on selected
+Timestamped Quadcopter with Egomotion sequences. Propellers are color-coded: rear left green, rear right orange, front left red, front
+right cyan. Markers encode time: size increases and opacity decreases backward in time, so older states appear larger and more transparent.
+100
+ 80
+ 60
+ 40
+ 20
+ 0
+ 20
+ 40
+ 60
+ 80
+ 100
+Ablation amount (%)
+102
+103
+104
+ RPM ablation (%)
+pose ablation (%)
+scale ablation (%)
+Figure 4. Robustness to initialization errors. We perturb
+the initial tracker position, in-plane scale, and initial RPM by
+±{1,2, . . . ,100}%around the nominal initialization and run He-
+lixTrack end-to-end. For position, we average shifts “toward” and
+“away from” the nearest distractor (propeller). The plot reports
+shaft-RPM Mean Absolute Error (MAE) across propellers with
+MAE≤300(lower is better); red line marks 10,000 RPM.
+4.6. Initial State Estimate Ablation
+Trackers are provided with a coarse initial state (posi-
+tion, radius/scale, weak perspective, and RPM), supplied
+by the propeller detector [7]. We evaluate how much
+initialization quality matters by ablating each component
+independently and measuring the MAE of the estimated
+shaft RPM across 23 successfully tracked propellers (MAE
+≤300 RPM) from Timestamped Quadcopter with Ego-
+motion (Sec. 4.1), marked with✓in supplementary Ta-
+ble S3. We vary RPM and scale by±{1,2, . . . ,100}%
+of their nominal values. For position, we translate along
+the image-plane radial direction by a given fraction of the
+estimated blade radius and average “toward-distractor” and
+“away-from-distractor” shifts.
+Fig. 4 shows that the system is tolerant to errors in ini-
+tialization but exhibits sharp, asymmetric failure modes for
+larger perturbations.
+4.7. Loss ablation
+A detailed ablation of(λ ϕ, λr, λpol, λband, λBTO)terms (4)
+revealed that thephaseλ ϕ andradialλ r data terms provide
+the backbone for stable pose/phase coupling. Thebandcon-
+straintsλ band andpolarityλ pol alignment significantly boost
+robustness under distance and highM ego; andBTOλ BTO
+offers a small but reliable safety margin against occupancy
+imbalance. Together, these components are necessary to
+keep the asynchronous EKF and batched GN updates co-
+herent. See the full results in supplementary Sec. S6.
+4.8. Limitations
+Initialization.Coarse hub position/scale/RPM is required;
+small errors are tolerated, but larger perturbations (>30%)
+often cause failures (Sec. 4.6).
+View and geometry.A single planar homography and a he-
+lical phase on a visible annulus are assumed; edge-on/side
+views (severe foreshortening), strong non-planarity, or
+heavy occlusion violate this model and degrade tracking.
+Scene priors.Known blade count and dominance of rotor
+events in the ring is assumed. However, the blade count may
+be estimated during initialization.
+Reinitialization.HelixTrack does not perform automatic
+reinitialization after failure. Although feasible, doing so
+would obscure the evaluation by mixing tracking accuracy
+with recovery behavior.
+5. Conclusion
+We presented HelixTrack, a geometry-aware, event-native
+tracker that turns the periodicity of a spinning propeller into
+a modeling advantage. By lifting events to rotor-plane coor-
+dinates and enforcing a simple helical phase law, a per-event
+EKF and batched Gauss-Newton pose updates jointly de-
+liver trajectories and instantaneous RPM from raw events.
+Performance of HelixTrack on the proposed TQE bench-
+mark exposed the difficulty ofsingle-propellertracking in
+the presence of near-identical, co-rotating distractors and
+egomotion. Representative asynchronous and learned track-
+ers frequently fail or experience order-of-magnitude errors
+as motion and distance increase (Table 1). At the same time,
+HelixTrack produces instantaneous angular-speed and RPM
+estimates at event resolution,i.e.,microsecond-latencyup-
+dates, while sustaining≈11.8×real-time throughput on
+TQE (Table 2), pairing precise timing with practical speed.
+Pose updates are triggered adaptively whenever the accu-
+mulated helical phase exceeds2π. This defines an event-
+driven, self-timed pose-estimation latency typically on the
+order of tens ofms.
+8
+References
+[1] Gianluca Ciattaglia, Grazia Iadarola, Linda Senigagliesi, En-
+nio Gambi, and Susanna Spinsante. Measuring UA V Pro-
+peller RPM with FMCW Radar: Validation with Calibrated
+Accelerometers. InIEEE Sensors Applications Symposium
+(SAS), pages 1–6, 2024. 3
+[2] Jakub Kol ´aˇr, Radim ˇSpetl´ık, and Jiˇr´ı Matas. EEPPR: event-
+based estimation of periodic phenomena rate using correla-
+tion in 3D. InSeventeenth International Conference on Ma-
+chine Vision (ICMV 2024), pages 223–230. SPIE, 2025. 2
+[3] Siqi Li, Zhikuan Zhou, Zhou Xue, Yipeng Li, Shaoyi Du,
+and Yue Gao. 3D Feature Tracking via Event Camera.
+InIEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 18974–18983, 2024. 1, 2
+[4] Nico Messikommer, Carter Fang, Mathias Gehrig, Giovanni
+Cioffi, and Davide Scaramuzza. Data-Driven Feature Track-
+ing for Event Cameras With and Without Frames.IEEE
+Transactions on Pattern Analysis and Machine Intelligence,
+47(5):3706–3717, 2025. 1, 2, 6, 7
+[5] Anton Mitrokhin, Cornelia Ferm ¨uller, Chethan Paramesh-
+wara, and Yiannis Aloimonos. Event-Based Moving Object
+Detection and Tracking. In2018 IEEE/RSJ International
+Conference on Intelligent Robots and Systems (IROS), pages
+1–9, 2018. 3
+[6] Nitin J. Sanket, Deep Singh Chahat, Chethan M. Paramesh-
+wara, Cornelia Ferm¨uller, Guido C.H.E. de Croon, and Yian-
+nis Aloimonos. EVPropNet: Detecting Drones By Find-
+ing Propellers For Mid-Air Landing And Following. In
+Robotics: Science and Systems 2021, 2021. 3
+[7] Radim Spetlik, Tereza Uhrov ´a, and Ji ˇr´ı Matas. Efficient
+Real-Time Quadcopter Propeller Detection and Attribute Es-
+timation with High-Resolution Event Camera. InImage
+Analysis, pages 217–230, 2025. 2, 3, 7, 8
+[8] Terrence Stewart, Marc-Antoine Drouin, Guillaume Gagne,
+and Guy Godin. Drone Virtual Fence Using a Neuromor-
+phic Camera. InInternational Conference on Neuromorphic
+Systems 2021, pages 1–9, 2021. 3
+[9] Terrence Stewart, Marc-Antoine Drouin, Michel Picard,
+Frank Billy Djupkep Dizeu, Anthony Orth, and Guillaume
+Gagn´e. A Virtual Fence for Drones: Efficiently Detecting
+Propeller Blades with a DVXplorer Event Camera. InPro-
+ceedings of the International Conference on Neuromorphic
+Systems 2022, pages 1–7, 2022. 3
+[10] Hongze Sun, Rui Liu, Wuque Cai, Jun Wang, Yue Wang,
+Huajin Tang, Yan Cui, Dezhong Yao, and Daqing Guo. Re-
+liable object tracking by multimodal hybrid feature extrac-
+tion and transformer-based fusion.Neural Networks, 178:
+106493, 2024. 1, 2
+[11] Matou ˇs Vrba and Martin Saska. Marker-Less Micro Aerial
+Vehicle Detection and Localization Using Convolutional
+Neural Networks.IEEE Robotics and Automation Letters,
+5(2):2459–2466, 2020. 3
+[12] Song Wang, Zhu Wang, Can Li, Xiaojuan Qi, and Hay-
+den Kwok-Hay So. SpikeMOT: Event-Based Multi-Object
+Tracking With Sparse Motion Features.IEEE Access, 13:
+214–230, 2025. 1, 2
+[13] Xiao Wang, Shiao Wang, Chuanming Tang, Lin Zhu, Bo
+Jiang, Yonghong Tian, and Jin Tang. Event Stream-Based
+Visual Object Tracking: A High-Resolution Benchmark
+Dataset and A Novel Baseline. InIEEE/CVF Conference
+on Computer Vision and Pattern Recognition, pages 19248–
+19257, 2024. 2
+[14] Xiao Wang, Chao Wang, Shiao Wang, Xixi Wang, Zhicheng
+Zhao, Lin Zhu, and Bo Jiang. MambaEVT: Event Stream
+based Visual Object Tracking using State Space Model.
+IEEE Transactions on Circuits and Systems for Video Tech-
+nology, 2025. 1, 2
+[15] Ziwei Wang, Timothy Molloy, Pieter van Goor, and Robert
+Mahony. Asynchronous Blob Tracker for Event Cameras.
+IEEE Transactions on Robotics, 40:4750–4767, 2024. 1, 2,
+6
+[16] Maria Zafeiri, Georgios Evangelidis, and Emmanouil
+Psarakis. Event-ECC: Asynchronous Tracking of Events
+with Continuous Optimization, 2024. 1, 2, 3
+[17] Xu Zheng, Yexin Liu, Yunfan Lu, Tongyan Hua, Tianbo Pan,
+Weiming Zhang, Dacheng Tao, and Lin Wang. Deep Learn-
+ing for Event-based Vision: A Comprehensive Survey and
+Benchmarks, 2024. 3
+[18] Ye Zheng, Canlun Zheng, Jiahao Shen, Peidong Liu, and
+Shiyu Zhao. Keypoint-Guided Efficient Pose Estimation and
+Domain Adaptation for Micro Aerial Vehicles.IEEE Trans-
+actions on Robotics, 40:2967–2983, 2024. 3
+9
+HelixTrack:
+Event-Based Tracking and RPM Estimation of Propeller-like Objects
+Supplementary Material
+S1. Full Gauss-Newton System with Jacobians
+In this section, we describe the full Gauss-Newton System
+with Jacobians of the terms mentioned in Sec. 3.
+Jacobians for all residuals.Letσ(x) = 1
+1+e−x and adopt
+d
+dx wrapπ(x) = 1a.e. For polarity,
+δi = wrapπ(εϕ
+i −d pol), ε pol
+i =c pol sin( 1
+2 δi),
+Jpol
+i =c pol · 1
+2 cos( 1
+2 δi)J ϕ
+i .
+For soft band barriers,
+εin
+i =c b softplusτ (rin−ri), ε out
+i =c b softplusτ (ri−rout),
+Jin
+i =−c b σ
+ rin −r i
+τ
+
+Jr
+i ,J out
+i =c b σ
+ ri −r out
+τ
+
+Jr
+i .
+Balanced Tip Occupancy (BTO).Define soft occupan-
+cies with temperatureτ occ,
+min
+i =σ
+ rin −r i
+τocc
+
+, m out
+i =σ
+ ri −r out
+τocc
+
+,
+pin = 1
+|B|
+X
+i
+min
+i , p out = 1
+|B|
+X
+i
+mout
+i .
+Then
+∂pin
+∂q = 1
+|B|
+X
+i
+h
+− 1
+τocc
+min
+i (1−m in
+i )Jr
+i
+i
+,
+∂pout
+∂q = 1
+|B|
+X
+i
+h
+1
+τocc
+mout
+i (1−m out
+i )Jr
+i
+i
+.
+Let
+ϕ(s) = softplusτ (s), ϕ ′(s) =σ(s/τ),
+ϕ′′(s) =σ(s/τ)(1−σ(s/τ))/τ
+and
+slo
+in =p in −p in, s hi
+in =p in − pin,
+slo
+out =p out −p out, s hi
+out =p out − pout.
+Hence
+Jslo
+in
+=− ∂pin
+∂q ,J shi
+in
+= ∂pin
+∂q ,J slo
+out
+=− ∂pout
+∂q ,J shi
+out
+= ∂pout
+∂q .
+Complete GN system.With frozen gatesg ϕ
+i =λ ϕwϕ
+i and
+gr
+i =λ rwr
+i ,
+HGN =
+X
+i
+gϕ
+i (Jϕ
+i )⊤Jϕ
+i +
+X
+i
+gr
+i (Jr
+i )⊤Jr
+i (S1)
++λ pol
+X
+i
+(Jpol
+i )⊤Jpol
+i (S2)
++λ band
+X
+i
+h
+(Jin
+i )⊤Jin
+i + (Jout
+i )⊤Jout
+i
+i
+(S3)
++λ BTO
+X
+q∈{in,out}
+h
+ϕ′′(slo
+q ) (Jsloq )⊤Jsloq (S4)
++ϕ ′′(shi
+q ) (Jshiq )⊤Jshiq
+i
+(S5)
++H reg,(S6)
+g=
+X
+i
+gϕ
+i εϕ
+i (Jϕ
+i )⊤ +
+X
+i
+gr
+i εr
+i (Jr
+i )⊤ (S7)
++λ pol
+X
+i
+εpol
+i (Jpol
+i )⊤ (S8)
++λ band
+X
+i
+h
+εin
+i (Jin
+i )⊤ +ε out
+i (Jout
+i )⊤
+i
+(S9)
++λ BTO
+X
+q∈{in,out}
+h
+ϕ′(slo
+q ) (Jslo
+q )⊤ +ϕ ′(shi
+q ) (Jshiq )⊤
+i
+(S10)
++g reg.(S11)
+S2. Dataset Details
+This section gives a detailed overview of Timestamped
+Quadcopter with Egomotion dataset.
+The average number of ground-truth timetamps is 4 770,
+maximum 5 116, minimum 4 906, and median is 4 876.
+The average number of processed events is1.7×10 9,
+maximum3.1×10 9, minimum1.0×10 9, and median is
+1.6×10 9.
+The average event rate is60,4×10 6 (events / second).
+In Fig. S1, the aggregated events of the first 10 ms of
+five 1-second intervals are displayed for all recordings taken
+at a camera-to-quadcopter distance of 2 m. The intensity
+of egomotion begins at the top withM ego = 1and pro-
+gresses to the last row withM ego = 7. Fig. S2 is structured
+in the same way and presents recordings for a camera-to-
+quadcopter distance of 4 m.
+1
+Mego = 1
+Mego = 2
+Mego = 3
+Mego = 4
+Mego = 5
+Mego = 6
+Mego = 7
+Figure S1. Aggregated events from all sequences in the Timestamped Quadcopter with Egomotion dataset with camera-to-quadcopter
+distance of 2 m, from the smallest (top row,M ego=1), to the largest (bottom row,M ego=7) egomotion intensity. Events from the first 10 ms
+of five 1-second intervals are shown. Positive events displayed in black, negative in gray.
+S3. AEB-Tracker Parameters Grid Search
+As described in Sec. 4.3.1, we first tuned the hyperparame-
+ters of the tracker qualitatively. Once a well-performing set
+of parameters was found on the first 10 milliseconds of the
+recording, we run the grid search described below.
+We performed a comprehensive grid search over four
+AEB-tracker hyperparameters, 72 combinations in total,
+evaluated across all recordings and channels. The param-
+eters are as follows.
+1.rb(ring buffer len): Length of the per-target event/state
+ring buffers. Larger values smooth estimates more but
+add inertia,
+2.∆t: Integration timestep (seconds) used in the state tran-
+sitionFfor(x, y, θ); in particularθ←θ+q dt,
+3.q xy: Sets both velocity process-noise intensitiesq vx and
+qvy [px2/s3]. Larger values allow faster changes in ve-
+locity (more agility) at the cost of more noise/jitter.
+4.q q: Sets the spin-rate process-noise intensityq q
+[rad2/s3]. Larger values let the angular velocityqvary
+more between updates.
+We select the setting that minimizes mean absolute er-
+ror (MAE). We also report std/median and mean absolute
+relative error (MArE).
+The best configuration observed in Table S4 isrb= 22,
+∆t= 2.5,q xy = 5.0,q q = 0.5, achieving MArE 502.976
+and MAE of 38763.807 (aggregated over all recordings and
+channels).
+2
+Mego = 1
+Mego = 2
+Mego = 3
+Mego = 4
+Mego = 5
+Mego = 6
+Figure S2. Aggregated events from all sequences in the Timestamped Quadcopter with Egomotion dataset with camera-to-quadcopter
+distance of 4 m, from the smallest (top row,M ego=1), to the largest (bottom row,M ego=7) egomotion intensity. Events from the first 10 ms
+of five 1-second intervals are shown. Positive events displayed in black, negative in gray.
+S4. HelixTrack Parameter and Grid Search
+We set the parameters of HelixTrack with a combination
+of element-wise search and grid search. The complete set
+of parameters we searched for and their final values are:
+qjerk = 400,λ ϕ = 1.0,λ r = 1.0,λ pol = 0.25,λ band =
+5.0,λ BTO = 1.0,r in = 0.2,r out = 1.5,γ tx =γ ty = 6.0,
+γpersp = 1.0. For the complete set of all parameters, not just
+the ones we searched for, see the attached configuration file
+and codes.
+The grid search was performed overr in andr out param-
+eters, results are in Table S1.
+The element-wise search was performed with the follow-
+ing set of parameters:
+•q jerk (7): 50, 100, 200, 300, 400, 500, 600
+•λ ϕ (2): 0, 1
+•λ r (2): 0, 1
+•λ pol (6): 0, 0.25, 0.5, 1, 2, 10
+•λ band (5): 0, 1, 5, 10, 20
+•λ tip (5): 0, 0.5, 1, 2, 10
+•γ x=γy (7): 1, 2, 3, 4, 5, 6, 7
+•γ persp (5): 0.01, 0.1, 1, 2, 3
+In total,275unique experiment configurations were ex-
+amined, not including the grid search forr in andr out.
+S5. Benchmark Complete Results
+Across all cells of the Table S3, HelixTrack is consis-
+tently the most accurate. It achieves the lowest error in
+43/52 (MArE), 46/52 (MAE), and 45/52 (RMSE) cases,
+while AEB-Tracker wins 8/6/5 and DeepEv 1/0/2, respec-
+tively. When we compute medians to mitigate heavy-
+tailed failures, HelixTrack reduces error dramatically rel-
+ative to AEB-Tracker — MArE: 400.05→58.95 (-85.3%),
+MAE: 29,859.50→5,200.3 (-82.6%), RMSE: 51,662.7→
+6,332.25 (-87.7%). DeepEv’s medians for MAE/RMSE
+(14,459.0 / 19,504.4) are below the medians of AEB-
+Tracker, but its means are much higher due to frequent
+catastrophic failures.
+Effect of distanced.Performance improves with increased
+camera–scene distance for HelixTrack. Atd= 2mvs.4m,
+HelixTrack’s medians drop from 63.65→29.65 (MArE),
+3
+rin rout MAE (RPM)↓median
+0.0 1.4 25897.838±64560.838 6837.504
+0.0 1.5 31173.431±89359.956 6623.163
+0.0 1.6 21958.240±62330.271 7017.397
+0.0 1.7 33919.799±133795.000 7763.656
+0.0 1.8 17984.723±43510.488 6545.428
+0.0 1.9 15783.097±43241.885 7078.281
+0.1 1.4 4356.810±3985.889 4434.631
+0.1 1.5 4814.578±5064.586 4995.041
+0.1 1.6 4775.841±3918.283 6323.458
+0.1 1.7 4951.189±4428.663 5219.091
+0.1 1.8 4687.726±4220.879 5265.247
+0.1 1.9 10199.062±39763.741 5339.970
+0.2 1.4 10659.736±44302.860 5516.170
+0.2 1.5 4052.139±3779.222 5200.247
+0.2 1.6 4626.934±3815.512 6050.976
+0.2 1.7 4574.203±4136.607 5391.578
+0.2 1.8 4691.997±4598.824 5790.502
+0.2 1.9 4500.675±3892.523 5436.960
+0.3 1.4 6470.363±12126.974 6095.369
+0.3 1.5 4401.135±3951.049 5629.956
+0.3 1.6 43303.116±274072.299 5758.449
+0.3 1.7 4846.586±5777.108 5273.668
+0.3 1.8 5826.368±8064.029 5181.593
+0.3 1.9 29329.222±179744.825 5588.616
+Table S1. Grid search overr in andr out withq jerk=400,λ ϕ=1.0,
+λr=1.0,λ pol=0.25,λ band=5.0,λ BTO=1.0,γ x=γy=6.0,
+γpersp=1.0. The best setting (lowest MAE mean) is highlighted
+in bold. See Sec. S4
+.
+5,233.10→2,697.55 (MAE), and 6,461.30→3,358.60
+(RMSE). Compared to AEB-Tracker, the improvement
+widens at longer distance:d= 2m: -84.1% / 82.5% / 87.5%
+(MArE/MAE/RMSE);d= 4m: -94.9% / 94.0% / 95.5%.
+A plausible explanation is that the propeller occupies a
+smaller angular extent and generates fewer disruptive events
+at largerd, which HelixTrack exploits more effectively than
+the baselines.
+Effect of ego-motion magnitudeM ego.As motion in-
+creases, all methods degrade, but HelixTrack degrades more
+gracefully. For MAE (medians), HelixTrack stays low for
+Mego = 1−3, and rises forM ego = 4−7— still well be-
+low the results of AEB-Tracker. AEB-Tracker shows a pro-
+nounced failure at moderate-to-high motion (also reflected
+in RMSE), while DeepEv exhibits a non-monotonic pattern
+with moderate medians at certain bins but very heavy tails
+overall.
+Sensitivity to propeller position.The position of a pro-
+peller with respect to other propellers / distractors, mat-
+ters., HelixTrack’s easiest configuration is front-left. The
+most challenging is rear-right, followed by front-right and
+rear-left. Despite this, HelixTrack still secures the major-
+ity of wins in every placement: for example, in front-left it
+wins 13/13 cells for each metric, and even in rear-right it
+wins 12/13 (MAE/RMSE) and 11/13 (MArE).
+AEB-Tracker collects isolated wins (e.g., low motion
+with favorable geometry), and DeepEv takes two RMSE
+cells in specific configurations. However, these wins are
+not robust: the corresponding 95th percentiles and maxima
+reveal frequent large errors and outright failures, especially
+for DeepEv. In contrast, HelixTrack shows low variance in
+most of the grid.
+S6. Loss ablation
+The results of the loss term ablation in Table S2 show that
+removing either the phase-geometry coupling(λ ϕ = 0)
+or the radial centering term(λ r = 0)leads to failure or
+order-of-magnitude error increases. For example, at 2 m,
+Mego = 2, MAE jumps from 90.1±16.9 (full loss) to
+9327.1±175.7 whenλ r = 0; at 4 m,M ego = 3it rises
+from 3449.3±3961.3 to 9775.1±129.5 whenλ r = 0.
+Tying the Gauss-Newton pose update to phase residualsr ϕ
+and keeping events centered on the blade ring viarr are im-
+portant for stabilizing geometry and phase jointly (Sec. 3.5,
+Eq. 4).
+Disabling the soft band-edge barriers(λ band = 0)fre-
+quently causes failures in the harder settings (average col-
+umn reports failure; e.g., 2 m,M ego = 4and 2 m,M ego = 7
+both fail), indicating that the annulus constraints are nec-
+essary to keep the optimization from leaking inside/outside
+the informative blade band when background motion and
+perspective effects are large.
+Dropping the polarity term(λ pol = 0)degrades the over-
+all average from 4052.1±2135.0 to 7070.4±3146.3 and
+can sharply increase error in challenging cases (e.g., 4 m,
+Mego = 4: 2152.1±4126.9 to 8055.4±1451.6), suggest-
+ing that softly aligning polarity clusters with the expected
+blade edge improves robustness.
+Removing BTO(λ BTO = 0)changes the overall average
+modestly. This is consistent with BTO’s role in discour-
+aging degenerate “only-inside/only-outside” fits rather than
+driving the solution on its own.
+Overall, thephaseandradialdata terms provide the
+backbone for stable pose/phase coupling. Thebandcon-
+straints andpolarityalignment significantly boost robust-
+ness under distance and highM ego; andBTOoffers a small
+but reliable safety margin against occupancy imbalance. To-
+gether, these components are necessary to keep the asyn-
+chronous EKF and batched GN updates coherent.
+4
+d Mego allλ ϕ = 0λ r = 0λ pol = 0λ band = 0λ BTO = 0
+2m 192.8±18.498.8±21.5F5701.9±3786.992.8±18.492.8±18.4
+2m 2 90.1±16.9 2347.5±2766.6 9327.1±175.7 2103.3±4024.689.7±16.690.1±16.9
+2m 3 680.2±974.9 3883.1±7372.4 8430.9±1589.7 7438.6±1700.5 1319.7±1522.6612.5±841.1
+2m 4 7212.5±332.2 7807.8±3357.2 8720.0±1068.0 7427.7±950.7F6821.1±475.0
+2m 5 7488.4±2162.56718.4±2246.1F7142.7±1866.7 7452.8±1056.6 8434.2±974.4
+2m 6 7981.4±1705.1 8902.2±307.7 8210.8±2099.4 8182.7±1695.0 7997.8±1939.97868.9±899.4
+2m 76497.4±1534.1F9194.3±240.5 7873.5±1519.3F8032.8±573.4
+4m 11721.3±3263.32176.4±4171.0 9056.5±197.7F1783.8±3388.9 2078.1±3976.9
+4m 2 2210.3±4234.0 2319.0±4439.3 9144.2±202.0 4762.0±4837.7 2263.6±4340.81926.3±3666.0
+4m 3 3449.3±3961.3 4670.2±3608.3 9775.1±129.5 5903.4±4194.7 4409.7±5026.23402.7±3953.5
+4m 42152.1±4126.94795.1±5431.6 9617.7±224.8 8055.4±1451.6 4582.6±5204.8 2301.9±4426.5
+4m 5 6969.2±4582.95955.7±3973.09573.0±229.7 8630.4±2381.1 6913.1±4549.0 6705.8±4456.2
+4m 66132.8±842.38208.1±1158.6F7688.5±623.2 6251.3±2277.5 7990.8±1147.7
+Average 4052.1±2135.0F F7070.4±3146.3F4335.2±1955.8
+Table S2. Loss term ablation. Mean Absolute Error (MAE) of RPM (lower is better) under 4-fold cross-validation on theTimestamped
+Quadcopter with Egomotion(TQE) dataset, reported for two camera–target distances (2 m / 4 m) and seven egomotion levelsM ego. “All”
+uses the full batch objective in Eq. (4) with: phase–geometry alignmentrϕ, radial centeringr r, polarity alignmentr pol, soft annulus barriers
+rin, rout, and Balanced Tip Occupancyℓ BTO. Each ablation zeroes the indicated coefficient(λ ϕ, λr, λpol, λband, λBTO). TQE ground-truth
+RPM hasµ±σ= 11193.5±3540.2. Values are mean±std.
+5
+MArE (%)↓MAE (RPM)↓RMSE (RPM)↓
+d M ego propeller oursAEB [15] DeepEv [4]oursAEB [15] DeepEv [4]oursAEB [15] DeepEv [4]
+2m
+1
+rear right1.361.4 8564.8 93.7✓5980.8 652423.7 215.9 7186.8 785896.2
+rear left 1.30.9402.4 81.4✓73.0 32090.3 241.4 241.2 46466.0
+front left1.535.3 4132.0 118.4✓2487.0 303141.3 194.1 3302.9 359054.3
+front right1.265.5 94.6 77.8✓5650.8 8759.2 186.3 7673.3 9700.4
+2
+rear right1.252.1 9523.5 85.0✓4637.6 749060.3 178.9 5549.9 904654.7
+rear left 1.31.24811.7 87.0✓112.9 357676.3 277.2 457.4 455119.6
+front left1.549.8 478.5 114.0✓3075.8 28118.0 223.5 3879.2 68394.5
+front right1.134.5 7458.3 74.3✓2035.8 562988.0 160.9 3367.3 787219.5
+3
+rear right1.21198.7 5013.6 85.1✓102482.5 386360.6 223.2 192935.8 437954.9
+rear left 31.715.02059.8 2137.8×1696.4 151319.8 4518.8 3482.9 184206.2
+front left4.2467.5 5236.2 230.2✓37691.4 376231.1 763.8 81016.3 448776.7
+front right4.81347.9 195.7 267.9✓110056.2 14595.8 1031.9 202948.8 18910.5
+4
+rear right80.21241.2 12474.4 7634.3×93995.4 934583.8 9184.5 182884.8 1141131.4
+rear left 72.224.58678.3 7135.2×2828.9 674615.2 8699.8 4782.1 824811.5
+front left79.3410.3 89.2 7249.8×29227.1 8417.0 8825.0 68684.3 9362.8
+front right 76.359.5115.2 6830.5×5933.1 9027.6 8459.0 11580.7 10408.5
+5
+rear right62.3531.3 106.7 6347.2×41415.3 9244.0 7842.7 79321.0 10241.1
+rear left100.9480.0 117.9 9689.7×30491.9 10624.2 10899.5 67097.7 12239.0
+front left65.0389.8 99.3 5045.3×33458.3 8963.0 6266.7 69659.2 9836.3
+front right97.71122.0 398.5 8871.4×77151.0 32523.2 9710.6 111267.4 56823.0
+6
+rear right93.6726.2 98.1 8928.2×56816.8 9461.9 9874.9 72370.2 10223.4
+rear left97.2593.1 108.1 9221.9×41752.5 9932.7 10100.1 56316.4 11232.3
+front left89.5885.2 103.3 8283.4×61735.0 9163.9 9331.8 72061.8 10279.6
+front right57.2833.4 96.8 5492.3×58682.1 8881.7 6655.9 72261.9 9697.5
+7
+rear right72.2609.8 10417.8 7194.7×44713.1 780191.6 8292.1 51904.1 894151.1
+rear left 119.1 617.697.08328.7×45454.3 9180.8 10071.3 51421.3 10022.4
+front left75.7218.3 96.4 5341.7×16859.6 8811.8 6817.1 28904.6 9686.0
+front right72.2248.4 3638.0 5124.5×17502.1 253240.6 6262.9 29616.6 315329.1
+4m
+1
+rear right73.1285.5 834.5 6616.3×21029.7 57801.3 8517.8 46759.1 73901.3
+rear left1.257.2 89.6 76.4✓6038.7 8341.9 158.4 20115.0 9422.8
+front left1.448.9 88.7 104.8✓4676.4 7853.7 255.3 16769.4 8925.9
+front right1.3165.4 835.4 87.8✓13041.8 58054.3 319.4 36853.1 74833.5
+2
+rear right 91.143.193.1 8561.2×3847.8 8671.9 9537.1 4496.9 9642.0
+rear left1.337.4 3242.1 85.7✓3529.9 241975.2 273.2 5020.2 334534.1
+front left1.572.1 93.8 112.9✓6545.9 8536.3 254.1 17753.2 9595.1
+front right1.377.3 111.7 81.4✓4335.3 8969.8 248.9 17551.4 10429.0
+3
+rear right 70.958.895.8 5770.0×5904.9 9773.3 7008.1 11479.0 10725.7
+rear left1.346.8 1801.4 85.0✓3960.0 140787.4 211.7 4845.4 181653.8
+front left1.3303.1 1937.2 109.4✓21349.0 146814.9 210.8 51357.9 174482.0
+front right 79.839.797.4 7832.8×4091.3 9594.5 9394.6 5306.3 10465.4
+4
+rear right83.51194.9 95.2 8342.3×101987.0 9517.6 9491.6 201102.2 10384.6
+rear left1.1915.1 5251.8 77.6✓76275.0 426131.2 222.5 179370.3 537350.6
+front left1.41392.2 389.6 111.6✓98307.7 26933.9 288.4 201185.3 46853.8
+front right1.21166.3 13.3 76.9✓86077.0 693.4 209.4 191384.9 2370.2
+5
+rear right95.3994.6 97.8 9688.6×83816.5 9942.3 10614.2 127547.1 10817.5
+rear left93.91043.3 94.8 9316.3×76882.9 9332.0 10400.6 133235.2 10351.1
+front left1.71092.8 3339.1 119.1✓81598.8 260136.5 241.1 126119.1 310936.4
+front right88.31126.9 95.6 8752.7×93336.6 9351.7 9711.9 134050.9 10281.2
+6
+rear right62.1862.2 167.5 6778.5×68419.4 14322.1 8015.9 97991.7 20098.2
+rear left57.6958.9 3772.0 5547.2×71680.8 290173.7 6746.4 101283.8 359570.3
+front left71.5995.9 11718.5 6929.4×76394.7 918479.2 8522.6 105034.9 1024071.7
+front right60.3856.0 130.4 5276.0×68594.4 12657.2 6397.8 102062.7 18155.9
+Table S3. Benchmark, Timestamped Quadcopter with Egomotion (TQE). For each presented method and setting (camera-target distanced,
+egomotion levelM ego), the average shaft-RPM mean absolute relative error (MArE), mean absolute error (MAE), and root mean squared
+error (RMSE) are reported over 4-fold cross-validation across the four propellers (one training propeller per fold). Both AEB-Tracker [15]
+and DeepEv [4] methods were modified to allow RPM estimation (see Sec. 4.3). TQE ground-truth RPM hasµ±σ= 11193±3540,min
+917,max 15768.M ego = 1roughly means “slow camera movement”, whileM ego = 5means “fast camera movement” (see Fig. 2). As
+Mego increases, the camera experiences stronger egomotion, leading to increase of the number of events generated in the background.
+6
+rb∆t q xy qq MArE (%)↓median MAE (RPM)↓median
+22 2 0.2 0.25 496.419±402.402 428.662 39026.775±35704.452 27149.123
+22 2 0.2 0.5 538.978±532.238 335.813 41383.706±40575.234 24252.682
+22 2 0.2 1 650.760±610.255 580.914 49669.433±45197.183 44281.303
+22 2 0.2 2 697.412±668.144 537.904 53110.765±50873.870 39796.295
+22 2 1 0.25 587.555±478.454 411.100 39086.051±29527.280 26570.284
+22 2 1 0.5 544.618±510.582 401.498 41860.949±39341.854 30303.074
+22 2 1 1 615.645±577.918 553.496 47675.376±44307.127 42378.293
+22 2 1 2 694.885±662.955 577.022 52290.860±49815.795 42225.829
+22 2 5 0.25 510.618±388.804 397.497 39608.748±29903.648 29931.931
+22 2 5 0.5 506.789±472.468 400.054 38952.001±36484.847 29859.506
+22 2 5 1 637.420±590.571 597.896 48856.215±44965.901 44515.639
+22 2 5 2 664.801±623.023 618.496 50721.102±47445.002 46145.155
+22 2.5 0.2 0.25 599.204±405.217 428.662 39154.585±31844.812 27149.123
+22 2.5 0.2 0.5 541.204±535.575 335.813 41498.917±40751.855 24252.682
+22 2.5 0.2 1 656.356±608.960 626.036 50086.419±45131.954 46723.292
+22 2.5 0.2 2 700.457±672.777 537.904 53245.557±51105.783 39796.295
+22 2.5 1 0.25 582.944±578.059 404.861 39748.436±29535.466 26218.892
+22 2.5 1 0.5 546.194±513.463 401.498 41776.215±39284.539 30303.074
+22 2.5 1 1 619.680±584.761 553.496 48030.629±44997.063 42378.293
+22 2.5 1 2 696.192±666.004 577.022 52501.734±50255.610 42225.829
+22 2.5 5 0.25 511.004±391.626 362.751 39689.789±30294.397 29321.017
+22 2.5 5 0.5 502.976±462.531 400.054 38763.807±35860.448 29859.506
+22 2.5 5 1 635.099±588.028 597.896 48705.017±44782.988 44515.639
+22 2.5 5 2 667.087±627.251 618.496 50801.457±47640.824 46145.155
+22 3 0.2 0.25 537.926±339.939 388.690 40797.556±25179.970 32766.673
+22 3 0.2 0.5 527.948±330.960 482.435 39522.724±23976.905 36248.414
+22 3 0.2 1 1572.458±1439.686 1071.014 118593.768±108749.883 77281.079
+22 3 0.2 2 1729.390±1080.637 1360.253 130145.474±80259.290 110851.655
+22 3 1 0.25 510.972±337.896 387.988 39089.727±25213.444 29948.624
+22 3 1 0.5 522.499±311.308 439.585 39133.979±22301.822 32878.498
+22 3 1 1 1623.040±1543.883 999.876 122206.230±115777.126 76014.113
+22 3 1 2 1819.391±1076.640 1690.690 137646.186±80980.053 131528.893
+22 3 5 0.25 528.778±327.504 393.982 39501.077±24184.137 30356.179
+22 3 5 0.5 620.653±478.684 477.139 46596.672±35946.071 36226.416
+22 3 5 1 1775.582±1666.385 1223.899 133680.214±125213.233 87960.026
+22 3 5 2 1868.451±1043.308 1612.597 140173.319±78815.962 128391.421
+33 2 0.2 0.25 532.076±542.658 313.137 40817.897±42290.509 23969.480
+33 2 0.2 0.5 637.817±621.567 359.301 49911.826±48999.356 28496.135
+33 2 0.2 1 722.345±689.412 658.855 54920.949±53254.591 47154.050
+33 2 0.2 2 801.631±764.621 785.360 61030.529±59447.827 53700.933
+33 2 1 0.25 539.595±519.382 358.879 41270.586±40010.637 28240.227
+33 2 1 0.5 628.204±611.694 431.265 48692.147±47599.814 29409.219
+33 2 1 1 756.455±724.681 638.275 57933.012±56141.403 47235.750
+33 2 1 2 764.616±729.480 607.390 58027.384±56269.086 46369.599
+33 2 5 0.25 594.884±547.826 405.281 45212.128±41849.225 29930.397
+33 2 5 0.5 610.897±618.423 408.550 47681.510±48051.032 30428.694
+33 2 5 1 767.419±722.414 736.989 58523.058±55635.939 54296.780
+33 2 5 2 730.990±714.165 662.121 55352.472±55168.873 49709.951
+33 2.5 0.2 0.25 543.074±522.441 313.137 41890.431±41373.974 24346.624
+33 2.5 0.2 0.5 639.535±619.235 401.370 50020.820±48816.418 30022.854
+33 2.5 0.2 1 727.481±698.813 668.252 55288.661±54127.417 47256.535
+33 2.5 0.2 2 796.948±755.814 785.360 60555.252±58419.579 53700.933
+33 2.5 1 0.25 532.410±506.342 358.879 41036.682±39777.801 28240.227
+33 2.5 1 0.5 628.658±612.606 431.265 48665.147±47531.149 29409.219
+33 2.5 1 1 743.469±715.875 624.827 57122.147±55425.865 45484.744
+33 2.5 1 2 768.513±746.872 601.761 58471.489±57907.022 45485.936
+33 2.5 5 0.25 580.653±485.517 490.506 44371.759±38134.757 35223.893
+33 2.5 5 0.5 611.000±617.790 408.550 47776.018±48238.017 30428.694
+33 2.5 5 1 760.575±742.399 681.596 58266.260±57509.586 48980.242
+33 2.5 5 2 727.158±722.614 597.588 54981.420±55610.817 46677.389
+33 3 0.2 0.25 780.803±691.614 539.572 56835.266±50675.677 40003.480
+33 3 0.2 0.5 711.595±534.618 538.977 52049.844±39029.338 41273.869
+33 3 0.2 1 1334.438±1139.468 903.428 98922.204±83349.423 68183.272
+33 3 0.2 2 1800.403±1083.555 1388.857 133261.705±80987.728 101892.368
+33 3 1 0.25 797.649±670.641 528.780 58814.987±49205.799 37539.753
+33 3 1 0.5 752.721±578.674 586.153 56295.285±43346.004 42539.879
+33 3 1 1 1371.708±1131.488 885.898 100812.434±83139.604 65690.880
+33 3 1 2 1882.050±1109.445 1727.309 138601.952±83147.089 128224.109
+33 3 5 0.25 705.389±592.629 559.554 52950.606±43547.516 42432.900
+33 3 5 0.5 713.524±573.891 534.925 52982.647±42424.617 39459.804
+33 3 5 1 1401.862±1125.218 929.897 102499.465±82047.435 64251.491
+33 3 5 2 1843.070±1090.486 1565.962 136415.532±80887.240 122453.756
+Table S4. AEB-Tracker grid search results. MAE and MArE reported asµ±σ. See Sec. S3 for description.
+7

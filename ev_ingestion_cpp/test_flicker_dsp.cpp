@@ -1,0 +1,405 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <random>
+#include <cassert>
+#include "flicker_dsp.hpp"
+
+// Unit test 1: Drone Blade Passage Frequency (4000 Hz sampling, 140 Hz BPF / 4200 RPM, 512 samples)
+void test_pure_harmonic_signal() {
+    std::cout << "[TEST 1] Testing Pure Harmonic Propeller Flicker Extraction (140 Hz BPF / 4200 RPM @ 4000 Hz, 512 samples)... ";
+    
+    double sample_rate = 4000.0; // 4000 Hz => 250us bins
+    size_t window_size = 512;    // 128ms window
+    predator::PropellerFlickerAnalyzer analyzer(sample_rate, window_size, 80.0, 1200.0, 15.0);
+
+    double target_bpf = 140.0;
+    std::vector<double> signal(window_size);
+    for (size_t i = 0; i < window_size; ++i) {
+        double t = static_cast<double>(i) / sample_rate;
+        // Fundamental (140 Hz) + 2nd harmonic (280 Hz) + 3rd harmonic (420 Hz)
+        signal[i] = 10.0 * std::sin(2.0 * M_PI * target_bpf * t) +
+                     6.0 * std::sin(2.0 * M_PI * 2.0 * target_bpf * t) +
+                     3.0 * std::sin(2.0 * M_PI * 3.0 * target_bpf * t) +
+                    20.0; // DC offset
+    }
+
+    auto res = analyzer.analyze_time_series(signal, 2);
+
+    assert(res.is_drone_detected == true);
+    assert(std::abs(res.fundamental_bpf_hz - target_bpf) < 3.0); // within 3.0 Hz
+    assert(std::abs(res.estimated_rpm - 4200.0) < 90.0);         // within 90 RPM
+    assert(res.confidence > 0.60);
+    assert(res.peak_snr_db > 10.0);
+
+    std::cout << "PASSED! (Detected: " << res.fundamental_bpf_hz << " Hz | RPM: " << res.estimated_rpm << " | Confidence: " << res.confidence << ")\n";
+}
+
+// Unit test 2: High RPM Drone Propeller (400 Hz BPF / 12000 RPM with Harmonics)
+void test_high_rpm_harmonic_comb() {
+    std::cout << "[TEST 2] Testing High-RPM Propeller Extraction (400 Hz BPF / 12,000 RPM with Harmonics)... ";
+    
+    double sample_rate = 4000.0;
+    size_t window_size = 512;
+    predator::PropellerFlickerAnalyzer analyzer(sample_rate, window_size, 80.0, 1200.0, 15.0);
+
+    double target_bpf = 400.0;
+    std::vector<double> signal(window_size);
+    for (size_t i = 0; i < window_size; ++i) {
+        double t = static_cast<double>(i) / sample_rate;
+        // Fundamental (400 Hz) + 2nd harmonic (800 Hz) + 3rd harmonic (1200 Hz)
+        signal[i] = 12.0 * std::sin(2.0 * M_PI * target_bpf * t) +
+                     7.0 * std::sin(2.0 * M_PI * 2.0 * target_bpf * t) +
+                     4.0 * std::sin(2.0 * M_PI * 3.0 * target_bpf * t) +
+                    25.0;
+    }
+
+    auto res = analyzer.analyze_time_series(signal, 2);
+
+    assert(res.is_drone_detected == true);
+    assert(std::abs(res.fundamental_bpf_hz - target_bpf) < 5.0);
+    assert(std::abs(res.estimated_rpm - 12000.0) < 150.0);
+    assert(res.confidence > 0.65);
+
+    std::cout << "PASSED! (Detected: " << res.fundamental_bpf_hz << " Hz | RPM: " << res.estimated_rpm << " | Confidence: " << res.confidence << ")\n";
+}
+
+// Unit test 3: Low-Light Night-Time Photon Starved Rotor (Attenuated Harmonics)
+void test_low_light_sparse_rotor() {
+    std::cout << "[TEST 3] Testing Low-Light / Night-Time Sparse Rotor Extraction (Harmonics rolled off by analog front-end)... ";
+    
+    double sample_rate = 4000.0;
+    size_t window_size = 512;
+    predator::PropellerFlickerAnalyzer analyzer(sample_rate, window_size, 80.0, 1200.0, 15.0);
+
+    std::mt19937 rng(1337);
+    std::normal_distribution<double> noise_dist(0.0, 1.2);
+
+    double target_bpf = 180.0; // 5400 RPM
+    std::vector<double> signal(window_size);
+    for (size_t i = 0; i < window_size; ++i) {
+        double t = static_cast<double>(i) / sample_rate;
+        // Strong fundamental (180 Hz) but heavily attenuated harmonics due to pixel RC cutoff + dark noise
+        signal[i] = 3.5 * std::sin(2.0 * M_PI * target_bpf * t) +
+                    0.4 * std::sin(2.0 * M_PI * 2.0 * target_bpf * t) +
+                    noise_dist(rng) + 5.0; // sparse count
+    }
+
+    auto res = analyzer.analyze_time_series(signal, 2);
+
+    assert(res.is_drone_detected == true);
+    assert(std::abs(res.fundamental_bpf_hz - target_bpf) < 4.0);
+    assert(res.confidence >= 0.45);
+
+    std::cout << "PASSED! (Night-time sparse fundamental locked: " << res.fundamental_bpf_hz << " Hz | SNR: " << res.peak_snr_db << " dB)\n";
+}
+
+// Unit test 4: Low-Frequency Ego-Motion Rejection
+void test_ego_motion_rejection() {
+    std::cout << "[TEST 4] Testing Ego-Motion & Random Clutter Rejection (5-15 Hz walking sway + white noise)... ";
+    
+    double sample_rate = 4000.0;
+    size_t window_size = 512;
+    predator::PropellerFlickerAnalyzer analyzer(sample_rate, window_size, 80.0, 1200.0, 15.0);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<double> noise_dist(0.0, 3.0);
+
+    std::vector<double> signal(window_size);
+    for (size_t i = 0; i < window_size; ++i) {
+        double t = static_cast<double>(i) / sample_rate;
+        // Low frequency human gait motion (2 Hz, 6 Hz) + random noise
+        signal[i] = 20.0 * std::sin(2.0 * M_PI * 2.5 * t) +
+                    15.0 * std::sin(2.0 * M_PI * 6.0 * t) +
+                    noise_dist(rng) + 50.0;
+    }
+
+    auto res = analyzer.analyze_time_series(signal, 2);
+
+    // Should NOT trigger drone detection
+    assert(res.is_drone_detected == false);
+    assert(res.confidence < 0.35);
+
+    std::cout << "PASSED! (Properly rejected clutter, Detection: FALSE | Confidence: " << res.confidence << ")\n";
+}
+
+// Unit test 5: Ambient Powerline Light Flicker Rejection (50 Hz / 60 Hz)
+void test_powerline_flicker_rejection() {
+    std::cout << "[TEST 5] Testing AC Powerline Light Flicker Rejection (50-60 Hz room lighting)... ";
+    
+    double sample_rate = 4000.0;
+    size_t window_size = 512;
+    predator::PropellerFlickerAnalyzer analyzer(sample_rate, window_size, 80.0, 1200.0, 15.0);
+
+    std::vector<double> signal(window_size);
+    for (size_t i = 0; i < window_size; ++i) {
+        double t = static_cast<double>(i) / sample_rate;
+        // 60 Hz ambient lighting sine wave
+        signal[i] = 25.0 * std::sin(2.0 * M_PI * 60.0 * t) + 30.0;
+    }
+
+    auto res = analyzer.analyze_time_series(signal, 2);
+
+    // 60 Hz is below the 80 Hz cutoff -> must be rejected
+    assert(res.is_drone_detected == false);
+
+    std::cout << "PASSED! (60 Hz room light rejected, Detection: FALSE)\n";
+}
+
+// Unit test 6: Activity Density Gate (Dark Background Noise)
+void test_low_activity_density_gate() {
+    std::cout << "[TEST 6] Testing Low-Activity Density Gate (Sparse dark noise)... ";
+    
+    double sample_rate = 4000.0;
+    size_t window_size = 512;
+    predator::PropellerFlickerAnalyzer analyzer(sample_rate, window_size, 80.0, 1200.0, 8.0);
+
+    // Only 5 total events over 128ms
+    std::vector<double> signal(window_size, 0.0);
+    signal[10] = 2.0;
+    signal[40] = 1.0;
+    signal[100] = 2.0;
+
+    auto res = analyzer.analyze_time_series(signal, 2);
+
+    // Activity < 8 events -> immediately rejected
+    assert(res.is_drone_detected == false);
+
+    std::cout << "PASSED! (Low event count rejected before FFT, Detection: FALSE)\n";
+}
+
+// Unit test 7: Spatial 2x2 Pooling Grid Verification
+void test_spatial_2x2_pooling() {
+    std::cout << "[TEST 7] Testing Spatial 2x2 Cell Pooling & Ingestion... ";
+    
+    predator::SpatialPatchGrid grid(32, 18, 4000.0, 512);
+    
+    // Ingest events into cell (2, 2) and (3, 3)
+    uint64_t base_ts = 1000000;
+    for (int i = 0; i < 50; ++i) {
+        grid.ingest_event(85, 85, base_ts + i * 200); // lands in col 2, row 2
+        grid.ingest_event(125, 125, base_ts + i * 200); // lands in col 3, row 3
+    }
+    grid.advance_temporal_bin();
+
+    assert(grid.is_pooled_patch_active(2, 2, 50.0) == true);
+    auto pooled = grid.get_pooled_patch_history(2, 2);
+    double total_pooled = std::accumulate(pooled.begin(), pooled.end(), 0.0);
+    assert(total_pooled >= 100.0); // Both cells pooled together!
+
+    double cx, cy;
+    grid.get_pooled_patch_center(2, 2, cx, cy);
+    assert(std::abs(cx - 3.0 * 40.0) < 1e-4);
+    assert(std::abs(cy - 3.0 * 40.0) < 1e-4);
+
+    std::cout << "PASSED! (Pooled 2x2 patch correctly aggregated events and computed center)\n";
+}
+
+// Unit test 8: Global Common-Mode & M-of-N Track State Machine
+void test_global_common_mode_and_tracking() {
+    std::cout << "[TEST 8] Testing Global Common-Mode Spatial Rejection & M-of-N Track Lifecycle... ";
+    
+    predator::SpatialFlickerClusterer::reset_tracker();
+
+    std::vector<predator::FlickerDetectionResult> raw_detections;
+    
+    // Simulate 20 patches across the entire screen all reporting ~120 Hz (e.g. 120Hz LED ambient light spanning 600px)
+    for (int i = 0; i < 20; ++i) {
+        predator::FlickerDetectionResult d;
+        d.is_drone_detected = true;
+        d.fundamental_bpf_hz = 120.0 + (i % 2) * 0.5;
+        d.centroid_px_x = (i % 5) * 200; // Spans 0 to 800 px
+        d.centroid_px_y = (i / 5) * 150; // Spans 0 to 450 px
+        raw_detections.push_back(d);
+    }
+
+    // Add 2 overlapping pooled patches from the same localized drone rotor at 260 Hz
+    predator::FlickerDetectionResult drone1, drone2;
+    drone1.is_drone_detected = true;
+    drone1.fundamental_bpf_hz = 260.0;
+    drone1.centroid_px_x = 400;
+    drone1.centroid_px_y = 300;
+    
+    drone2.is_drone_detected = true;
+    drone2.fundamental_bpf_hz = 261.0;
+    drone2.centroid_px_x = 420; // 20 pixels away
+    drone2.centroid_px_y = 310;
+
+    raw_detections.push_back(drone1);
+    raw_detections.push_back(drone2);
+
+    // Frame 1: Tentative (0 confirmed)
+    auto f1 = predator::SpatialFlickerClusterer::filter_and_cluster(raw_detections, 6);
+    assert(f1.empty());
+
+    // Frame 2: Tentative (0 confirmed)
+    auto f2 = predator::SpatialFlickerClusterer::filter_and_cluster(raw_detections, 6);
+    assert(f2.empty());
+
+    // Frame 3: Confirmed! (3-hit confirmation validated, common-mode rejected, overlapping merged)
+    auto f3 = predator::SpatialFlickerClusterer::filter_and_cluster(raw_detections, 6);
+    assert(f3.size() == 1);
+    assert(std::abs(f3[0].fundamental_bpf_hz - 260.0) < 2.0);
+
+    // Frame 4: Test track coasting across a 1-frame sparse dropout (empty input)
+    auto coasted = predator::SpatialFlickerClusterer::filter_and_cluster({}, 6);
+    assert(coasted.size() == 1); // Confirmed track successfully coasted!
+    assert(std::abs(coasted[0].fundamental_bpf_hz - 260.0) < 2.0);
+
+    std::cout << "PASSED! (Spatial dispersion rejected ambient light, 3-hit confirmation validated, and coasted across dropout)\n";
+}
+
+// Unit test 9: Lens Bearing Geometry
+void test_lens_bearing_geometry() {
+    std::cout << "[TEST 9] Testing Edmund Optics 8mm f/8 M12 Lens Bearing Geometry... ";
+    
+    predator::LensParameters lens;
+    lens.focal_length_mm = 8.0;
+    lens.pixel_pitch_um = 4.86;
+    lens.sensor_width = 1280;
+    lens.sensor_height = 720;
+
+    double az, el;
+    // Center pixel (640, 360) -> Optical Axis (0, 0 deg)
+    lens.pixel_to_angles(640.0, 360.0, az, el);
+    assert(std::abs(az) < 1e-4);
+    assert(std::abs(el) < 1e-4);
+
+    // Top-Right corner (1280, 0)
+    lens.pixel_to_angles(1280.0, 0.0, az, el);
+    assert(az > 20.0 && az < 23.0); // Expect ~21.2 deg
+    assert(el > 11.0 && el < 14.0); // Expect ~12.3 deg
+
+    std::cout << "PASSED! (Center: [0, 0] deg | Corner: [" << az << ", " << el << "] deg)\n";
+}
+
+// Unit test 10: Drone Target Beneath 120 Hz Building Floodlight (Multi-Candidate Peak Extraction)
+void test_floodlight_drone_coexistence() {
+    std::cout << "[TEST 10] Testing Drone Detection Directly Beneath 120 Hz AC Building Floodlight... ";
+    
+    predator::SpatialFlickerClusterer::reset_tracker();
+
+    double sample_rate = 4000.0;
+    size_t window_size = 512;
+    predator::PropellerFlickerAnalyzer analyzer(sample_rate, window_size, 80.0, 1200.0, 15.0);
+
+    // 1. Drone Patch Signal: Strong 120 Hz Floodlight ripple + 175 Hz Drone Propeller (5250 RPM)
+    std::vector<double> drone_patch_signal(window_size);
+    for (size_t i = 0; i < window_size; ++i) {
+        double t = static_cast<double>(i) / sample_rate;
+        drone_patch_signal[i] = 20.0 * std::sin(2.0 * M_PI * 120.0 * t) + // 120 Hz floodlight carrier
+                                10.0 * std::sin(2.0 * M_PI * 175.0 * t) + // 175 Hz drone propeller
+                                30.0;
+    }
+
+    // 2. Extract multi-candidates from drone patch
+    auto drone_cands = analyzer.analyze_time_series_candidates(drone_patch_signal, 2, 2);
+    assert(drone_cands.size() == 2); // Both 120 Hz floodlight AND 175 Hz drone extracted!
+
+    // 3. Simulate 8 background patches illuminated by the same 120 Hz floodlight (spread across 800px)
+    std::vector<predator::FlickerDetectionResult> raw_all;
+    for (int p = 0; p < 8; ++p) {
+        predator::FlickerDetectionResult bg_det;
+        bg_det.is_drone_detected = true;
+        bg_det.fundamental_bpf_hz = 120.0;
+        bg_det.centroid_px_x = p * 120; // 0 to 840 px
+        bg_det.centroid_px_y = 100;
+        raw_all.push_back(bg_det);
+    }
+
+    // Add drone patch candidates (at pixel 600, 350)
+    for (auto& c : drone_cands) {
+        c.centroid_px_x = 600;
+        c.centroid_px_y = 350;
+        raw_all.push_back(c);
+    }
+
+    // Pass 3 frames through clusterer to confirm (M=3)
+    predator::SpatialFlickerClusterer::filter_and_cluster(raw_all, 4);
+    predator::SpatialFlickerClusterer::filter_and_cluster(raw_all, 4);
+    auto confirmed = predator::SpatialFlickerClusterer::filter_and_cluster(raw_all, 4);
+
+    // Verified: The 120 Hz floodlight was suppressed across all patches, and the 175 Hz drone was confirmed!
+    assert(confirmed.size() == 1);
+    assert(std::abs(confirmed[0].fundamental_bpf_hz - 175.0) < 3.0);
+    assert(confirmed[0].centroid_px_x == 600);
+
+    std::cout << "PASSED! (120 Hz floodlight rejected across scene, 175 Hz drone confirmed beneath light)\n";
+}
+
+// Unit test 11: Shaded Quadcopter 4-Rotor Multi-Scale Airframe Fusion (12 hits -> 1 unified airframe lock)
+void test_shaded_multirotor_fusion() {
+    std::cout << "[TEST 11] Testing Shaded Quadcopter Multi-Rotor Airframe Fusion (12 candidate hits -> 1 unified target)... ";
+    
+    predator::SpatialFlickerClusterer::reset_tracker();
+
+    // Simulate 4 rotors + multi-scale pooled cells generating 12 hits all at ~183 Hz (5500 RPM Mavic Air 2)
+    // Located at bottom-center of FOV (X=640, Y=580)
+    std::vector<predator::FlickerDetectionResult> quad_hits;
+    int base_x = 640;
+    int base_y = 580;
+
+    for (int rotor = 0; rotor < 4; ++rotor) {
+        int rx = base_x + ((rotor % 2 == 0) ? -25 : 25);
+        int ry = base_y + ((rotor < 2) ? -25 : 25);
+        
+        // Each rotor generates 1 single-cell hit + 2 pooled-cell hits
+        for (int k = 0; k < 3; ++k) {
+            predator::FlickerDetectionResult h;
+            h.is_drone_detected = true;
+            h.fundamental_bpf_hz = 183.0 + (rotor * 0.4);
+            h.centroid_px_x = rx + (k * 4 - 4);
+            h.centroid_px_y = ry + (k * 4 - 4);
+            h.confidence = 0.60;
+            h.peak_snr_db = 11.5;
+            quad_hits.push_back(h);
+        }
+    }
+
+    assert(quad_hits.size() == 12);
+
+    // Pass 3 frames for M=3 confirmation
+    auto f1 = predator::SpatialFlickerClusterer::filter_and_cluster(quad_hits, 6);
+    assert(f1.empty());
+
+    auto f2 = predator::SpatialFlickerClusterer::filter_and_cluster(quad_hits, 6);
+    assert(f2.empty());
+
+    // Frame 3: Confirmed!
+    auto f3 = predator::SpatialFlickerClusterer::filter_and_cluster(quad_hits, 6);
+    // Must NOT be suppressed by common-mode filter (spatial dispersion <= 140px)
+    // Must fuse all 12 hits into 1 unified airframe target
+    assert(f3.size() == 1);
+    assert(std::abs(f3[0].fundamental_bpf_hz - 183.6) < 2.0);
+    assert(std::abs(f3[0].centroid_px_x - base_x) < 15);
+    assert(std::abs(f3[0].centroid_px_y - base_y) < 15);
+    // Multi-rotor fusion boost elevates confidence to >= 0.90!
+    assert(f3[0].confidence >= 0.90);
+
+    std::cout << "PASSED! (12 multi-scale rotor hits fused into 1 target | BPF: " << f3[0].fundamental_bpf_hz 
+              << " Hz | Centroid: [" << f3[0].centroid_px_x << ", " << f3[0].centroid_px_y 
+              << "] | Unified Confidence: " << f3[0].confidence << ")\n";
+}
+
+int main() {
+    std::cout << "========================================================\n";
+    std::cout << "  Predator — Frequency-Domain DSP Unit Verification     \n";
+    std::cout << "========================================================\n";
+
+    test_pure_harmonic_signal();
+    test_high_rpm_harmonic_comb();
+    test_low_light_sparse_rotor();
+    test_ego_motion_rejection();
+    test_powerline_flicker_rejection();
+    test_low_activity_density_gate();
+    test_spatial_2x2_pooling();
+    test_global_common_mode_and_tracking();
+    test_lens_bearing_geometry();
+    test_floodlight_drone_coexistence();
+    test_shaded_multirotor_fusion();
+
+    std::cout << "========================================================\n";
+    std::cout << "  ALL 11 MATHEMATICAL DSP UNIT TESTS PASSED SUCCESSFULLY!\n";
+    std::cout << "========================================================\n";
+    return 0;
+}

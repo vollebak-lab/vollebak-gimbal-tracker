@@ -31,7 +31,7 @@
 //! safety, but this Rust-side check is the last line of defense.
 
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// PID controller gains for a single axis.
 #[derive(Debug, Clone, Serialize, Deserialize)]

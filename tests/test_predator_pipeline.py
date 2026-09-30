@@ -352,10 +352,14 @@ class TestSimulatedRadar:
     """Tests for the simulated radar backend."""
 
     def test_generates_frames(self):
-        from src.layer2_radar.radar_interface import SimulatedRadarBackend
+        from src.layer2_radar.radar_interface import (
+            SimulatedRadarBackend, RadarPowerMode,
+        )
         radar = SimulatedRadarBackend(update_rate_hz=100.0)
         radar.add_simulated_target(range_m=100.0)
         radar.start()
+        # Must set power mode — radar starts in DEEP_SLEEP (cognitive duty cycling)
+        radar.set_power_mode(RadarPowerMode.FULL_TRACK)
         frame = radar.get_frame()
         radar.stop()
         assert frame is not None

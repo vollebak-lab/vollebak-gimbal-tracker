@@ -37,6 +37,51 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Radar Power & Configuration Enums
+# ---------------------------------------------------------------------------
+
+class RadarPowerMode(Enum):
+    """Radar power states for cognitive duty cycling.
+
+    Supports 3-tier power model per Radar Fire Control RoC
+    cognitive power gating architecture.
+
+    DEEP_SLEEP: RF Tx/Rx and DSPs power-gated. Clock only.
+        Typical draw ~50mW. Used in SILENT engagement state.
+    SECTOR_SEARCH: High duty cycle, beam steered to neuromorphic
+        cue bearing. Aggressive wake for acquisition after L1 trigger.
+        Typical draw ~7-9W.
+    FULL_TRACK: All 12Tx/16Rx, max PRF, continuous waveform.
+        Track-quality updates at full rate. Typical draw ~9.5W.
+    """
+    DEEP_SLEEP = auto()
+    SECTOR_SEARCH = auto()
+    FULL_TRACK = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class CFARConfig:
+    """Constant False Alarm Rate detector configuration.
+
+    Configures the adaptive detection threshold for environment-
+    specific sensitivity tuning. When neuromorphic detection
+    corroborates a radar return, CFAR may be bypassed entirely
+    (see ``cfar_bypassed`` field on RadarDetection).
+
+    Attributes:
+        pfa: Probability of false alarm. Lower = fewer false
+            alarms but reduced detection probability.
+            - Open field: 1e-6 (conservative)
+            - Urban/congested: 1e-4 (permissive)
+        guard_cells: Number of guard cells around CUT (cell under test).
+        training_cells: Number of training cells for noise estimation.
+    """
+    pfa: float = 1e-6
+    guard_cells: int = 4
+    training_cells: int = 16
+
+
+# ---------------------------------------------------------------------------
 # Data Classes
 # ---------------------------------------------------------------------------
 
@@ -72,6 +117,8 @@ class RadarDetection:
     y: float
     z: float
     array_id: RadarArrayId
+    hcr_margin_db: float = 0.0
+    cfar_bypassed: bool = False
 
 
 @dataclass(slots=True)
@@ -158,6 +205,56 @@ class RadarBackend(ABC):
             DopplerTimeSeries, or None if insufficient data.
         """
 
+    @abstractmethod
+    def set_power_mode(
+        self,
+        mode: RadarPowerMode,
+        sector_bearing_deg: Optional[float] = None,
+        sector_width_deg: Optional[float] = None,
+    ) -> None:
+        """Set the radar power/duty cycle mode.
+
+        Implements cognitive duty cycling per RoC research.
+        Neuromorphic camera provides the cue bearing — radar wakes
+        aggressively and beam-steers to that sector.
+
+        Args:
+            mode: Target power mode.
+            sector_bearing_deg: Bearing for SECTOR_SEARCH beam steering.
+                Required when mode is SECTOR_SEARCH.
+            sector_width_deg: Search sector half-width in degrees.
+                Defaults to ±15° if not specified.
+        """
+
+    @abstractmethod
+    def set_cfar_config(self, config: CFARConfig) -> None:
+        """Update CFAR detection threshold parameters.
+
+        Allows mission-configurable sensitivity:
+        - Low Pfa (1e-6): Open field — minimize false alarms
+        - High Pfa (1e-4): Urban — accept more clutter for higher Pd
+
+        Args:
+            config: CFAR detector parameters.
+        """
+
+    @abstractmethod
+    def set_tx_power_allocation(
+        self,
+        power_fraction: float,
+        beam_indices: Optional[list[int]] = None,
+    ) -> None:
+        """Set transmit power allocation for cognitive power management.
+
+        Reduces Tx power on close/high-SNR targets to conserve battery.
+        Requires S80 SDK — this is a stub interface until SDK is available.
+
+        Args:
+            power_fraction: Fraction of max Tx power (0.0–1.0).
+            beam_indices: Optional subset of beam channels to adjust.
+                None = apply globally to all Tx channels.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Simulated Radar Backend
@@ -171,6 +268,8 @@ class SimulatedRadarBackend(RadarBackend):
     - Range + azimuth + elevation spread
     - Blade-rate Doppler modulation (micro-Doppler signature)
     - Clutter and noise detections
+    - HCR margin simulation for near-structure scenarios
+    - Power mode state tracking for duty cycle testing
 
     Args:
         update_rate_hz: Frame rate for simulated updates.
@@ -193,6 +292,18 @@ class SimulatedRadarBackend(RadarBackend):
 
         # Simulated targets (configurable)
         self._targets: list[dict] = []
+
+        # Power mode state (cognitive duty cycling)
+        self._power_mode: RadarPowerMode = RadarPowerMode.DEEP_SLEEP
+        self._sector_bearing_deg: Optional[float] = None
+        self._sector_width_deg: float = 15.0
+        self._simulated_power_w: float = 0.05  # Deep sleep default
+
+        # CFAR config state
+        self._cfar_config: CFARConfig = CFARConfig()
+
+        # Tx power allocation state
+        self._tx_power_fraction: float = 1.0
 
     def add_simulated_target(
         self,
@@ -235,6 +346,8 @@ class SimulatedRadarBackend(RadarBackend):
     def stop(self) -> None:
         """Stop the simulated radar."""
         self._running = False
+        self._power_mode = RadarPowerMode.DEEP_SLEEP
+        self._simulated_power_w = 0.05
         logger.info("SimulatedRadarBackend stopped")
 
     def get_frame(self, timeout_s: float = 0.1) -> Optional[RadarFrame]:
@@ -246,6 +359,10 @@ class SimulatedRadarBackend(RadarBackend):
         if not self._running:
             return None
 
+        # In DEEP_SLEEP mode, radar produces no frames
+        if self._power_mode == RadarPowerMode.DEEP_SLEEP:
+            return None
+
         time.sleep(1.0 / self._update_rate_hz)
 
         now_us = int(time.monotonic() * 1e6) - self._start_time_us
@@ -253,6 +370,17 @@ class SimulatedRadarBackend(RadarBackend):
 
         # Generate target detections
         for target in self._targets:
+            # In SECTOR_SEARCH mode, only return targets within sector
+            if self._power_mode == RadarPowerMode.SECTOR_SEARCH:
+                if self._sector_bearing_deg is not None:
+                    bearing_delta = abs(
+                        target["azimuth_deg"] - self._sector_bearing_deg
+                    )
+                    # Handle wraparound
+                    bearing_delta = min(bearing_delta, 360.0 - bearing_delta)
+                    if bearing_delta > self._sector_width_deg:
+                        continue
+
             # Add micro-Doppler modulation
             t_sec = now_us / 1e6
             blade_doppler = (
@@ -261,28 +389,58 @@ class SimulatedRadarBackend(RadarBackend):
             )
             total_doppler = target["velocity_mps"] + blade_doppler
 
-            # Add measurement noise
+            # Simulate HCR margin — PMCW provides ~35dB sidelobe
+            # suppression. Targets near large reflectors still get
+            # good HCR margin due to code-domain isolation.
+            hcr_margin = 35.0 + self._rng.normal(0, 3.0)
+
+            # Scale SNR by Tx power fraction (cognitive power mgmt)
+            effective_snr = 20.0 + self._rng.normal(0, 2)
+            if self._tx_power_fraction < 1.0:
+                effective_snr += 10.0 * np.log10(
+                    max(self._tx_power_fraction, 0.01)
+                )
+
             det = self._make_detection(
                 range_m=target["range_m"] + self._rng.normal(0, 0.3),
                 azimuth_deg=target["azimuth_deg"] + self._rng.normal(0, 0.5),
                 elevation_deg=target["elevation_deg"] + self._rng.normal(0, 0.5),
                 doppler_mps=total_doppler + self._rng.normal(0, 0.1),
-                snr_db=20.0 + self._rng.normal(0, 2),
+                snr_db=effective_snr,
                 rcs_dbsm=target["rcs_dbsm"] + self._rng.normal(0, 1),
                 array_id=RadarArrayId.FRONT,
+                hcr_margin_db=hcr_margin,
             )
             detections.append(det)
 
-        # Generate clutter detections
-        for _ in range(self._num_clutter):
+        # Generate clutter detections (only in search/track modes)
+        clutter_count = self._num_clutter
+        if self._power_mode == RadarPowerMode.SECTOR_SEARCH:
+            # Fewer clutter returns in sector mode (narrower beam)
+            clutter_count = max(1, self._num_clutter // 3)
+
+        for _ in range(clutter_count):
+            clutter_az = self._rng.uniform(-90, 90)
+            # In sector mode, clutter only within sector
+            if self._power_mode == RadarPowerMode.SECTOR_SEARCH:
+                if self._sector_bearing_deg is not None:
+                    clutter_az = (
+                        self._sector_bearing_deg
+                        + self._rng.uniform(
+                            -self._sector_width_deg,
+                            self._sector_width_deg,
+                        )
+                    )
+
             det = self._make_detection(
                 range_m=self._rng.uniform(5, 400),
-                azimuth_deg=self._rng.uniform(-90, 90),
+                azimuth_deg=clutter_az,
                 elevation_deg=self._rng.uniform(-5, 5),
                 doppler_mps=self._rng.normal(0, 0.3),
                 snr_db=self._rng.uniform(5, 12),
                 rcs_dbsm=self._rng.uniform(-20, 0),
                 array_id=RadarArrayId.FRONT,
+                hcr_margin_db=self._rng.uniform(5, 15),  # Low HCR for clutter
             )
             detections.append(det)
 
@@ -342,6 +500,74 @@ class SimulatedRadarBackend(RadarBackend):
             azimuth_deg=azimuth_deg,
         )
 
+    def set_power_mode(
+        self,
+        mode: RadarPowerMode,
+        sector_bearing_deg: Optional[float] = None,
+        sector_width_deg: Optional[float] = None,
+    ) -> None:
+        """Set simulated radar power mode.
+
+        Updates internal power state and simulated power draw.
+        In SECTOR_SEARCH mode, limits detection returns to the
+        specified sector around the neuromorphic cue bearing.
+        """
+        old_mode = self._power_mode
+        self._power_mode = mode
+
+        if sector_bearing_deg is not None:
+            self._sector_bearing_deg = sector_bearing_deg
+        if sector_width_deg is not None:
+            self._sector_width_deg = sector_width_deg
+
+        # Simulated power draw
+        power_map = {
+            RadarPowerMode.DEEP_SLEEP: 0.05,
+            RadarPowerMode.SECTOR_SEARCH: 8.0,
+            RadarPowerMode.FULL_TRACK: 9.5,
+        }
+        self._simulated_power_w = power_map.get(mode, 9.5)
+
+        logger.info(
+            "SimRadar power: %s → %s (%.1fW, sector=%.1f°±%.1f°)",
+            old_mode.name, mode.name, self._simulated_power_w,
+            self._sector_bearing_deg or 0.0, self._sector_width_deg,
+        )
+
+    def set_cfar_config(self, config: CFARConfig) -> None:
+        """Update simulated CFAR parameters."""
+        self._cfar_config = config
+        logger.info(
+            "SimRadar CFAR: Pfa=%.1e, guard=%d, training=%d",
+            config.pfa, config.guard_cells, config.training_cells,
+        )
+
+    def set_tx_power_allocation(
+        self,
+        power_fraction: float,
+        beam_indices: Optional[list[int]] = None,
+    ) -> None:
+        """Set simulated Tx power allocation.
+
+        Adjusts simulated SNR proportionally to power fraction.
+        """
+        self._tx_power_fraction = max(0.01, min(1.0, power_fraction))
+        logger.info(
+            "SimRadar Tx power: %.0f%% (beams: %s)",
+            self._tx_power_fraction * 100,
+            beam_indices or "all",
+        )
+
+    @property
+    def power_mode(self) -> RadarPowerMode:
+        """Current radar power mode."""
+        return self._power_mode
+
+    @property
+    def simulated_power_w(self) -> float:
+        """Current simulated power draw in watts."""
+        return self._simulated_power_w
+
     @staticmethod
     def _make_detection(
         range_m: float,
@@ -351,6 +577,8 @@ class SimulatedRadarBackend(RadarBackend):
         snr_db: float,
         rcs_dbsm: float,
         array_id: RadarArrayId,
+        hcr_margin_db: float = 0.0,
+        cfar_bypassed: bool = False,
     ) -> RadarDetection:
         """Build a RadarDetection from spherical coordinates."""
         az_rad = np.radians(azimuth_deg)
@@ -371,4 +599,6 @@ class SimulatedRadarBackend(RadarBackend):
             y=float(y),
             z=float(z),
             array_id=array_id,
+            hcr_margin_db=hcr_margin_db,
+            cfar_bypassed=cfar_bypassed,
         )

@@ -62,14 +62,19 @@ class GimbalFeedForward:
     Attributes:
         delta_az_deg: Azimuth correction (degrees) to subtract.
         delta_el_deg: Elevation correction (degrees) to subtract.
+        delta_roll_deg: Roll correction (degrees). Positive = operator tilted right.
+            Used by the mast stabilization controller, not the gimbal PID.
         angular_rate_az_dps: Operator heading rotation rate (deg/s).
         angular_rate_el_dps: Operator pitch rotation rate (deg/s).
+        angular_rate_roll_dps: Operator roll rotation rate (deg/s).
         is_valid: Whether IMU data is fresh enough for feed-forward.
     """
     delta_az_deg: float = 0.0
     delta_el_deg: float = 0.0
+    delta_roll_deg: float = 0.0
     angular_rate_az_dps: float = 0.0
     angular_rate_el_dps: float = 0.0
+    angular_rate_roll_dps: float = 0.0
     is_valid: bool = False
 
 
@@ -182,19 +187,24 @@ class MotionCompensator:
 
         # Gimbal feed-forward: negate operator motion
         # Yaw → azimuth correction, Pitch → elevation correction
+        # Roll → mast stabilization (not gimbal PID)
         delta_az = -euler[0]  # Counteract yaw
         delta_el = -euler[1]  # Counteract pitch
+        delta_roll = euler[2]  # Roll: positive = tilted right
 
         # Angular rates from gyro (body frame)
         gyro = np.array(imu_state.gyro_rps)
-        az_rate_dps = float(np.degrees(gyro[2]))  # Z-axis = yaw
-        el_rate_dps = float(np.degrees(gyro[1]))   # Y-axis = pitch
+        az_rate_dps = float(np.degrees(gyro[2]))   # Z-axis = yaw
+        el_rate_dps = float(np.degrees(gyro[1]))    # Y-axis = pitch
+        roll_rate_dps = float(np.degrees(gyro[0]))  # X-axis = roll
 
         return GimbalFeedForward(
             delta_az_deg=float(delta_az),
             delta_el_deg=float(delta_el),
+            delta_roll_deg=float(delta_roll),
             angular_rate_az_dps=az_rate_dps,
             angular_rate_el_dps=el_rate_dps,
+            angular_rate_roll_dps=roll_rate_dps,
             is_valid=True,
         )
 

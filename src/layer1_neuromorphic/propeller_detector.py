@@ -68,18 +68,30 @@ class DetectionAlert:
         camera_id: Source camera identifier.
         camera_name: Human-readable camera name.
         bearing_deg: Global bearing to detection centroid (0=fwd, CW).
+        elevation_deg: Elevation angle to detection centroid
+            (0=horizon, negative=below, positive=above).
         confidence: Detection confidence score (0.0–1.0).
         centroid_x: Detection centroid X in camera pixel coordinates.
         centroid_y: Detection centroid Y in camera pixel coordinates.
+        centroid_vx_degps: Azimuth angular rate (°/s) from centroid
+            tracking across sequential batches. Positive = CW.
+        centroid_vy_degps: Elevation angular rate (°/s) from centroid
+            tracking across sequential batches. Positive = ascending.
+        bounding_box: Detection spatial extent (x_min, y_min, x_max, y_max)
+            in pixel coordinates. Used for angular extent estimation.
         tracker_state: Current state of the per-camera tracker FSM.
     """
     timestamp_us: int
     camera_id: int
     camera_name: str
     bearing_deg: float
+    elevation_deg: float
     confidence: float
     centroid_x: float
     centroid_y: float
+    centroid_vx_degps: float
+    centroid_vy_degps: float
+    bounding_box: tuple[int, int, int, int]
     tracker_state: str
 
 
@@ -110,7 +122,9 @@ class PerCameraTracker:
         camera_id: Camera identifier.
         camera_name: Human-readable camera name.
         azimuth_offset_deg: Camera mounting azimuth for bearing calculation.
+        elevation_offset_deg: Camera mounting elevation offset.
         fov_h_deg: Camera horizontal field of view.
+        fov_v_deg: Camera vertical field of view.
         resolution_w: Sensor width in pixels.
         resolution_h: Sensor height in pixels.
         det_thresh: Logit threshold for detection.
@@ -122,7 +136,9 @@ class PerCameraTracker:
     camera_id: int
     camera_name: str
     azimuth_offset_deg: float
-    fov_h_deg: float
+    elevation_offset_deg: float = 0.0
+    fov_h_deg: float = 55.0
+    fov_v_deg: float = 41.0
     resolution_w: int = 640
     resolution_h: int = 480
     det_thresh: float = 1.0
@@ -137,7 +153,15 @@ class PerCameraTracker:
     _last_centroid_x: float = field(default=320.0, init=False)
     _last_centroid_y: float = field(default=240.0, init=False)
     _last_confidence: float = field(default=0.0, init=False)
+    _last_timestamp_us: int = field(default=0, init=False)
     _detections_total: int = field(default=0, init=False)
+
+    # Velocity tracking state (for Waiter mode launch vector detection)
+    _prev_centroid_x: float = field(default=320.0, init=False)
+    _prev_centroid_y: float = field(default=240.0, init=False)
+    _prev_timestamp_us: int = field(default=0, init=False)
+    _centroid_vx_degps: float = field(default=0.0, init=False)
+    _centroid_vy_degps: float = field(default=0.0, init=False)
 
     def process_prediction(
         self,
@@ -186,6 +210,32 @@ class PerCameraTracker:
             self._miss_count = 0
             self._detections_total += 1
 
+            # Compute centroid velocity from frame-to-frame delta
+            # (used by Waiter mode for launch vector detection)
+            if (
+                self._last_timestamp_us > 0
+                and self.state == TrackerState.TRACK
+            ):
+                dt_us = timestamp_us - self._last_timestamp_us
+                if dt_us > 0:
+                    dt_s = dt_us / 1_000_000.0
+                    deg_per_px_h = self.fov_h_deg / self.resolution_w
+                    deg_per_px_v = self.fov_v_deg / self.resolution_h
+                    dx_px = cx - self._prev_centroid_x
+                    dy_px = cy - self._prev_centroid_y
+                    self._centroid_vx_degps = (dx_px * deg_per_px_h) / dt_s
+                    # Invert Y: pixel down = negative elevation
+                    self._centroid_vy_degps = -(dy_px * deg_per_px_v) / dt_s
+            else:
+                self._centroid_vx_degps = 0.0
+                self._centroid_vy_degps = 0.0
+
+            # Store previous centroid for next velocity computation
+            self._prev_centroid_x = cx
+            self._prev_centroid_y = cy
+            self._prev_timestamp_us = timestamp_us
+            self._last_timestamp_us = timestamp_us
+
             # Transition to TRACK
             if self.state == TrackerState.DETECT:
                 self.state = TrackerState.TRACK
@@ -194,17 +244,25 @@ class PerCameraTracker:
                     self.camera_name, cx, cy, confidence,
                 )
 
-            # Compute global bearing from pixel X
+            # Compute global bearing and elevation from pixel coords
             bearing = self._pixel_to_bearing(cx)
+            elevation = self._pixel_to_elevation(cy)
+
+            # Compute bounding box from detection mask
+            bbox = self._compute_bounding_box(det_mask)
 
             return DetectionAlert(
                 timestamp_us=timestamp_us,
                 camera_id=self.camera_id,
                 camera_name=self.camera_name,
                 bearing_deg=bearing,
+                elevation_deg=elevation,
                 confidence=confidence,
                 centroid_x=cx,
                 centroid_y=cy,
+                centroid_vx_degps=self._centroid_vx_degps,
+                centroid_vy_degps=self._centroid_vy_degps,
+                bounding_box=bbox,
                 tracker_state=self.state.name,
             )
 
@@ -262,6 +320,44 @@ class PerCameraTracker:
         bearing = (self.azimuth_offset_deg + offset) % 360.0
         return bearing
 
+    def _pixel_to_elevation(self, pixel_y: float) -> float:
+        """Convert a pixel Y coordinate to an elevation angle.
+
+        Convention: 0° = horizon, negative = below, positive = above.
+
+        Args:
+            pixel_y: Y coordinate in sensor pixel space.
+
+        Returns:
+            Elevation in degrees.
+        """
+        center_y = self.resolution_h / 2.0
+        deg_per_pixel = self.fov_v_deg / self.resolution_h
+        # Higher pixel Y = lower in frame = below horizon = negative
+        offset = (center_y - pixel_y) * deg_per_pixel
+        elevation = self.elevation_offset_deg + offset
+        return elevation
+
+    @staticmethod
+    def _compute_bounding_box(
+        det_mask: np.ndarray,
+    ) -> tuple[int, int, int, int]:
+        """Compute bounding box from detection mask.
+
+        Args:
+            det_mask: (H, W) boolean mask of detected pixels.
+
+        Returns:
+            (x_min, y_min, x_max, y_max) bounding box in pixel coords.
+        """
+        ys, xs = np.where(det_mask)
+        if xs.size == 0:
+            return (0, 0, 0, 0)
+        return (
+            int(xs.min()), int(ys.min()),
+            int(xs.max()), int(ys.max()),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Voxelizer — Adapted from overlab-kevin EventVoxelDataset
@@ -284,7 +380,7 @@ class EventVoxelizer:
         self,
         resolution: tuple[int, int] = (640, 480),
         time_bin_us: int = 100,
-        batch_duration_us: int = 10_000,
+        batch_duration_us: int = 5_000,
     ) -> None:
         self._w, self._h = resolution
         self._time_bin_us = time_bin_us
@@ -378,7 +474,7 @@ class PropellerDetector:
         camera_configs: list[dict],
         resolution: tuple[int, int] = (640, 480),
         time_bin_us: int = 100,
-        batch_duration_us: int = 10_000,
+        batch_duration_us: int = 5_000,
         device: str = "cuda",
     ) -> None:
         self._model_path = Path(model_path)
@@ -392,7 +488,9 @@ class PropellerDetector:
                 camera_id=cfg["id"],
                 camera_name=cfg["name"],
                 azimuth_offset_deg=cfg["azimuth_offset_deg"],
+                elevation_offset_deg=cfg.get("elevation_offset_deg", 0.0),
                 fov_h_deg=cfg.get("fov_h_deg", 55.0),
+                fov_v_deg=cfg.get("fov_v_deg", 41.0),
                 resolution_w=resolution[0],
                 resolution_h=resolution[1],
                 det_thresh=cfg.get("det_thresh", 1.0),

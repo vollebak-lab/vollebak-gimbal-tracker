@@ -133,3 +133,54 @@ class SlewToCue:
             target_range_m=range_m,
             is_lead_compensated=has_lead,
         )
+
+    def compute_l1_command(
+        self,
+        bearing_deg: float,
+        elevation_deg: float,
+        estimated_range_m: float = 25.0,
+    ) -> GimbalCommand:
+        """Compute gimbal command from L1-only bearing/elevation.
+
+        Used in Waiter mode (L1_ENGAGEMENT) where no radar track
+        data is available. The gimbal slews at max rate to the
+        bearing, then the vertical sweep pattern takes over.
+
+        No lead-angle compensation is applied — Waiter drones
+        are stationary on the ground at the moment of detection.
+        The sweep pattern handles positional uncertainty.
+
+        Args:
+            bearing_deg: L1 detection bearing (0=fwd, CW).
+            elevation_deg: L1 detection elevation (negative=below).
+            estimated_range_m: Range estimate from WaiterRangeEstimator.
+
+        Returns:
+            GimbalCommand with max slew rate, no lead compensation.
+        """
+        cfg = self._config
+
+        # Apply gimbal mounting offsets
+        az = bearing_deg - cfg.gimbal_az_offset_deg
+        el = elevation_deg - cfg.gimbal_el_offset_deg
+
+        # Wrap azimuth
+        az = ((az + 180.0) % 360.0) - 180.0
+
+        # Max slew rate — time is critical in Waiter mode
+        slew_rate = cfg.max_slew_rate_dps
+
+        self.commands_total += 1
+
+        logger.info(
+            "L1 SLEW: az=%.1f° el=%.1f° range=%.1fm (max rate)",
+            az, el, estimated_range_m,
+        )
+
+        return GimbalCommand(
+            azimuth_deg=az,
+            elevation_deg=el,
+            slew_rate_dps=slew_rate,
+            target_range_m=estimated_range_m,
+            is_lead_compensated=False,
+        )

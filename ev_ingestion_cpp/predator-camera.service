@@ -1,0 +1,19 @@
+[Unit]
+Description=Predator IDS IMX636 Neuromorphic Live Streamer Service
+After=network.target
+
+[Service]
+Type=simple
+User=orin
+Environment=MV_FLAGS_EVT3_UNSAFE_DECODER=1
+Environment=MV_LOG_LEVEL=ERROR
+Environment=MV_PSEE_PLUGIN_DATA_TRANSFER_BUFFER_POOL_BYTE_SIZE=67108864
+Environment=LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/aarch64-linux-gnu
+ExecStartPre=+/bin/sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb && jetson_clocks || true'
+ExecStart=/home/orin/ev_deploy/bin/ev_flicker_detector 8080
+Restart=always
+RestartSec=3
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[package]
+name = "predator-messages"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Shared Zenoh message types for the Predator C-UAS pipeline"
+
+[dependencies]
+serde = { workspace = true }
+rmp-serde = { workspace = true }

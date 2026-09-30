@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Optional
 
+from src.layer2_radar.radar_interface import RadarPowerMode
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +42,8 @@ class SystemState(Enum):
     ALERT = auto()          # Layer 1 detection — awaiting confirmation
     RADAR_ACTIVE = auto()   # Radar emitting — searching for target
     TRACKING = auto()       # Radar locked — EKF tracking target
-    ENGAGEMENT = auto()     # Laser armed — engaging target
+    ENGAGEMENT = auto()     # Laser armed — radar-guided engagement
+    L1_ENGAGEMENT = auto()  # Laser armed — L1-only passive engagement (Waiter mode)
     BDA = auto()            # Battle damage assessment — evaluating kill
 
 
@@ -96,6 +99,18 @@ class FSMConfig:
     bda_observation_s: float = 5.0
     min_threat_score: float = 0.7
 
+    # Cognitive duty cycling parameters
+    radar_wake_latency_ms: float = 10.0   # Estimated S80 wake time
+    sector_search_width_deg: float = 15.0  # Half-width of sector search
+
+    # Waiter mode (L1-only passive engagement) parameters
+    waiter_mode_enabled: bool = True
+    l1_engagement_confidence: float = 0.95  # Min confidence for L1-only
+    l1_max_range_m: float = 50.0            # Max range for L1-only
+    operator_camera_height_m: float = 1.85  # Eye height + helmet offset
+    ansur_min_height_m: float = 1.37        # 5th pct × 0.9 + helmet
+    ansur_max_height_m: float = 1.79        # 95th pct × 1.1 + helmet
+
 
 class PredatorStateMachine:
     """Silent-to-Active engagement finite state machine.
@@ -113,9 +128,13 @@ class PredatorStateMachine:
         self,
         config: Optional[FSMConfig] = None,
         on_state_change: Optional[Callable[[StateTransition], None]] = None,
+        on_radar_power_command: Optional[
+            Callable[[RadarPowerMode, Optional[float], Optional[float]], None]
+        ] = None,
     ) -> None:
         self._config = config or FSMConfig()
         self._on_state_change = on_state_change
+        self._on_radar_power_command = on_radar_power_command
 
         # Current state
         self._state = SystemState.SILENT
@@ -142,6 +161,7 @@ class PredatorStateMachine:
         self._bda_start_time: float = 0.0
         self._flicker_ceased: bool = False
         self._doppler_lost: bool = False
+        self._l1_only_bda: bool = False  # Waiter mode: flicker-only BDA
 
         # History
         self._transition_log: list[StateTransition] = []
@@ -169,7 +189,19 @@ class PredatorStateMachine:
     @property
     def is_engagement_authorized(self) -> bool:
         """Whether laser engagement is authorized."""
-        return self._state == SystemState.ENGAGEMENT
+        return self._state in (
+            SystemState.ENGAGEMENT,
+            SystemState.L1_ENGAGEMENT,
+        )
+
+    @property
+    def is_l1_only_engagement(self) -> bool:
+        """Whether the current engagement is L1-only (Waiter mode).
+
+        In L1-only mode, radar is never activated, BDA uses flicker
+        cessation alone, and the gimbal uses a vertical sweep pattern.
+        """
+        return self._state == SystemState.L1_ENGAGEMENT or self._l1_only_bda
 
     def _transition_to(
         self,
@@ -210,6 +242,9 @@ class PredatorStateMachine:
             except Exception:
                 logger.exception("State change callback error")
 
+        # Emit cognitive duty cycling radar power command
+        self._emit_radar_power_command(new_state)
+
     # -------------------------------------------------------------------
     # Input Methods — called by the pipeline
     # -------------------------------------------------------------------
@@ -230,29 +265,40 @@ class PredatorStateMachine:
         bearing_deg: float,
         confidence: float,
         timestamp_us: int,
+        elevation_deg: float | None = None,
+        centroid_vy_degps: float | None = None,
     ) -> None:
         """Process a Layer 1 neuromorphic propeller detection.
 
         Behavior:
-            - High confidence (>0.8): SILENT → RADAR_ACTIVE directly
+            - **Waiter mode** (L1-only): If elevation < 0 AND confidence
+              >= 0.95 AND estimated range <= 50m → SILENT → L1_ENGAGEMENT
+              directly (skip ALERT, RADAR_ACTIVE, TRACKING). Radar stays
+              in DEEP_SLEEP. Zero RF emission.
+            - **High confidence** (>0.8): SILENT → RADAR_ACTIVE directly
               (skip ALERT state to save 10-80ms).
-            - Normal confidence: SILENT → ALERT → RADAR_ACTIVE
+            - **Normal confidence**: SILENT → ALERT → RADAR_ACTIVE
               (requires ``alert_confirm_count`` detections).
             - Pre-slew: On ANY first detection, emit arm deploy and
-              FSM coarse-aim commands. No harm if false positive —
-              arm returns to stow on timeout.
+              FSM coarse-aim commands.
 
         Args:
             camera_id: Source camera identifier.
             bearing_deg: Global bearing to detection.
             confidence: Detection confidence (0–1).
             timestamp_us: Detection timestamp.
+            elevation_deg: Elevation angle (0=horizon, negative=below).
+                Required for Waiter mode auto-detect.
+            centroid_vy_degps: Vertical angular rate from L1 tracker.
+                Positive = ascending (ground-launch Waiter).
         """
         detection_data = {
             "camera_id": camera_id,
             "bearing_deg": bearing_deg,
             "confidence": confidence,
             "timestamp_us": timestamp_us,
+            "elevation_deg": elevation_deg,
+            "centroid_vy_degps": centroid_vy_degps,
         }
 
         if self._state == SystemState.SILENT:
@@ -262,9 +308,15 @@ class PredatorStateMachine:
             self._alert_camera_ids.add(camera_id)
 
             # --- Pre-slew: begin arm deploy + FSM coarse aim ---
-            # Bearing determines shoulder side (left vs right)
             if self._config.pre_slew_on_alert:
                 self._request_pre_slew(bearing_deg)
+
+            # --- Waiter mode auto-detect (L1-only engagement) ---
+            # Conditions: below-horizon + high confidence + close range
+            if self._check_waiter_mode(
+                elevation_deg, confidence, bearing_deg, camera_id,
+            ):
+                return  # Transition already handled
 
             # --- Fast-track: high confidence → skip ALERT ---
             if confidence >= self._config.high_confidence_threshold:
@@ -384,11 +436,14 @@ class PredatorStateMachine:
 
     def on_laser_fired(self) -> None:
         """Record that the laser fire command has been sent."""
-        if self._state == SystemState.ENGAGEMENT:
+        if self._state in (SystemState.ENGAGEMENT, SystemState.L1_ENGAGEMENT):
             self._laser_fire_sent = True
+            # Track whether this is an L1-only engagement for BDA
+            self._l1_only_bda = (self._state == SystemState.L1_ENGAGEMENT)
             self._transition_to(
                 SystemState.BDA,
                 trigger="laser_fire_command",
+                metadata={"l1_only": self._l1_only_bda},
             )
             self._bda_start_time = time.monotonic()
             self._flicker_ceased = False
@@ -448,28 +503,77 @@ class PredatorStateMachine:
                 )
                 self._bda_start_time = now
 
+        elif self._state == SystemState.L1_ENGAGEMENT:
+            # L1-only engagement timeout (reuse engagement_timeout_s)
+            elapsed = now - self._engagement_start_time
+            if elapsed > self._config.engagement_timeout_s:
+                self._l1_only_bda = True
+                self._transition_to(
+                    SystemState.BDA,
+                    trigger="l1_engagement_timeout",
+                    metadata={"l1_only": True},
+                )
+                self._bda_start_time = now
+
         elif self._state == SystemState.BDA:
             elapsed = now - self._bda_start_time
-            # BDA assessment: flicker ceased AND doppler lost = confirmed kill
-            if self._flicker_ceased and self._doppler_lost:
-                logger.info("BDA: KILL CONFIRMED — flicker ceased + Doppler lost")
-                self._transition_to(
-                    SystemState.SILENT,
-                    trigger="kill_confirmed",
-                )
-            elif elapsed > self._config.bda_observation_s:
-                if self._flicker_ceased or self._doppler_lost:
-                    logger.info("BDA: PROBABLE KILL — partial signature loss")
-                else:
-                    logger.info("BDA: MISS — no signature change observed")
-                self._transition_to(
-                    SystemState.SILENT,
-                    trigger="bda_timeout",
-                    metadata={
-                        "flicker_ceased": self._flicker_ceased,
-                        "doppler_lost": self._doppler_lost,
-                    },
-                )
+
+            if self._l1_only_bda:
+                # L1-only BDA: flicker cessation alone = kill confirmed
+                # No Doppler available (radar was never activated)
+                if self._flicker_ceased:
+                    logger.info(
+                        "BDA (L1-ONLY): KILL CONFIRMED — flicker ceased"
+                    )
+                    self._stow_arm()
+                    self._l1_only_bda = False
+                    self._transition_to(
+                        SystemState.SILENT,
+                        trigger="l1_kill_confirmed",
+                        metadata={"l1_only": True},
+                    )
+                elif elapsed > self._config.bda_observation_s:
+                    logger.info(
+                        "BDA (L1-ONLY): TIMEOUT — flicker_ceased=%s",
+                        self._flicker_ceased,
+                    )
+                    self._stow_arm()
+                    self._l1_only_bda = False
+                    self._transition_to(
+                        SystemState.SILENT,
+                        trigger="l1_bda_timeout",
+                        metadata={
+                            "l1_only": True,
+                            "flicker_ceased": self._flicker_ceased,
+                        },
+                    )
+            else:
+                # Standard BDA: flicker ceased AND doppler lost
+                if self._flicker_ceased and self._doppler_lost:
+                    logger.info(
+                        "BDA: KILL CONFIRMED — flicker ceased + Doppler lost",
+                    )
+                    self._transition_to(
+                        SystemState.SILENT,
+                        trigger="kill_confirmed",
+                    )
+                elif elapsed > self._config.bda_observation_s:
+                    if self._flicker_ceased or self._doppler_lost:
+                        logger.info(
+                            "BDA: PROBABLE KILL — partial signature loss",
+                        )
+                    else:
+                        logger.info(
+                            "BDA: MISS — no signature change observed",
+                        )
+                    self._transition_to(
+                        SystemState.SILENT,
+                        trigger="bda_timeout",
+                        metadata={
+                            "flicker_ceased": self._flicker_ceased,
+                            "doppler_lost": self._doppler_lost,
+                        },
+                    )
 
     def get_transition_log(self) -> list[StateTransition]:
         """Return the full state transition history."""
@@ -517,6 +621,91 @@ class PredatorStateMachine:
             self._arm_deploy_requested = False
             logger.info("ARM: returning to Z-fold stow")
 
+    def _check_waiter_mode(
+        self,
+        elevation_deg: float | None,
+        confidence: float,
+        bearing_deg: float,
+        camera_id: int,
+    ) -> bool:
+        """Evaluate Waiter mode auto-engagement conditions.
+
+        Waiter mode engages when ALL geometric conditions are satisfied:
+        1. waiter_mode_enabled in config
+        2. elevation < 0° (target is below horizon — on the ground)
+        3. confidence ≥ 0.95 (high-confidence multi-propeller detection)
+        4. estimated range ≤ 50 m (from camera height / tan(|el|))
+
+        If conditions pass, transitions directly from SILENT to
+        L1_ENGAGEMENT with zero radar emission.
+
+        Timing:
+            - Mast stowed: ~1.5–2.5 s total kill chain
+            - Mast pre-deployed (ambush mode): ~400–700 ms
+
+        Args:
+            elevation_deg: Target elevation angle (negative = below).
+            confidence: L1 detection confidence.
+            bearing_deg: Target bearing for sweep azimuth.
+            camera_id: Source camera ID.
+
+        Returns:
+            True if Waiter mode engaged (transition happened),
+            False if conditions not met (caller should continue).
+        """
+        # Gate 1: feature enabled
+        if not self._config.waiter_mode_enabled:
+            return False
+
+        # Gate 2: elevation must be provided and below horizon
+        if elevation_deg is None or elevation_deg >= 0.0:
+            return False
+
+        # Gate 3: confidence threshold
+        if confidence < self._config.l1_engagement_confidence:
+            return False
+
+        # Gate 4: range estimate from geometry
+        import math
+        abs_el = abs(elevation_deg)
+        if abs_el < 0.1:
+            # Near-zero elevation → range indeterminate
+            return False
+
+        estimated_range = (
+            self._config.operator_camera_height_m
+            / math.tan(math.radians(abs_el))
+        )
+        if estimated_range > self._config.l1_max_range_m:
+            logger.debug(
+                "WAITER MODE: range %.1fm > %.1fm limit — skipping",
+                estimated_range, self._config.l1_max_range_m,
+            )
+            return False
+
+        # All conditions satisfied → L1-only passive engagement
+        logger.info(
+            "WAITER MODE: L1-only engagement AUTHORIZED — "
+            "el=%.1f° conf=%.3f range=%.1fm ≤ %.1fm",
+            elevation_deg, confidence, estimated_range,
+            self._config.l1_max_range_m,
+        )
+
+        self._engagement_start_time = time.monotonic()
+        self._transition_to(
+            SystemState.L1_ENGAGEMENT,
+            trigger="waiter_mode_auto_detect",
+            metadata={
+                "camera_id": camera_id,
+                "bearing_deg": bearing_deg,
+                "elevation_deg": elevation_deg,
+                "confidence": confidence,
+                "estimated_range_m": round(estimated_range, 1),
+                "l1_only": True,
+            },
+        )
+        return True
+
     @staticmethod
     def _circular_mean_deg(angles: list[float]) -> float:
         """Compute circular mean of angles in degrees."""
@@ -525,6 +714,85 @@ class PredatorStateMachine:
         rad = np.radians(angles)
         mean_rad = np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))
         return float(np.degrees(mean_rad)) % 360.0
+
+    def _emit_radar_power_command(
+        self, target_state: SystemState,
+    ) -> None:
+        """Emit radar power mode command based on engagement state.
+
+        Implements cognitive duty cycling per RoC research:
+        - SILENT: Deep sleep (∼50mW)
+        - ALERT: Aggressive sector search at L1 bearing (∼8W)
+        - RADAR_ACTIVE/TRACKING/ENGAGEMENT: Full track (9.5W)
+        - BDA→SILENT: Return to deep sleep
+
+        The neuromorphic camera IS the search function — radar wakes
+        aggressively on L1 trigger, beam-steered to the cue bearing.
+
+        Args:
+            target_state: The state being transitioned INTO.
+        """
+        if self._on_radar_power_command is None:
+            return
+
+        cfg = self._config
+
+        if target_state == SystemState.SILENT:
+            self._on_radar_power_command(
+                RadarPowerMode.DEEP_SLEEP, None, None,
+            )
+            logger.info(
+                "RADAR POWER: DEEP_SLEEP (∼50mW) — passive mode",
+            )
+
+        elif target_state == SystemState.ALERT:
+            # Aggressive wake: beam-steer to L1 detection bearing
+            bearing = self._pre_slew_bearing_deg
+            sector_width = cfg.sector_search_width_deg
+            self._on_radar_power_command(
+                RadarPowerMode.SECTOR_SEARCH, bearing, sector_width,
+            )
+            logger.info(
+                "RADAR POWER: SECTOR_SEARCH at %.1f°±%.1f° "
+                "(∼8W, wake latency ∼%.0fms)",
+                bearing, sector_width, cfg.radar_wake_latency_ms,
+            )
+
+        elif target_state in (
+            SystemState.RADAR_ACTIVE,
+            SystemState.TRACKING,
+            SystemState.ENGAGEMENT,
+        ):
+            self._on_radar_power_command(
+                RadarPowerMode.FULL_TRACK, None, None,
+            )
+            logger.info(
+                "RADAR POWER: FULL_TRACK (9.5W) — all Tx/Rx active",
+            )
+
+        elif target_state == SystemState.BDA:
+            # Keep radar on during BDA for signature monitoring
+            # (flicker cessation, Doppler loss detection)
+            # UNLESS this is an L1-only BDA (radar was never on)
+            if not self._l1_only_bda:
+                self._on_radar_power_command(
+                    RadarPowerMode.FULL_TRACK, None, None,
+                )
+                logger.info(
+                    "RADAR POWER: FULL_TRACK (9.5W) — BDA observation",
+                )
+            else:
+                logger.info(
+                    "RADAR POWER: DEEP_SLEEP — L1-only BDA (no radar)",
+                )
+
+        elif target_state == SystemState.L1_ENGAGEMENT:
+            # L1-only engagement: radar stays in DEEP_SLEEP
+            # Zero RF emission throughout entire kill chain
+            logger.info(
+                "RADAR POWER: DEEP_SLEEP — L1-only engagement "
+                "(Waiter mode, zero RF emission)",
+            )
 
 
 # NumPy import deferred to method to keep module light

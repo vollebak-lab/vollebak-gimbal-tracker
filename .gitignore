@@ -34,7 +34,14 @@ Thumbs.db
 models/*.pt
 models/*.onnx
 models/*.pth
+models/*.engine
 !models/.gitkeep
+
+# Vendor SDKs & Archive Tarballs
+event_camera/
+*.tar.gz
+*.deb
+*.zip
 
 # Logs
 *.log

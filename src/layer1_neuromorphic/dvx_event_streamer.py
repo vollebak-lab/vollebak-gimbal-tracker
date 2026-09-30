@@ -128,7 +128,7 @@ class CameraReaderThread(threading.Thread):
         self,
         config: CameraConfig,
         output_queue: queue.Queue[EventBatch],
-        batch_duration_us: int = 10_000,
+        batch_duration_us: int = 5_000,
         resolution: tuple[int, int] = (640, 480),
     ) -> None:
         super().__init__(daemon=True, name=f"CamReader-{config.name}")
@@ -296,7 +296,7 @@ class DvxEventStreamer:
     def __init__(
         self,
         cameras: list[CameraConfig],
-        batch_duration_us: int = 10_000,
+        batch_duration_us: int = 5_000,
         resolution: tuple[int, int] = (640, 480),
         queue_depth: int = 64,
     ) -> None:

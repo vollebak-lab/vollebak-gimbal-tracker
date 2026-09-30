@@ -75,7 +75,12 @@ engagement:
   laser:
     provider: "Thor Dynamics"
     type: "soft-kill"
-    optical_power_w: [2.0, 5.0]  # Range
+    mode: "pulsed"                   # "pulsed" | "cw"
+    optical_power_w: [2.0, 5.0]      # Average power range
+    pulse_width_ns: 10               # Q-switched nanosecond pulse
+    peak_power_class: "megawatt"     # Energy compression from Q-switching
+    lidt_cmos_mj_cm2: 78.9          # Permanent CMOS damage threshold (pulsed)
+    optical_gain_factor: 100000      # Drone lens funnel effect (intensity multiplier)
     claimed_range_km: 10.0
     interface: "GPIO/serial"  # TBD — confirm with Thor
     mount: "robotic arm + self-leveling gimbal"
@@ -86,3 +91,21 @@ engagement:
       - "Lissajous"
       - "Rosette"
       - "Raster"
+      - "VerticalSweep"             # L1-only Waiter mode
+
+# Waiter Mode — L1-only passive engagement (zero RF emission)
+waiter_mode:
+  enabled: true
+  l1_engagement_confidence: 0.95     # Min confidence for L1-only engagement
+  max_range_m: 50.0                  # Beyond this → fall back to radar pipeline
+  auto_detect: true                  # Auto-engage from geometry (no operator toggle)
+  sweep_rate_dps: 180.0              # Max gimbal rate for vertical sweep
+  sweep_passes: 3                    # Multi-pass for probabilistic coverage
+  sweep_margin_deg: 5.0              # Margin around estimated elevation
+
+# Operator calibration (set during initial outfitting)
+operator:
+  eye_height_m: 1.75                 # Measured during equipment issue
+  helmet_camera_offset_m: 0.10       # Camera mount above eye level
+  ansur_min_height_m: 1.37           # 1.52m × 0.9 (10% buffer low)
+  ansur_max_height_m: 1.79           # 1.63m × 1.1 (10% buffer high)
