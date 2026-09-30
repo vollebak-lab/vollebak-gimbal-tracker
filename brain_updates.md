@@ -342,6 +342,17 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
   5. `docs/` & `PSF_Engineering/`: Complete technical documentation, kill-chain latency audit, waiter mode specs, and point-spread-function engineering research.
   6. `README.md` & `.gitignore`: Updated with system architecture and vendor package exclusions.
 
+---
+
+### 16. Architectural Decision: Deprecation of `event-cam-prop-tracker` (SpMiniUNet)
+- **Status**: Formally Deprecated / Retired from Primary Pipeline.
+- **Operational Reality**:
+  - Kinetic FPV / loitering munition threats approach at $15\text{--}30\text{ m/s}$ ($54\text{--}108\text{ km/h}$). A detection at $\le 20\text{m}$ leaves $<0.7\text{--}1.3\text{ seconds}$ total kill chain latency—well inside the lethal fragmentation blast radius.
+  - Tactical requirements dictate standoff detection, identification, slew-to-cue, and soft-kill engagement at $100\text{m}\text{--}300\text{m}+$.
+- **Mathematical & Structural Basis**:
+  - `SpMiniUNet` uses 3D spatial voxel convolutions requiring extended spatial pixel spans ($>20\text{--}50\text{ px}$) to resolve blade morphology, suffering complete feature collapse at standoff ranges where blades project to sub-pixel or $<5\text{ px}$.
+  - Project Predator's C++ Frequency-Domain DSP Engine (`flicker_dsp.hpp`) is purely *temporal* ($4000\text{ Hz}$ sampling, 512-sample coherent FFT integration, Harmonic Product Spectrum). It detects temporal photon flux modulation at sub-pixel scale without requiring resolved spatial blade geometry, making it the sole operational Layer 1 tripwire.
+
 
 
 
