@@ -1,151 +1,97 @@
-# Project Predator: Autonomous Counter-UAS Neuromorphic & Radar Soft-Kill System
+# Predator Observation Console
 
-[![Tests](https://img.shields.io/badge/Python%20Tests-48%2F48%20Passing-brightgreen)]()
-[![Rust](https://img.shields.io/badge/Rust%20Tests-72%2F72%20Passing-brightgreen)]()
-[![C++ DSP](https://img.shields.io/badge/C%2B%2B%2FCUDA%20DSP-17%2F17%20Passing-brightgreen)]()
-[![Platform](https://img.shields.io/badge/Target-NVIDIA%20Jetson%20Orin%20Nano-blue)]()
+This repository combines Bart's complete [Vollebak Predator](https://github.com/vollebak-lab/predator) source tree at commit `ea46468` with a working Raspberry Pi 5 camera-to-gimbal application.
 
-Project Predator is an ultra-low-latency, tactical Counter-UAS (C-UAS) defense system combining passive neuromorphic vision, 4D PMCW radar, kinematic threat assessment, mast self-leveling stabilization, and directed-energy soft-kill laser engagement.
+The runnable Pi profile is deliberately scoped to passive observation, target tracking, and two-axis pointing. A stationary Logitech USB camera detects a target, a calibration maps image pixels to pan/tilt angles, and the Waveshare 360-degree two-axis module follows those angles. Until the gimbal arrives, the exact same loop drives the on-screen digital twin through the mock driver.
 
----
+The GUI also exposes the readiness of Bart's layered stack without pretending disconnected hardware is live:
 
-## 📐 System Architecture
+- L1: the Logitech RGB camera and connected IDS UE-39B0XCP/Sony IMX636 event camera are selectable live feeds. Bart's CPU FFT/HPS flicker detector is running live and publishes event rate, tracks, bearing, BPF, RPM, and SNR when it finds a qualifying target.
+- L2: Uhnder radar is shown as not connected; its real backend in Bart's current tree is a stub.
+- L3: the Pi profile provides one bearing-only visual track; Bart's full IMM/JPDA fusion source remains in the repository.
+- L4: mock or Waveshare gimbal pointing only. Engagement is hard-disabled and no engagement command endpoint exists.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    LAYER 1: PASSIVE NEUROMORPHIC                            │
-│  Sony IMX636 (1280×720 @ >10 MEv/s) / iniVation DVXplorer                                   │
-│  ├── Tier 1: Continuous Gyro Homography Warper (Coordinate stabilization under ego-motion)   │
-│  ├── Tier 2: UZH RSS 2026 Anticipatory ConvGRU + TensorRT FP16 Motion Mask Suppression       │
-│  └── Tier 3: 4000 Hz Temporal Binning + 512-FFT + Harmonic Product Spectrum (HPS) Peak DSP    │
-└──────────────────────────────────────────────┬──────────────────────────────────────────────┘
-                                               │ Fast-Track Cue (<5ms)
-                                               ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    LAYER 2: ACTIVE 4D RADAR                                 │
-│  Uhnder S80 Cascaded PMCW Array (768 Virtual Channels, 300m+ Range)                         │
-│  ├── Micro-Doppler signature extraction (rotary blade chop vs micro-turbulences)            │
-│  └── Range-Doppler-Azimuth-Elevation pointcloud centroiding                                 │
-└──────────────────────────────────────────────┬──────────────────────────────────────────────┘
-                                               │
-                                               ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    LAYER 3: TRACKING & FUSION                               │
-│  Rust Orchestrator (`predator-orchestrator`) + Python Fusion Engine                         │
-│  ├── Extended Kalman Filter (EKF) / Interacting Multiple Model (IMM) Target Tracking         │
-│  ├── Mast Self-Leveling PID Torque Control & Body-Frame Dynamic Parallax Solver             │
-│  ├── Kinematic Primer: Instantaneous closing-rate threat scoring                            │
-│  └── Silent-to-Active Finite State Machine with Safety Veto Interlocks                      │
-└──────────────────────────────────────────────┬──────────────────────────────────────────────┘
-                                               │
-                                               ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 LAYER 4 & 5: ENGAGEMENT & FABRIC                            │
-│  Thor Dynamics Directed-Energy Laser + Real-Time Rust Gimbal Daemon                         │
-│  ├── Slew-to-Cue with sub-milliradian pointing precision                                    │
-│  ├── High-frequency Lissajous optical beam scanning for sensor saturation soft-kill        │
-│  ├── Closed-Loop Battle Damage Assessment (BDA) via flicker cessation & Doppler loss        │
-│  └── Zenoh Distributed Multi-Node Cooperative Tracking Fabric                              │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
+See [Bart integration audit](docs/bart-integration-audit.md) for the component-by-component review.
+
+## Run it now
+
+```powershell
+cd C:\Users\gutie\Downloads\vollebak-gimbal-tracker
+.\.venv\Scripts\Activate.ps1
+gimbal-tracker ui -c config/dev.yaml
 ```
 
----
+Open <http://127.0.0.1:8080>. Camera index `0` is configured for the Logitech camera. If it is unavailable, the app falls back to a synthetic target and probes for the camera every five seconds.
 
-## ⚡ Key Subsystems & Features
+The development dashboard also consumes Bart's event-camera service at <http://127.0.0.1:8081>. On this Windows workstation the IDS camera is passed into WSL with `usbipd`; both event services cap the sensor in hardware at 10 MEv/s to stay within the virtual USB bridge's practical limit. Use the feed selector in the dashboard to switch between `LOGITECH RGB` and `IMX636 EVENT`.
 
-### 1. Neuromorphic Event Camera Ingestion Core (`ev_ingestion_cpp`)
-- **Native OpenEB 5.2.0 HAL Driver**: Custom Cypress CX3 Treuzell board plugin (`0x1409:0x8e00`) for native IDS UE-39B0XCP-E (Sony IMX636) direct bulk streaming at **>9.47 Million events/second**.
-- **Continuous Gyro Homography Warper (`ego_motion.hpp`)**: Analytical spherical homography $\mathbf{K} \mathbf{R}(t_{\text{ref}}, t_i) \mathbf{K}^{-1}$ with Rodrigues quaternion integration, canceling platform rotational blur (verified up to $30^\circ/\text{s}$).
-- **Anticipatory Motion Suppression (`event_suppression_trt.hpp`)**: UZH RSS 2026 ConvGRU + Attention-based Time Conditioning (ATC) dynamic mask engine compiled to TensorRT 10.3 FP16 (**$14.0\text{ ms}$ GPU compute, 71.0 FPS**).
-- **Hardened Multi-Gate Frequency DSP (`flicker_dsp.hpp`)**:
-  - $4000\text{ Hz}$ temporal binning ($250\ \mu\text{s}$ resolution, $2000\text{ Hz}$ Nyquist).
-  - 512-sample coherent integration ($128\text{ ms}$ sliding window, $+3\text{ dB}$ processing gain).
-  - Harmonic Product Spectrum (HPS)comb filtering for Blade Passage Frequency ($f_{\text{BPF}}$) and RPM extraction.
-  - Wideband noise floor estimator ($40\text{--}1000\text{ Hz}$) suppressing Poisson extreme-value noise.
-  - Multi-candidate peak extraction resolving multi-carrier AC floodlight modulation ($100/120\text{ Hz}$) from rotor signatures.
-  - Spatial dispersion bounding-box filter distinguishing localized quadcopter rotors from global ambient lighting.
-  - M-of-N temporal confirmation ($M=3$) and track coasting up to $200\text{ ms}$.
-- **Web UI & Telemetry Endpoint**: Live HTTP visualizer (`http://<target-ip>:8080/`) streaming 30 FPS polarity-colored overlays and `/flicker_stats` JSON metrics.
+Start the already-built full detector after attaching USB bus `2-14`:
 
-### 2. High-Assurance Rust Orchestrator (`crates/predator-orchestrator`)
-- Real-time Silent-to-Active state machine managing zero-RF-signature standby to active laser soft-kill prosecution.
-- Mast self-leveling stabilization loop with dual-axis PID and overcurrent/IMU fault handling.
-- Dynamic body-frame 3D parallax correction reconciling radar, camera, and laser turret coordinate offsets.
-- High-throughput Zero-Copy message serialization (`predator-messages`) powered by Zenoh and MessagePack.
-
-### 3. Verification & Outdoor Benchmarks
-- **Range & Tracking**: Verified on DJI Mavic Air 2 in direct sunlight and semi-shade at 50ft, 75ft, and 100ft ($30.5\text{m}$) with zero false alarms.
-- **Test Coverage**:
-  - `python -m pytest`: 48/48 passed.
-  - `cargo test`: 72/72 passed.
-  - `ev_ingestion_cpp` unit tests: 17/17 passed.
-
----
-
-## 🛠️ Repository Layout
-
-```
-predator/
-├── config/                      # System & sensor configuration YAMLs
-│   ├── dvxplorer_array.yaml
-│   └── predator_system.yaml
-├── crates/                      # Rust workspace crates
-│   ├── predator-messages/       # Shared message types, topics, and serialization
-│   └── predator-orchestrator/   # Real-time state machine, mast stabilization, & parallax
-├── docs/                        # Architecture specs, kill-chain latency audits, research papers
-│   ├── architecture/
-│   ├── research/
-│   └── waiter_mode/
-├── ev_ingestion_cpp/            # High-performance C++/CUDA/TensorRT neuromorphic engine
-│   ├── ego_motion.hpp           # Analytical continuous gyro homography warper
-│   ├── event_suppression_trt.hpp# UZH RSS 2026 TensorRT FP16 dynamic suppression
-│   ├── flicker_dsp.hpp          # Harmonic comb & 4000Hz frequency-domain DSP
-│   ├── ev_flicker_detector.cpp  # Main live detector & Web HUD daemon
-│   ├── ev_web_viewer.cpp        # Low-overhead web visualizer
-│   └── test_*.cpp               # C++ DSP and ego-motion test suites
-├── models/                      # Deep learning suppression network export & ONNX definitions
-│   └── export_suppression_model.py
-├── src/                         # Python C-UAS layers
-│   ├── imu/                     # IMU providers & motion compensation
-│   ├── layer1_neuromorphic/     # Python event streamers & aggregators
-│   ├── layer2_radar/            # Uhnder PMCW radar interface & micro-Doppler classifier
-│   ├── layer3_fusion/           # EKF/IMM tracking, JPDA associator, safety manager
-│   ├── layer4_engagement/       # Laser slew-to-cue, Lissajous scanner, gimbal controller
-│   └── layer5_cooperative/      # Distributed cooperative multi-node tracker
-├── tests/                       # Python end-to-end integration test suite
-├── brain_updates.md             # Detailed engineering log, RCA findings, and hardware profiles
-└── task.md                      # Phased milestone and implementation tracking
+```powershell
+usbipd attach --wsl --busid 2-14
+wsl -d Ubuntu -- bash /mnt/c/Users/gutie/Downloads/vollebak-gimbal-tracker/scripts/run_event_detector_wsl.sh
 ```
 
----
+The bus ID can change after reconnecting the camera; confirm it with `usbipd list`. `run_event_viewer_wsl.sh` is a lower-CPU raw-event fallback. Native USB on the Pi remains the preferred deployment path because it removes USB/IP from the capture chain.
 
-## 🚀 Building & Running
+Useful checks:
 
-### 1. Python Pipeline Tests
-```bash
+```powershell
+gimbal-tracker doctor -c config/dev.yaml
 python -m pytest
+ruff check src/vollebak_gimbal tests/test_calibration.py tests/test_control.py tests/test_predator_observer.py tests/test_waveshare.py tests/test_web.py
 ```
 
-### 2. Rust Workspace
+## Raspberry Pi 5
+
+Start with 64-bit Raspberry Pi OS Bookworm:
+
 ```bash
-cargo check
-cargo test
+sudo bash scripts/install_pi.sh
+source .venv/bin/activate
+cp config/pi.example.yaml config/pi.yaml
+gimbal-tracker doctor -c config/pi.yaml
+gimbal-tracker ui -c config/pi.yaml --host 0.0.0.0
 ```
 
-### 3. C++ Neuromorphic Engine (Jetson Orin Nano / Linux)
-```bash
-cd ev_ingestion_cpp
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-./test_flicker_dsp
-./test_ego_motion
-./ev_flicker_detector
+Keep `gimbal.driver: mock` until the Waveshare assembly is mechanically centered, powered from its specified external 12 V supply, and clear to move. The Pi must not power the servos. USB serial is the simplest first connection; expected servo IDs are tilt `1` and pan `2`.
+
+Before enabling `waveshare_serial`:
+
+1. Verify the board's serial port with `gimbal-tracker doctor`.
+2. Make only 2–5 degree manual movements with the payload removed.
+3. Rigidly mount the stationary camera and gimbal.
+4. Run `gimbal-tracker calibrate -c config/pi.yaml` and collect at least six well-spaced points.
+5. Keep a physical servo-power disconnect within reach during initial tracking.
+
+Detailed instructions are in [Pi bring-up](docs/pi-bring-up.md) and [system design](docs/system-design.md).
+
+## Repository map
+
+```text
+src/vollebak_gimbal/       Runnable Pi camera, calibration, control, UI, and driver
+src/layer1_neuromorphic/   Bart's Python event-camera pipeline
+src/layer2_radar/          Bart's radar and micro-Doppler layer
+src/layer3_fusion/         Bart's trackers, association, and fusion source
+src/layer4_engagement/     Upstream research source; not connected to the Pi runtime
+src/layer5_cooperative/    Bart's cooperative tracking source
+ev_ingestion_cpp/          Jetson/OpenEB/CUDA event-camera engine and its web HUD
+crates/                    Bart's Rust messages and orchestrator workspace
+config/                    Pi configs plus upstream sensor configs
+docs/                      Pi guides and Bart's architecture/research corpus
+tests/                     Pi tests plus Bart's 48-test Python suite
 ```
 
----
+## Safety boundary
 
-## 🔒 Security & Safety Controls
-- **Keep-Out Cones**: Software and hardware interlocks strictly veto laser emission towards operator forward zones, non-cleared airspace, or ground elevations $< 5^\circ$.
-- **Zero-RF Silent Stance**: Layer 1 passive neuromorphic vision operates with zero RF emission until confirmed drone rotor harmonics trigger active cueing.
-- **Fail-Safe Interlocks**: Automatic laser shutdown and mast stowage upon track loss, BDA confirmation, or IMU telemetry degradation.
+`config/predator_system.yaml` is the active integration policy and fixes the runtime to observation-only. The dashboard health response and telemetry both report `engagement_enabled: false`. The app has no laser, firing, scanning, or engagement API. Bart's upstream engagement-oriented source is retained for provenance and analysis but is not imported by the Pi application.
+
+Bart's original system config and README are preserved as `config/predator_system.upstream.yaml` and `docs/upstream/bart-README.md`; neither is loaded by the Pi application.
+
+The checked-in Pi configs use the mock driver. Motion commands are range-, step-, rate-, and deadband-limited, but software limits are not a substitute for physical clearance and a servo-power emergency stop.
+
+## Vendor references
+
+- [Waveshare product wiki](https://www.waveshare.com/wiki/2-Axis_Pan-Tilt_Camera_Module)
+- [Waveshare assembly and calibration guide](https://www.waveshare.com/wiki/2-Axis_Pan-Tilt_Camera_Module_Assembly_and_Configuration_Guide)
+- [Waveshare host-control reference](https://github.com/waveshareteam/ugv_rpi)

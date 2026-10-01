@@ -3,6 +3,7 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <cstdlib>
 #include <metavision/sdk/stream/camera.h>
 #include <metavision/sdk/base/events/event_cd.h>
 
@@ -13,7 +14,13 @@ int main(int argc, char *argv[]) {
     
     try {
         std::cout << "[INFO] Initializing Metavision Camera..." << std::endl;
-        Metavision::Camera camera = Metavision::Camera::from_first_available();
+        const char *serial_env = std::getenv("PREDATOR_EVENT_CAMERA_SERIAL");
+        const std::string serial = argc > 1 ? argv[1] : (serial_env ? serial_env : "");
+        Metavision::Camera camera = serial.empty() ? Metavision::Camera::from_first_available()
+                                                    : Metavision::Camera::from_serial(serial);
+        if (!serial.empty()) {
+            std::cout << "[INFO] Direct-open serial: " << serial << std::endl;
+        }
         
         int width = camera.geometry().get_width();
         int height = camera.geometry().get_height();

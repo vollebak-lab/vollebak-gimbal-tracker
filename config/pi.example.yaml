@@ -1,0 +1,49 @@
+camera:
+  source: 0                 # Usually the first USB camera. Try 1 if needed.
+  width: 1280
+  height: 720
+  fps: 30
+  backend: v4l2
+
+event_camera:
+  enabled: false             # Enable after the OpenEB service is running on port 8081.
+  base_url: http://127.0.0.1:8081
+  poll_interval_s: 0.25
+  timeout_s: 1.0
+  track_targets: false       # Enable only after camera-to-gimbal alignment is calibrated.
+  pan_offset_deg: 0.0
+  tilt_offset_deg: 0.0
+
+detector:
+  type: motion              # motion | color | person
+  min_area: 3000
+  history: 300
+  threshold: 32
+  warmup_frames: 30
+  # HSV values used only when type is color:
+  hsv_low: [35, 80, 60]
+  hsv_high: [85, 255, 255]
+
+calibration:
+  path: calibration.json
+
+gimbal:
+  driver: mock              # Change to waveshare_serial only after safe bring-up.
+  serial_port: /dev/ttyUSB0 # Could be /dev/ttyACM0, /dev/ttyAMA0, or /dev/serial0.
+  baud: 115200
+  pan_min: -170.0           # Conservative software margin inside vendor range.
+  pan_max: 170.0
+  tilt_min: -25.0
+  tilt_max: 80.0
+  home_pan: 0.0
+  home_tilt: 0.0
+  speed: 60
+  acceleration: 20
+
+tracking:
+  command_hz: 10.0
+  smoothing_alpha: 0.25
+  deadband_deg: 1.0
+  max_step_deg: 4.0
+  lost_hold_s: 1.0
+  park_after_s: 5.0
