@@ -10,6 +10,7 @@
 #include <csignal>
 #include <condition_variable>
 #include <algorithm>
+#include <cstdlib>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -22,6 +23,7 @@
 #include <metavision/sdk/base/events/event_cd.h>
 #include <metavision/sdk/core/algorithms/periodic_frame_generation_algorithm.h>
 #include <metavision/sdk/core/utils/colors.h>
+#include <metavision/hal/facilities/i_erc_module.h>
 #include <opencv2/opencv.hpp>
 
 // Global shutdown flag
@@ -531,7 +533,13 @@ int main(int argc, char* argv[]) {
 
     try {
         std::cout << "[INFO] Opening Metavision Camera...\n";
-        Metavision::Camera camera = Metavision::Camera::from_first_available();
+        const char *serial_env = std::getenv("PREDATOR_EVENT_CAMERA_SERIAL");
+        const std::string serial = argc > 2 ? argv[2] : (serial_env ? serial_env : "");
+        Metavision::Camera camera = serial.empty() ? Metavision::Camera::from_first_available()
+                                                    : Metavision::Camera::from_serial(serial);
+        if (!serial.empty()) {
+            std::cout << "[INFO] Direct-open serial: " << serial << std::endl;
+        }
 
         int width = camera.geometry().get_width();
         int height = camera.geometry().get_height();
@@ -584,6 +592,26 @@ int main(int argc, char* argv[]) {
         std::thread server_thread(http_server_loop, port);
 
         camera.start();
+
+        // WSL's usbipd bridge is less tolerant of the IMX636's peak event rate than a
+        // native Linux USB stack. OpenEB facilities must be changed after acquisition
+        // starts on this IDS integration, as demonstrated by Metavision's own viewer.
+        const char *event_rate_env = std::getenv("PREDATOR_EVENT_RATE_LIMIT");
+        uint32_t requested_event_rate = event_rate_env ? std::stoul(event_rate_env) : 10000000U;
+        try {
+            auto &erc = camera.get_facility<Metavision::I_ErcModule>();
+            requested_event_rate = std::clamp(
+                requested_event_rate,
+                erc.get_min_supported_cd_event_rate(),
+                erc.get_max_supported_cd_event_rate());
+            if (!erc.set_cd_event_rate(requested_event_rate) || !erc.enable(true)) {
+                std::cerr << "[WARNING] Event Rate Controller configuration was not fully applied\n";
+            }
+            std::cout << "[INFO] Event Rate Controller enabled at "
+                      << erc.get_cd_event_rate() / 1000000.0 << " MEv/s\n";
+        } catch (const Metavision::CameraException& e) {
+            std::cerr << "[WARNING] Event Rate Controller unavailable: " << e.what() << "\n";
+        }
         std::cout << "[INFO] Camera streaming active. Serving live visualizer...\n";
 
         auto last_sec = std::chrono::steady_clock::now();
@@ -604,6 +632,9 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "[INFO] Stopping camera...\n";
+        // The HTTP listener is non-blocking and observes this flag. Clear it before
+        // joining so a USB disconnect cannot leave a stale-but-responsive /stats API.
+        g_running = false;
         camera.stop();
 
         if (server_thread.joinable()) {

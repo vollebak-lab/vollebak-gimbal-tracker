@@ -21,6 +21,9 @@ env/
 
 # Pytest
 .pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Rust
 target/
@@ -45,4 +48,14 @@ event_camera/
 
 # Logs
 *.log
+logs/
 engagement_logs/
+
+# Local camera/gimbal state
+config/calibration.json
+captures/
+*.avi
+*.mp4
+.env
+.edge-qa*/
+dashboard-qa*.png

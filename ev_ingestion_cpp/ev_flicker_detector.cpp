@@ -10,6 +10,7 @@
 #include <csignal>
 #include <condition_variable>
 #include <algorithm>
+#include <cstdlib>
 #include <iomanip>
 
 #include <sys/types.h>
@@ -23,12 +24,15 @@
 #include <metavision/sdk/base/events/event_cd.h>
 #include <metavision/sdk/core/algorithms/periodic_frame_generation_algorithm.h>
 #include <metavision/sdk/core/utils/colors.h>
+#include <metavision/hal/facilities/i_erc_module.h>
 #include <metavision/hal/facilities/i_ll_biases.h>
 #include <opencv2/opencv.hpp>
 
 #include "flicker_dsp.hpp"
 #include "ego_motion.hpp"
+#ifdef PREDATOR_WITH_TENSORRT
 #include "event_suppression_trt.hpp"
+#endif
 
 // Global shutdown flag
 static std::atomic<bool> g_running{true};
@@ -123,6 +127,7 @@ public:
         double gyro_wy{0.0};
         double gyro_wz{0.0};
         double suppressed_pct{0.0};
+        double event_rate_ev_s{0.0};
         uint64_t total_events{0};
         uint64_t retained_events{0};
     };
@@ -153,6 +158,13 @@ public:
         ss << std::fixed << std::setprecision(2);
         ss << "{\n"
            << "  \"timestamp_ms\": " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\n"
+           << "  \"status\": \"ONLINE\",\n"
+           << "  \"sensor\": \"Sony IMX636 HD\",\n"
+           << "  \"integrator\": \"IDS Imaging Development Systems\",\n"
+           << "  \"resolution\": \"1280x720\",\n"
+           << "  \"event_rate_ev_s\": " << ego_stats_.event_rate_ev_s << ",\n"
+           << "  \"event_rate_mev_s\": " << (ego_stats_.event_rate_ev_s / 1000000.0) << ",\n"
+           << "  \"stream_fps\": 30.0,\n"
            << "  \"lens\": {\"model\": \"Edmund Optics 8mm f/8 M12\", \"fl_mm\": 8.0, \"hfov_deg\": 44.5, \"vfov_deg\": 25.1},\n"
            << "  \"ego_motion\": {\n"
            << "    \"trt_suppression_active\": " << (ego_stats_.trt_suppression_active ? "true" : "false") << ",\n"
@@ -576,13 +588,23 @@ int main(int argc, char* argv[]) {
 
     std::cout << "========================================================\n";
     std::cout << "  Predator — Real-Time Propeller Flicker Detector Engine\n";
+#ifdef PREDATOR_WITH_TENSORRT
     std::cout << "  Ego-Motion Compensation + TensorRT Suppression Core   \n";
+#else
+    std::cout << "  Ego-Motion Compensation + CPU Pass-Through Core       \n";
+#endif
     std::cout << "  Lens: Edmund Optics 8mm f/8 M12 (#27052)              \n";
     std::cout << "========================================================\n";
 
     try {
         std::cout << "[INFO] Opening Metavision Event Camera...\n";
-        Metavision::Camera camera = Metavision::Camera::from_first_available();
+        const char *serial_env = std::getenv("PREDATOR_EVENT_CAMERA_SERIAL");
+        const std::string serial = argc > 2 ? argv[2] : (serial_env ? serial_env : "");
+        Metavision::Camera camera = serial.empty() ? Metavision::Camera::from_first_available()
+                                                    : Metavision::Camera::from_serial(serial);
+        if (!serial.empty()) {
+            std::cout << "[INFO] Direct-open serial: " << serial << "\n";
+        }
 
         int width = camera.geometry().get_width();
         int height = camera.geometry().get_height();
@@ -618,6 +640,7 @@ int main(int argc, char* argv[]) {
         // Continuous Gyroscope Warper & Stabilization Engine
         predator::ContinuousGyroWarper gyro_warper(lens_params);
 
+#ifdef PREDATOR_WITH_TENSORRT
         // 2-Bin Temporal Event Stack Accumulator for TensorRT Dynamic Suppression
         predator::TemporalEventStackAccumulator event_stack_acc(640, 360, 40000); // 40ms frames
 
@@ -625,6 +648,7 @@ int main(int argc, char* argv[]) {
         predator::AnticipatorySuppressionEngine suppression_engine(640, 360);
         std::string engine_path = "/home/orin/ev_deploy/models/event_suppression_fp16.engine";
         suppression_engine.load_engine(engine_path);
+#endif
 
         std::mutex grid_mutex;
         std::atomic<uint64_t> total_raw_counter{0};
@@ -656,15 +680,21 @@ int main(int argc, char* argv[]) {
                     current_epoch_ref_us.store(t_ref);
                 }
 
+#ifdef PREDATOR_WITH_TENSORRT
                 // Ingest into 2-bin temporal stack accumulator
                 event_stack_acc.ingest_event(it->x, it->y, it->t, it->p);
+#endif
 
                 // Tier 1: Continuous Gyroscope Point-Wise Coordinate Stabilization
                 double stab_x = 0.0, stab_y = 0.0;
                 bool valid = gyro_warper.unwarp_event(it->x, it->y, it->t, t_ref, stab_x, stab_y);
 
+#ifdef PREDATOR_WITH_TENSORRT
                 // Tier 2: Anticipatory Motion Suppression Gate (UZH RSS 2026 TensorRT)
                 bool retain = suppression_engine.is_event_retained(stab_x, stab_y, 0.30f);
+#else
+                bool retain = true;
+#endif
 
                 if (valid && retain) {
                     retained_counter++;
@@ -677,6 +707,25 @@ int main(int argc, char* argv[]) {
         std::thread server_thread(http_server_thread_func, port);
 
         camera.start();
+
+        // Protect virtual USB development hosts from IMX636 event bursts. This is
+        // configurable so native Pi/Jetson deployments can select a higher limit.
+        const char *event_rate_env = std::getenv("PREDATOR_EVENT_RATE_LIMIT");
+        uint32_t requested_event_rate = event_rate_env ? std::stoul(event_rate_env) : 10000000U;
+        try {
+            auto &erc = camera.get_facility<Metavision::I_ErcModule>();
+            requested_event_rate = std::clamp(
+                requested_event_rate,
+                erc.get_min_supported_cd_event_rate(),
+                erc.get_max_supported_cd_event_rate());
+            if (!erc.set_cd_event_rate(requested_event_rate) || !erc.enable(true)) {
+                std::cerr << "[WARNING] Event Rate Controller configuration was not fully applied\n";
+            }
+            std::cout << "[INFO] Event Rate Controller enabled at "
+                      << erc.get_cd_event_rate() / 1000000.0 << " MEv/s\n";
+        } catch (const Metavision::CameraException& e) {
+            std::cerr << "[WARNING] Event Rate Controller unavailable: " << e.what() << "\n";
+        }
         std::cout << "[INFO] Real-time propeller flicker detector active with ego-motion compensation.\n";
 
         struct CellSnapshot {
@@ -686,23 +735,35 @@ int main(int argc, char* argv[]) {
             std::vector<double> history;
         };
 
+        auto last_metrics_time = std::chrono::steady_clock::now();
+
         // Main analysis loop: 25 Hz analysis cycle with lock-free snapshot processing
         while (g_running && camera.is_running()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
 
+#ifdef PREDATOR_WITH_TENSORRT
             // 1. Run TensorRT Anticipatory Suppression Inference on Latest 2-Bin Event Stack
             std::vector<float> event_stack;
             if (event_stack_acc.get_latest_stack(event_stack)) {
                 suppression_engine.infer(event_stack, 40.0f); // 40ms lookahead
             }
+#endif
 
             // 2. Snapshot metrics
             uint64_t total_events = total_raw_counter.exchange(0);
             uint64_t retained_events = retained_counter.exchange(0);
+            auto metrics_time = std::chrono::steady_clock::now();
+            double metrics_interval_s = std::chrono::duration<double>(metrics_time - last_metrics_time).count();
+            last_metrics_time = metrics_time;
             double suppressed_pct = (total_events > 0) ? (100.0 * (1.0 - (static_cast<double>(retained_events) / total_events))) : 0.0;
 
             DetectionManager::EgoMotionStats ego_stats;
+#ifdef PREDATOR_WITH_TENSORRT
             ego_stats.trt_suppression_active = suppression_engine.is_ready();
+#else
+            ego_stats.trt_suppression_active = false;
+#endif
+            ego_stats.event_rate_ev_s = metrics_interval_s > 0.0 ? total_events / metrics_interval_s : 0.0;
             ego_stats.total_events = total_events;
             ego_stats.retained_events = retained_events;
             ego_stats.suppressed_pct = suppressed_pct;
