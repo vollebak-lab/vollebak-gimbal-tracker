@@ -4,9 +4,9 @@ After=multi-user.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/vollebak-gimbal-tracker
-ExecStart=/home/pi/vollebak-gimbal-tracker/.venv/bin/gimbal-tracker ui -c config/pi.yaml --host 0.0.0.0 --port 8080
+User=vollebak
+WorkingDirectory=/home/vollebak/vollebak-gimbal-tracker
+ExecStart=/home/vollebak/vollebak-gimbal-tracker/.venv/bin/gimbal-tracker ui -c config/pi.yaml --host 0.0.0.0 --port 8080
 Restart=on-failure
 RestartSec=3
 
