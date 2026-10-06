@@ -294,9 +294,8 @@ __global__ void kernel_analyze_spectral_peaks(
     }
 
     // Standoff Dynamic Activity Gate:
-    // If a 2x2 micro-tile has locked into repetitive periodic blade passes (>= 2 hits),
-    // allow weak standoff signals with as few as 6 events!
-    float min_activity_req = (max_sieve_hits >= 2) ? 6.0f : (is_pooled ? 20.0f : 12.0f);
+    // Allow weak standoff signals (>= 5.0 events) to proceed to spectral harmonic analysis and CombNet
+    float min_activity_req = is_pooled ? 8.0f : 5.0f;
     if (total_events < min_activity_req) return;
 
     // Peak search using Harmonic Product Spectrum (HPS) in [min_freq_hz, max_freq_hz] (bins 9 to 102 for 70..800 Hz)
@@ -795,12 +794,10 @@ void CudaFlickerCore::get_active_cells_with_spectra(
     CUDA_CHECK(cudaMemcpy(h_cell_totals_, d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_cell_sieve_hits_, d_cell_max_sieve_hits_, num_total_cells_ * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    // Identify active base and pooled cells that exhibit periodic micro-sieve confirmation (>= 1 hit)
-    // or moderate activity density (>= 18.0 events)
+    // Identify active base and pooled cells with sufficient event density (>= min_events)
     for (int i = 0; i < num_total_cells_; ++i) {
         float ev = h_cell_totals_[i];
-        uint32_t hits = h_cell_sieve_hits_[i];
-        if ((hits >= 1 && ev >= min_events) || (ev >= 18.0f)) {
+        if (ev >= min_events) {
             out_cell_indices.push_back(i);
             if (out_cell_indices.size() >= 128) break; // Capped at max batch size
         }

@@ -32,7 +32,6 @@
 
 #include "flicker_dsp.hpp"
 #include "ego_motion.hpp"
-#include "event_suppression_trt.hpp"
 #include "spectral_combnet_trt.hpp"
 #include "cuda_flicker_core.cuh"
 #include <omp.h>
@@ -505,13 +504,12 @@ void display_encoder_thread_func(int width, int height) {
             std::string hud_top = "PREDATOR-01 | 12mm f/2.0 M12 | DDHF + Ego-Motion Core";
             cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
 
-            // Ego-Motion & Suppression HUD Badge
+            // Ego-Motion & Frequency-Domain Core HUD Badge
             char ego_badge[256];
-            snprintf(ego_badge, sizeof(ego_badge), "NICLA: %s | GYRO: [%+.2f, %+.2f, %+.2f] | TRT-EGO: %s (%.0f%%) | COMBNET: %s (%d DET)",
+            snprintf(ego_badge, sizeof(ego_badge), "NICLA: %s | GYRO: [%+.2f, %+.2f, %+.2f] (%.1f deg/s) | WARP: %s | COMBNET: %s (%d DET)",
                      ego_stats.imu_connected ? "200Hz" : "OFFLINE",
-                     ego_stats.gyro_wx, ego_stats.gyro_wy, ego_stats.gyro_wz,
-                     ego_stats.trt_suppression_active ? "ACTIVE" : "PASS-THRU",
-                     ego_stats.suppressed_pct,
+                     ego_stats.gyro_wx, ego_stats.gyro_wy, ego_stats.gyro_wz, ego_stats.gyro_speed_deg_s,
+                     ego_stats.trt_suppression_active ? "BYPASS" : "ACTIVE",
                      ego_stats.spectral_combnet_active ? "FP16" : "OFF",
                      ego_stats.spectral_detections);
             cv::putText(frame, ego_badge, cv::Point(16, 56), cv::FONT_HERSHEY_SIMPLEX, 0.48,
@@ -1029,14 +1027,6 @@ int main(int argc, char* argv[]) {
         g_diag_logger.start();
         std::cout << "[INFO] High-rate CSV diagnostics logger active at " << g_diag_logger.log_path() << "\n";
 
-        // 2-Bin Temporal Event Stack Accumulator for TensorRT Dynamic Suppression
-        predator::TemporalEventStackAccumulator event_stack_acc(640, 360, 40000); // 40ms frames
-
-        // TensorRT FP16 Dynamic Motion Suppression Engine
-        predator::AnticipatorySuppressionEngine suppression_engine(640, 360);
-        std::string engine_path = "/home/orin/ev_deploy/models/event_suppression_fp16.engine";
-        suppression_engine.load_engine(engine_path);
-
         // TensorRT FP16 SpectralCombNet Engine (Frequency-Domain Propeller Classifier)
         predator::SpectralCombNetEngine spectral_engine(128);
         std::string spectral_engine_path = "/home/orin/ev_deploy/models/spectral_combnet_fp16.engine";
@@ -1047,16 +1037,13 @@ int main(int argc, char* argv[]) {
             std::cout << "[WARN] SpectralCombNet TRT Engine not loaded, continuing with cuFFT peak detector.\n";
         }
 
-        // Configurable Ego-Motion & TensorRT Suppression Toggles
-        // Default to pure direct native ingestion (0/disabled) to ensure 100% detection of stationary/hovering drones
-        bool enable_trt_suppression = false;
-        bool enable_ego_warp = false;
-        const char* env_trt = std::getenv("PREDATOR_ENABLE_TRT_SUPPRESSION");
+        // Configurable Ego-Motion Stabilization
+        // Default to active 200 Hz IMU homography de-rotation with calibrated rad/s scaling
+        bool enable_ego_warp = true;
         const char* env_warp = std::getenv("PREDATOR_ENABLE_EGO_WARP");
-        if (env_trt && std::string(env_trt) == "1") enable_trt_suppression = true;
-        if (env_warp && std::string(env_warp) == "1") enable_ego_warp = true;
-        std::cout << "[INFO] Pipeline Ingestion Mode: Ego-Warp=" << (enable_ego_warp ? "ACTIVE" : "BYPASS (Identity)")
-                  << ", TRT-Suppression=" << (enable_trt_suppression ? "ACTIVE" : "BYPASS (Pass-Through)") << ".\n";
+        if (env_warp && std::string(env_warp) == "0") enable_ego_warp = false;
+        std::cout << "[INFO] Pipeline Ingestion Mode: Ego-Warp=" << (enable_ego_warp ? "ACTIVE (Nicla 200Hz)" : "BYPASS (Identity)")
+                  << ", Pure Frequency-Domain Harmonic Pipeline Active.\n";
 
         std::atomic<uint64_t> total_raw_counter{0};
         std::atomic<uint64_t> retained_counter{0};
@@ -1095,22 +1082,11 @@ int main(int argc, char* argv[]) {
                 batch_H = gyro_warper.compute_homography(t_ref, mid_t);
             }
 
-            // Ingest into 2-bin stack accumulator for TensorRT
-            if (enable_trt_suppression) {
-                event_stack_acc.update_window(begin->t);
-                for (auto it = begin; it != end; ++it) {
-                    event_stack_acc.ingest_event_fast(it->x, it->y, it->p);
-                }
-            }
-
-            const float* d_suppression_mask = (enable_trt_suppression && suppression_engine.is_ready()) ?
-                suppression_engine.get_device_mask() : nullptr;
-
-            // Direct GPU Ingestion, Homography Warping, TensorRT Mask Gating, SAE Sieve, and Ring Buffer Accumulation
+            // Direct GPU Ingestion, Homography Warping, SAE Sieve, and Ring Buffer Accumulation
             uint64_t raw_count = 0;
             uint64_t retained_count = 0;
             cuda_core.ingest_event_batch(begin, batch_size, batch_H, raw_count, retained_count,
-                                         d_suppression_mask, 0.35f, false);
+                                         nullptr, 0.35f, false);
 
             total_raw_counter.fetch_add(raw_count, std::memory_order_relaxed);
         });
@@ -1128,14 +1104,6 @@ int main(int argc, char* argv[]) {
         while (g_running && camera.is_running()) {
             next_cycle_epoch += cycle_interval;
 
-            // 1. Run TensorRT Anticipatory Suppression Inference on Latest 2-Bin Event Stack (if enabled)
-            if (enable_trt_suppression && suppression_engine.is_ready()) {
-                std::vector<float> event_stack;
-                if (event_stack_acc.get_latest_stack(event_stack)) {
-                    suppression_engine.infer(event_stack, 40.0f); // 40ms lookahead
-                }
-            }
-
             // 2. Snapshot metrics
             uint64_t total_events = total_raw_counter.exchange(0);
             uint64_t retained_events = cuda_core.get_and_reset_retained_count();
@@ -1148,7 +1116,7 @@ int main(int argc, char* argv[]) {
             double foliage_dispersion_pct = (100.0 * static_cast<double>(active_cells)) / 576.0;
 
             DetectionManager::EgoMotionStats ego_stats;
-            ego_stats.trt_suppression_active = enable_trt_suppression && suppression_engine.is_ready();
+            ego_stats.trt_suppression_active = false;
             ego_stats.imu_connected = imu_reader.is_connected();
             ego_stats.imu_packets = imu_reader.packet_count();
             ego_stats.gyro_wx = omega.x;

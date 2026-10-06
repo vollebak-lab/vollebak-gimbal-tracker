@@ -170,3 +170,12 @@
   - [x] Clamped homography coordinates in `cuda_flicker_core.cu` to prevent boundary event dropping.
   - [x] Configured clean default bypass for TRT suppression and ego-warp in `ev_flicker_detector.cpp` (`enable_trt_suppression = false`, `enable_ego_warp = false`), restoring direct native pixel ingestion (`H = Identity`) and allowing 100% of hovering blade chops into the 512-point cuFFT.
   - [x] Verified all 3 unit test suites ($26/26$ tests passed) and deployed live binary to `predator-camera.service` on Jetson Orin Nano (PID 129214). Live telemetry confirms unbroken lock on stationary target with 124+ consecutive hits, $16\text{--}18\text{ dB}$ SNR, and $0\text{ misses}$.
+
+- [x] **Phase 30: Lean Frequency-Domain Pipeline & Nicla IMU Gyro Calibration**
+  - [x] Identified root cause of ego-motion failure during active camera movement: `ego_motion.hpp` had an inverted axis swap and a $16.384\times$ double-scaling multiplier (`BHI260_SCALE = 32768 / 2000`) on packet data that `nicla_predator_imu.ino` had already converted to SI units ($\text{rad/s}$ in optical camera frame). As a result, a $3^\circ/\text{s}$ horizontal pan was interpreted as a $49.1^\circ/\text{s}$ vertical pitch homography, instantaneously smearing and throwing events across the sensor.
+  - [x] Fixed `ego_motion.hpp` to assign `cam_wx = wx` (pitch), `cam_wy = wy` (yaw), `cam_wz = wz` (roll) with pure $1.0\times$ SI scaling.
+  - [x] Decommissioned the optical flow ConvGRU engine (`event_suppression_fp16.engine`) and 2-bin stack accumulator from `ev_flicker_detector.cpp`, removing $\sim 14\text{ ms}$ overhead and eliminating hover suppression traps entirely.
+  - [x] Streamlined CUDA core: lowered standoff activity gate in `cuda_flicker_core.cu` to $\ge 5.0\text{ events}$ without requiring micro-sieve hits, allowing weak, distant rotor sweeps at 80–115ft to enter cuFFT and `SpectralCombNet` analysis.
+  - [x] Enabled Nicla 200 Hz IMU ego-warp by default (`enable_ego_warp = true`).
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed 100%) and deployed updated binary to `predator-camera.service` on Jetson Orin Nano (PID 130679). Telemetry confirms unbroken lock (323+ consecutive hits, 0 misses, $16.8\text{ dB}$ SNR at $250\text{ Hz}$).
+

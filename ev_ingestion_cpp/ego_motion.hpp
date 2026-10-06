@@ -644,18 +644,18 @@ private:
                         continue;
                     }
 
-                    // Calibrated BHI260AP scale correction factor (32768 / 2000 = 16.384x)
-                    // and physical rear-mount camera optical axis alignment:
-                    //   Camera Yaw (Horizontal pan)  = +Packet WX * 16.384
-                    //   Camera Pitch (Vertical tilt) = +Packet WY * 16.384
-                    //   Camera Roll (Twist)          = +Packet WZ * 16.384
-                    const float BHI260_SCALE = 32768.0f / 2000.0f; // 16.384f
-                    float cam_wx = wy * BHI260_SCALE;
-                    float cam_wy = wx * BHI260_SCALE;
-                    float cam_wz = wz * BHI260_SCALE;
+                    // Physical camera optical axis alignment from Arduino Nicla Sense ME:
+                    //   nicla_predator_imu.ino already mapped:
+                    //     g_packet.gyro_x = nicla_wy (Camera Pitch rate in rad/s)
+                    //     g_packet.gyro_y = nicla_wx (Camera Yaw rate in rad/s)
+                    //     g_packet.gyro_z = -nicla_wz (Camera Roll rate in rad/s)
+                    // Packet payload is already in SI units of rad/s and m/s^2.
+                    float cam_wx = wx; // Pitch rate around X-axis (rad/s)
+                    float cam_wy = wy; // Yaw rate around Y-axis (rad/s)
+                    float cam_wz = wz; // Roll rate around Z-axis (rad/s)
 
-                    float cam_ax = ay;
-                    float cam_ay = ax;
+                    float cam_ax = ax;
+                    float cam_ay = ay;
                     float cam_az = az;
 
                     uint64_t host_now_us = std::chrono::duration_cast<std::chrono::microseconds>(

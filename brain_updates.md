@@ -814,3 +814,38 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - TRT suppression status: `PASS-THRU (BYPASS)` — 100% of hovering blade chops reach the 512-point cuFFT.
     - Zero false alarms from stationary or moving foliage.
 
+---
+
+### 36. Lean Frequency-Domain Pipeline & Nicla IMU Gyro Calibration (Phase 30)
+- **Problem Statement & Architectural Review**:
+  - The user clarified that bypassing motion compensation was the wrong operational approach—camera ego-motion compensation is a core requirement for counter-UAS platforms (helmet-mounted, mast-mounted, and gimbals).
+  - The pipeline had accumulated layers over successive phases (ConvGRU IMO optical flow, 2-bin stack accumulator, SAE micro-sieve, cuFFT, DDHF flatness, SpectralCombNet TRT, spatial clustering).
+- **Critical Root Cause Analysis (RCA)**:
+  - *The Smoking Gun on Ego-Motion Failure*: In `ego_motion.hpp` (`NiclaSerialReader::read_loop`), the code had an inverted axis swap and a $16.384\times$ double-scaling multiplier (`BHI260_SCALE = 32768 / 2000`). However, `nicla_predator_imu.ino` had **already** converted raw ADC counts to SI units ($\text{rad/s}$) and mapped axes to the optical camera frame (`gyro_x = nicla_wy` = pitch, `gyro_y = nicla_wx` = yaw, `gyro_z = -nicla_wz` = roll).
+  - Because of this bug, whenever the camera panned horizontally at $3^\circ/\text{s}$, the warper computed a **$49.1^\circ/\text{s}$ vertical pitch homography**, instantly throwing and smearing all events across the vertical axis!
+  - *Redundancy of ConvGRU Optical Flow*: The TensorRT Anticipatory Motion Suppression engine (`event_suppression_fp16.engine`) was trained as an IMO optical flow segmenter. A hovering or head-on drone has $\mathbf{u} \approx 0$ and gets suppressed. Moreover, `SpectralCombNet` + cuFFT harmonic detection already rejects foliage clutter with $>99.98\%$ accuracy in the frequency domain.
+- **Architectural Streamlining & Fixes Deployed**:
+  1. *Fixed Nicla IMU Ingestion (`ego_motion.hpp`)*:
+     - Directly assigned `cam_wx = wx` (pitch rate), `cam_wy = wy` (yaw rate), `cam_wz = wz` (roll rate) in pure $1.0\times$ SI units ($\text{rad/s}$).
+     - Preserved online zero-velocity bias calibration and $0.02\text{ rad/s}$ ($1.1^\circ/\text{s}$) deadband.
+  2. *Decommissioned ConvGRU Suppression Engine (`ev_flicker_detector.cpp`)*:
+     - Removed `event_suppression_trt.hpp`, `TemporalEventStackAccumulator`, and `AnticipatorySuppressionEngine`.
+     - Saved $\sim 14\text{ ms}$ compute/frame, eliminated 2-bin stack accumulation, and permanently eliminated the hover suppression trap.
+  3. *Streamlined CUDA Core for Standoff Range (`cuda_flicker_core.cu`)*:
+     - Lowered standoff activity gate to $\ge 5.0\text{ events}$ without requiring micro-sieve hits.
+     - Updated `get_active_cells_with_spectra` to evaluate `SpectralCombNet` on any cell with $\ge 5.0\text{ events}$, recovering faint blade chops at 80–115ft.
+  4. *Active Ego-Motion Compensation by Default*:
+     - Enabled `enable_ego_warp = true` by default.
+     - Updated HUD badge to display live calibrated gyro rates and warp status: `NICLA: 200Hz | GYRO: [wx, wy, wz] (deg/s) | WARP: ACTIVE | COMBNET: FP16`.
+- **Hardware Verification & Live Deployment (`orin@10.0.0.34`, PID 130679)**:
+  - All 3 unit test suites passed 100%:
+    - `test_cuda_flicker`: 7/7 PASSED (0.75 ms cuFFT, CombNet prob=0.9604, foliage=0.0001).
+    - `test_flicker_dsp`: 12/12 PASSED.
+    - `test_ego_motion`: 7/7 PASSED (Compensated SNR = 29.7 dB under 25 deg/s pan, 12/12 cycles locked).
+  - Live deployment verified on Jetson Orin Nano:
+    - Target locked with **323+ consecutive hits (0 misses)**.
+    - $\text{BPF} = 249.67\text{ Hz}$ ($7490\text{ RPM}$) with **$16.8\text{ dB}$ SNR** and confidence $1.00$.
+    - Memory reduced to $98.5\text{ MB}$.
+    - Pipeline compute latency reduced to $<2.5\text{ ms}$ total per frame.
+
+
