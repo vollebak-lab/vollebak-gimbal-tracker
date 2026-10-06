@@ -38,6 +38,7 @@ gimbal:
   acceleration: 20
 
 tracking:
+  start_enabled: true       # Development uses the mock driver, so auto-start is safe.
   command_hz: 10.0
   smoothing_alpha: 0.30
   deadband_deg: 1.0

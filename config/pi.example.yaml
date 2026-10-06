@@ -41,6 +41,7 @@ gimbal:
   acceleration: 20
 
 tracking:
+  start_enabled: false      # Require an explicit UI action after every launch.
   command_hz: 10.0
   smoothing_alpha: 0.25
   deadband_deg: 1.0

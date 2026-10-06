@@ -49,6 +49,7 @@ class GimbalConfig:
 
 @dataclass(slots=True)
 class TrackingConfig:
+    start_enabled: bool = False
     command_hz: float = 10.0
     smoothing_alpha: float = 0.25
     deadband_deg: float = 1.0

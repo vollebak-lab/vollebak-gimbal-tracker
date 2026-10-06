@@ -1,7 +1,19 @@
 import time
+from dataclasses import replace
 
 from vollebak_gimbal.config import load_config
 from vollebak_gimbal.web import DashboardEngine
+
+
+def test_dashboard_starts_disarmed_by_default():
+    config = load_config("config/dev.yaml")
+    config.tracking = replace(config.tracking, start_enabled=False)
+    engine = DashboardEngine(config, force_demo=True)
+    try:
+        state = engine.state()
+        assert state["tracking_enabled"] is False
+    finally:
+        engine.close()
 
 
 def test_demo_dashboard_tracks_and_accepts_manual_commands():

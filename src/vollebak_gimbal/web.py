@@ -94,7 +94,9 @@ class DashboardEngine:
         self._thread: threading.Thread | None = None
         self._frame: bytes | None = None
         self._frame_id = 0
-        self._tracking_enabled = self.calibration is not None
+        self._tracking_enabled = bool(
+            config.tracking.start_enabled and self.calibration is not None
+        )
         initial_angles = Angles(config.gimbal.home_pan, config.gimbal.home_tilt)
         initial_event_camera = self.event_camera.snapshot()
         self._state: dict[str, Any] = {
