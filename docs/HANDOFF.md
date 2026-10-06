@@ -39,6 +39,10 @@ At the end of a session, double-click `STOP_SYSTEM.cmd`. It pauses tracking, ret
 
 If the event camera is absent, the launcher warns but continues with Logitech tracking. A failure of the Logitech bridge, Pi SSH connection, or dashboard is treated as a startup failure.
 
+### Low-latency dashboard path
+
+The Logitech panel relays the bridge's original MJPEG bytes directly to the browser in small immediately available chunks. Detection and gimbal control still run on the Pi, but they no longer block or re-encode the visible feed. The target marker is rendered as a browser overlay from 10 Hz telemetry. This avoids the former laptop encode -> Pi decode -> detection -> Pi encode round trip and prevents multi-frame HTTP buffering.
+
 ## One-time provisioning
 
 The current development laptop and Pi can already use `RUN_SYSTEM.cmd`. When preparing a fresh checkout or transferring ownership, double-click `SETUP_HANDOFF.cmd` and enter the Pi password when requested. It:

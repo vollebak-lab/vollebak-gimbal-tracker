@@ -39,6 +39,7 @@ class OpenCVCamera:
         self.capture.set(self.cv2.CAP_PROP_FRAME_WIDTH, config.width)
         self.capture.set(self.cv2.CAP_PROP_FRAME_HEIGHT, config.height)
         self.capture.set(self.cv2.CAP_PROP_FPS, config.fps)
+        self.capture.set(self.cv2.CAP_PROP_BUFFERSIZE, 1)
         if not self.capture.isOpened():
             self.capture.release()
             raise RuntimeError(f"Could not open camera source {config.source!r}")

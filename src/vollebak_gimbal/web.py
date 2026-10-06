@@ -472,7 +472,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {"ok": True, "mode": "OBSERVATION_ONLY", "engagement_enabled": False},
             )
         elif path == "/stream.mjpg":
-            self._stream()
+            self._rgb_stream()
         elif path == "/event-stream.mjpg":
             self._event_stream()
         else:
@@ -519,10 +519,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         length = min(int(self.headers.get("Content-Length", "0")), 16_384)
         return json.loads(self.rfile.read(length) or b"{}")
 
-    def _stream(self) -> None:
+    def _rgb_stream(self) -> None:
+        """Prefer the original MJPEG bytes so the UI never waits on tracking work."""
+        source = self.engine.config.camera.source
+        state = self.engine.state()
+        if (
+            state.get("camera_mode") == "live"
+            and isinstance(source, str)
+            and source.startswith(("http://", "https://"))
+            and self._proxy_stream(source)
+        ):
+            return
+        self._processed_stream()
+
+    def _processed_stream(self) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         frame_id = -1
         try:
@@ -541,9 +556,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self.engine.config.event_camera.enabled:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Event camera is disabled"})
             return
+        self._proxy_stream(self.engine.event_camera.stream_url)
+
+    def _proxy_stream(self, source: str) -> bool:
+        """Relay an upstream MJPEG stream in small available chunks.
+
+        ``HTTPResponse.read(65536)`` waits to fill a large buffer and can retain
+        several JPEG frames. ``read1`` forwards whatever is available now,
+        keeping the browser close to the camera's newest frame.
+        """
         try:
             with urlopen(
-                self.engine.event_camera.stream_url,
+                source,
                 timeout=self.engine.config.event_camera.timeout_s,
             ) as upstream:
                 content_type = upstream.headers.get(
@@ -552,13 +576,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
-                while chunk := upstream.read(65_536):
+                read_available = getattr(upstream, "read1", upstream.read)
+                while chunk := read_available(8_192):
                     self.wfile.write(chunk)
+                return True
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
-            return
+            return True
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            LOGGER.warning("Event stream proxy stopped: %s", exc)
+            LOGGER.warning("MJPEG stream proxy stopped for %s: %s", source, exc)
+            return False
 
     def log_message(self, message: str, *args: object) -> None:
         LOGGER.debug("HTTP %s - %s", self.address_string(), message % args)

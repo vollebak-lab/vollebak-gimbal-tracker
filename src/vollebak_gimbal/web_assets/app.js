@@ -19,7 +19,7 @@ const ui = {
   profile: $("profileValue"), upstream: $("upstreamValue"),
   cameraFeed: $("cameraFeed"), rgbFeed: $("rgbFeedButton"),
   eventFeed: $("eventFeedButton"), eventRate: $("eventRateValue"),
-  clickHint: $("clickHint"),
+  clickHint: $("clickHint"), targetReticle: $("targetReticle"),
 };
 
 const canvas = $("twinCanvas");
@@ -28,7 +28,7 @@ let state = null;
 let priorSignature = "";
 let priorMessage = "";
 let toastTimer = null;
-let selectedFeed = "event";
+let selectedFeed = "rgb";
 
 function signed(value, digits = 1) {
   return `${value >= 0 ? "+" : "\u2212"}${Math.abs(value).toFixed(digits)}\u00b0`;
@@ -108,6 +108,34 @@ function updatePredatorUI(predator) {
   ui.upstream.textContent = `${predator.upstream.repository} @ ${predator.upstream.commit}`;
 }
 
+function displayedImageRect(frameWidth, frameHeight) {
+  const width = ui.cameraStage.clientWidth;
+  const height = ui.cameraStage.clientHeight;
+  const mediaAspect = Math.max(1, frameWidth) / Math.max(1, frameHeight);
+  const stageAspect = width / Math.max(1, height);
+  if (mediaAspect > stageAspect) {
+    const imageHeight = width / mediaAspect;
+    return {left: 0, top: (height - imageHeight) / 2, width, height: imageHeight};
+  }
+  const imageWidth = height * mediaAspect;
+  return {left: (width - imageWidth) / 2, top: 0, width: imageWidth, height};
+}
+
+function updateTargetOverlay(target, frameWidth, frameHeight) {
+  const matchesFeed = target && (
+    (selectedFeed === "rgb" && target.source === "rgb") ||
+    (selectedFeed === "event" && target.source === "event")
+  );
+  if (!matchesFeed) {
+    ui.targetReticle.style.display = "none";
+    return;
+  }
+  const rect = displayedImageRect(frameWidth, frameHeight);
+  ui.targetReticle.style.left = `${rect.left + Number(target.x) * rect.width}px`;
+  ui.targetReticle.style.top = `${rect.top + Number(target.y) * rect.height}px`;
+  ui.targetReticle.style.display = "block";
+}
+
 function updateUI(next) {
   state = next;
   const eventCamera = next.event_camera || {connected: false};
@@ -145,6 +173,7 @@ function updateUI(next) {
   ui.tiltLimits.textContent = `${signed(limits.tilt_min, 0)} \u2014 ${signed(limits.tilt_max, 0)}`;
   ui.panRange.min = limits.pan_min; ui.panRange.max = limits.pan_max;
   ui.tiltRange.min = limits.tilt_min; ui.tiltRange.max = limits.tilt_max;
+  updateTargetOverlay(next.target, next.frame_width, next.frame_height);
   updatePredatorUI(next.predator);
 
   const signature = `${next.status}|${next.camera_mode}|${Boolean(next.target)}|${next.tracking_enabled}|${eventCamera.connected}`;
@@ -221,7 +250,7 @@ async function poll() {
     ui.statusBadge.textContent = "SYSTEM \u00b7 OFFLINE";
     showToast(`Dashboard connection lost: ${error.message}`);
   } finally {
-    setTimeout(poll, 180);
+    setTimeout(poll, 100);
   }
 }
 
@@ -262,9 +291,12 @@ ui.cameraStage.addEventListener("click", async (event) => {
     showToast("Event targets drive the mock gimbal from Bart's bearing telemetry");
     return;
   }
-  const rect = ui.cameraStage.getBoundingClientRect();
+  const stage = ui.cameraStage.getBoundingClientRect();
+  const image = displayedImageRect(state.frame_width, state.frame_height);
+  const x = Math.max(0, Math.min(1, (event.clientX - stage.left - image.left) / image.width));
+  const y = Math.max(0, Math.min(1, (event.clientY - stage.top - image.top) / image.height));
   try {
-    updateUI(await api("/api/point", {x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height}));
+    updateUI(await api("/api/point", {x, y}));
     addLog("Click-to-aim command sent");
   } catch (error) { showToast(error.message); }
 });

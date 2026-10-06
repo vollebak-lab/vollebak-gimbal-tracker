@@ -260,7 +260,7 @@ if ($eventAvailable) {
 
 if (-not (Test-JsonEndpoint "$DashboardUrl/api/state" 5)) {
     Write-Step "Starting Pi dashboard"
-    $startCommand = "pgrep -f 'vollebak_gimbal ui' >/dev/null || (cd '$PiRepo' && nohup env PYTHONPATH=src .venv/bin/python -m vollebak_gimbal ui -c config/pi.yaml --host 0.0.0.0 --port 8080 > .dashboard.log 2>&1 < /dev/null &)"
+    $startCommand = "if ! ss -ltn | grep -q ':8080 '; then cd '$PiRepo' && setsid -f env PYTHONPATH=src .venv/bin/python -m vollebak_gimbal ui -c config/pi.yaml --host 0.0.0.0 --port 8080 > .dashboard.log 2>&1 < /dev/null; fi"
     $null = Invoke-Pi $startCommand
     Wait-For "Pi dashboard" { Test-JsonEndpoint "$DashboardUrl/api/state" 3 } 20
 }

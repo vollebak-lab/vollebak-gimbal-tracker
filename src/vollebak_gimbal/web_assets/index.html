@@ -33,14 +33,15 @@
           </div>
           <div class="feed-tools">
             <div class="feed-switch" role="group" aria-label="Camera feed">
-              <button id="rgbFeedButton" type="button">LOGITECH</button>
-              <button class="active" id="eventFeedButton" type="button" disabled>IMX636 EVENT</button>
+              <button class="active" id="rgbFeedButton" type="button">LOGITECH</button>
+              <button id="eventFeedButton" type="button" disabled>IMX636 EVENT</button>
             </div>
             <div class="metric"><span id="fpsValue">0.0</span><small>FPS</small></div>
           </div>
         </div>
         <div class="camera-stage" id="cameraStage">
-          <img id="cameraFeed" src="/event-stream.mjpg" alt="Live camera with target tracking overlay">
+          <img id="cameraFeed" src="/stream.mjpg" alt="Live camera with target tracking overlay">
+          <div class="target-reticle" id="targetReticle" aria-hidden="true"><i></i></div>
           <div class="corner corner-tl"></div><div class="corner corner-tr"></div>
           <div class="corner corner-bl"></div><div class="corner corner-br"></div>
           <div class="scanline"></div>

@@ -123,6 +123,31 @@ h2 { margin-top: 6px; font-size: 18px; font-weight: 500; }
   cursor: crosshair;
 }
 .camera-stage img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.target-reticle {
+  display: none;
+  position: absolute;
+  z-index: 4;
+  width: 38px;
+  height: 38px;
+  border: 2px solid var(--acid);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 12px rgba(73, 248, 174, 0.7);
+  pointer-events: none;
+}
+.target-reticle::before, .target-reticle::after {
+  content: "";
+  position: absolute;
+  background: var(--acid);
+}
+.target-reticle::before { left: 17px; top: -9px; width: 2px; height: 54px; }
+.target-reticle::after { left: -9px; top: 17px; width: 54px; height: 2px; }
+.target-reticle i {
+  position: absolute;
+  inset: 7px;
+  border: 1px solid rgba(73, 248, 174, 0.65);
+  border-radius: 50%;
+}
 .camera-stage::after {
   content: "";
   position: absolute;
