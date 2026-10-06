@@ -969,8 +969,13 @@ private:
 
                 double min_assoc_dist = std::min({dist_world, dist_cam, dist_bearing_equiv_px});
 
-                // Association gate: within 140 pixels (world, cam, or angular bearing < 3.25 deg) and +- 8 Hz frequency consistency
-                if (min_assoc_dist < 140.0 && std::abs(track.last_detection.fundamental_bpf_hz - d.fundamental_bpf_hz) < 8.0) {
+                // Association gate: within 140 pixels (or 220 px during motion / standoff coasting) and +- 8 Hz frequency consistency
+                double assoc_gate_px = 140.0;
+                if (track.state == TrackState::CONFIRMED || track.miss_count > 0) {
+                    assoc_gate_px = 220.0; // Expand to 5.1 degrees to maintain lock during fast camera tracking and hover drift
+                }
+
+                if (min_assoc_dist < assoc_gate_px && std::abs(track.last_detection.fundamental_bpf_hz - d.fundamental_bpf_hz) < 8.0) {
                     if (min_assoc_dist < min_dist) {
                         min_dist = min_assoc_dist;
                         best_det_idx = i;

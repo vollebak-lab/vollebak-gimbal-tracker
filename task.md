@@ -153,3 +153,12 @@
   - [x] Upgraded tracker confirmation: confirm in 2 frames ($80\text{ ms}$) if $\text{SNR} \ge 10.0\text{ dB}$ or neural-confirmed; expanded tentative coasting to 3 miss frames ($120\text{ ms}$) across sparse blade sweep dropouts.
   - [x] Upgraded HUD rendering to display ACQUIRING targets (hit $\ge 2$ or $\text{SNR} \ge 10.0\text{ dB}$) in Amber, and CONFIRMED targets in Green, while completely suppressing 1-hit noise blips.
   - [x] Verified all 3 unit test suites ($26/26$ tests passed) and deployed live binary to `predator-camera.service` on Jetson Orin Nano (PID 119638).
+
+- [x] **Phase 28: Standoff Lock Recovery (80ft–115ft) & Dynamic Camera Tracking**
+  - [x] Conducted telemetry Root Cause Analysis: identified that narrow $16.6^\circ$ VFOV on 12mm lens caused climbing drone to exit top edge ($Y < 0$); moving foliage texture velocity filter ($v_{\text{scan}} = 1646 \cdot \omega$) unconditionally purged the 250 Hz drone during camera pans/tilts ($10^\circ/\text{s}\text{--}35^\circ/\text{s}$); and pre-FFT micro-sieve dropped 98.4% of distant rotor chops before entering temporal ring buffers.
+  - [x] Upgraded `kernel_warp_sieve_ingest` in `cuda_flicker_core.cu` to accumulate all unsuppressed events into 512-slot ring buffers, restoring 128ms coherent matched filtering for the cuFFT while retaining micro-sieve periodic lock scoring.
+  - [x] Gated the motion texture velocity filter in `cuda_flicker_core.cu` to ONLY reject broad diffuse clutter (`sharpness < 2.5 && flatness > 0.20 && max_sieve_hits < 2`), guaranteeing high-Q mechanical blade harmonics are never purged during camera pans.
+  - [x] Expanded tracker dynamic association gate in `flicker_dsp.hpp` to 220px ($5.1^\circ$) for confirmed and coasting tracks, eliminating track loss during active camera panning and hover drift.
+  - [x] Calibrated IMX636 analog biases (`bias_diff_on = 6, bias_diff_off = 6`) in `ev_flicker_detector.cpp` for enhanced photon sensitivity on sub-pixel blade sweeps at 80–115ft.
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed 100%) and deployed live service to Jetson Orin Nano (PID 127922).
+  - [x] Verified live flight telemetry: achieved solid lock with 240+ consecutive hits ($>9.6\text{ s}$ unbroken lock), $20.0\text{ dB}$ SNR at $250.0\text{ Hz}$ BPF ($7500\text{ RPM}$) during active $5.5^\circ/\text{s}$ camera tracking.

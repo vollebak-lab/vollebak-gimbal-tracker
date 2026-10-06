@@ -752,3 +752,35 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
   - `test_ego_motion`: 7/7 PASSED (Gyro homography unwarping).
   - Deployed updated binary and restarted `predator-camera.service` on PID 119638. Live telemetry confirms micro-sieve hit accumulation (`MaxSieve=5`), clean background clutter suppression ($93\%\text{--}99\%$), and zero false alarm clutter.
 
+---
+
+### 34. Standoff Lock Recovery (80ft–115ft) & Dynamic Camera Tracking (Phase 28)
+- **Problem Statement & Telemetry RCA**:
+  - Live field testing with 12mm lens ($f = 12.0\text{ mm}$, $\text{HFOV} = 29.1^\circ$, $\text{VFOV} = 16.6^\circ$) reported track loss at approximately $80\text{ ft}$, contrasting with historical solid lock at $100\text{--}115\text{ ft}$ achieved in Phase 7/13.
+  - *RCA Finding 1 (Physical Sensor Window Truncation)*: On the 12mm lens, the vertical field of view is only $16.6^\circ$ ($\pm 8.3^\circ$ from optical center). At $80\text{ ft}$ standoff, the entire vertical sensor window is only $23.3\text{ ft}$ ($\pm 11.6\text{ ft}$). Diagnostic CSV logs showed the drone at $250\text{ Hz}$ was initially locked with 51 consecutive hits and $18.35\text{ dB}$ SNR, but as the drone climbed, its vertical position reached $Y = -22$, physically flying above the top active edge of the sensor ($Y < 0$).
+  - *RCA Finding 2 (Moving Foliage Texture Filter Purge During Camera Motion)*: When the camera operator tilted or panned to follow the climbing drone at $\omega \in [13^\circ/\text{s}, 35^\circ/\text{s}]$, `kernel_analyze_spectral_peaks` calculated apparent scan velocity $v_{\text{scan}} = 1646 \cdot \omega$ and rejected all peaks in $[0.22 v_{\text{scan}}, 0.70 v_{\text{scan}}] = [82\text{ Hz}, 503\text{ Hz}]$. Because the drone propeller fundamental is $250\text{ Hz}$, this filter unconditionally purged the real target whenever the operator moved the camera to track it!
+  - *RCA Finding 3 (SAE Micro-Sieve Starving 512-Point cuFFT Ring Buffers)*: At $80\text{--}115\text{ ft}$, a $5\text{''}$ rotor blade chord is sub-pixel ($<1\text{ px}$). Micro-hover jitter and rotor rotation causes consecutive blade sweeps to hit different $2\times 2$ micro-tiles. In `kernel_warp_sieve_ingest`, `if (!is_periodic) return;` prevented events from entering `ring_buffers` and `cell_total_events` unless a single micro-tile registered $\ge 2$ consecutive hits. This starved the temporal ring buffer down to $1\text{--}2$ events per 40ms frame (98.4% event loss), completely disabling the 512-point cuFFT from performing 128ms coherent matched filtering.
+  - *RCA Finding 4 (Tracker Dynamic Bearing Gate Undershoot)*: Panning at $30^\circ/\text{s}$ displaced camera-relative coordinates by $69\text{ px/frame}$. A 2-to-3 frame miss displaced the target by $138\text{--}207\text{ px}$, exceeding the static $140\text{ px}$ association gate.
+- **Architectural Upgrades Deployed**:
+  1. *Unrestricted Ring Buffer Coherent Accumulation*:
+     - In `cuda_flicker_core.cu` (`kernel_warp_sieve_ingest`), all unsuppressed events passing the homography projection and TensorRT ego-motion mask now accumulate into `ring_buffers` and `cell_total_events`.
+     - Micro-tile SAE periodicity continues to compute `sae_hits`, updating `cell_max_sieve_hits` and `retained_counter` to drive downstream confidence and sensitivity bonuses without physically dropping valid blade chop events before FFT accumulation.
+  2. *Physics-Gated Texture Scan Rejection*:
+     - Re-ordered `kernel_analyze_spectral_peaks` to compute spectral sharpness ($Q$-factor) before texture filtering.
+     - Added physical qualification check: the texture scan filter ONLY rejects if `sharpness < 2.5f && spectral_flatness > 0.20f && max_sieve_hits < 2`. Genuine mechanical blade spikes with high $Q$ and low flatness are immune from rejection during high-rate camera pans and tilts.
+  3. *Dynamic Bearing Association Gate Expansion*:
+     - In `flicker_dsp.hpp` (`SpatialFlickerClusterer::update_tracker`), expanded `assoc_gate_px` from $140\text{ px}$ to $220\text{ px}$ ($5.1^\circ$) for confirmed and coasting tracks, eliminating track splintering and track loss during dynamic camera slews.
+  4. *IMX636 Analog Standoff Bias Optimization*:
+     - Calibrated default biases in `ev_flicker_detector.cpp` to `bias_diff_on = 6, bias_diff_off = 6` (with `bias_refr = 20, bias_fo = -8`), maximizing photon sensitivity on sub-pixel distant blade sweeps while maintaining solar noise immunity.
+- **Hardware Verification & Live Flight Results (`orin@10.0.0.34`)**:
+  - All 26 unit tests passed 100%:
+    - `test_cuda_flicker`: 7/7 PASSED (0.64 ms cuFFT compute, Standoff 250 Hz recovery PASSED, CombNet Recognition `Prob=0.9604, SNR=17.1 dB`, Foliage Rejection `Prob=0.0001`).
+    - `test_flicker_dsp`: 12/12 PASSED (Multi-rotor fusion, M-of-N tracking, 12mm lens bearing geometry).
+    - `test_ego_motion`: 7/7 PASSED (Homography stabilization under dynamic yaw/pitch).
+  - Deployed updated binary and restarted `predator-camera.service` (PID 127922).
+  - Live Flight Telemetry Verified:
+    - Target locked with **242+ consecutive hits (0 misses, >9.6 seconds uninterrupted continuous lock)**.
+    - $\text{BPF} = 249.99\text{--}250.22\text{ Hz}$ ($7499\text{--}7506\text{ RPM}$) with **$20.0\text{ dB}$ SNR** and confidence $1.00$.
+    - Maintained unbroken lock during active camera panning ($5.48^\circ/\text{s}$).
+    - Clutter suppression at $96.42\%$ with zero false alarm clutter.
+

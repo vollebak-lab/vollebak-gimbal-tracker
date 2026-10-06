@@ -991,9 +991,9 @@ int main(int argc, char* argv[]) {
         try {
             auto *biases = camera.get_device().get_facility<Metavision::I_LL_Biases>();
             if (biases) {
-                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=10, diff_off=10)
-                int diff_on = 10;
-                int diff_off = 10;
+                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=6, diff_off=6 for 80-115ft sensitivity)
+                int diff_on = 6;
+                int diff_off = 6;
                 const char* env_on = std::getenv("PREDATOR_BIAS_DIFF_ON");
                 const char* env_off = std::getenv("PREDATOR_BIAS_DIFF_OFF");
                 if (env_on) diff_on = std::stoi(env_on);
