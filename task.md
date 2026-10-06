@@ -138,6 +138,10 @@
   - [x] Integrate TensorRT FP16 spectral inference directly into real-time C++20 25 Hz analysis pipeline on Orin Nano via `SpectralCombNetEngine`.
   - [x] Verify all 3 unit test suites (`test_cuda_flicker`, `test_flicker_dsp`, `test_ego_motion` 100% passing) and deploy live service to `predator-camera.service`.
 
-
-
+- [x] **Phase 26: Foliage Background False Alarm Elimination & Physical/Neural Co-Gating**
+  - [x] Implement physical signal co-gating in `ev_flicker_detector.cpp`: require cells evaluated by `SpectralCombNet` to have micro-sieve periodic lock (`max_sieve_hits >= 2`) or physical candidate peaks.
+  - [x] Eliminate fabricated metrics (`snr_db = 10 + 8*purity`, `flatness = 0.02`): compute real physical SNR, sharpness Q-factor, and spectral flatness from the cell's cuFFT spectrum.
+  - [x] Restrict HUD bounding box rendering to CONFIRMED tracks ($M \ge 3$ hits), eliminating unconfirmed tentative track swarms on the live display.
+  - [x] Retrain `SpectralCombNet` on DGX Spark (`100.114.14.56`) with sparse Poisson event impulse noise ($N \in [4, 50]$ events) and negative purity loss, export ONNX, and compile TRT FP16 engine on Orin Nano.
+  - [x] Verify unit tests on Orin Nano, deploy updated binary, and verify clean live tracking of drone against foliage background.
 

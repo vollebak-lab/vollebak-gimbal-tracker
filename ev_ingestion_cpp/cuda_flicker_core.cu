@@ -764,10 +764,14 @@ void CudaFlickerCore::get_active_cells_with_spectra(
     out_spectra.clear();
 
     CUDA_CHECK(cudaMemcpy(h_cell_totals_, d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_cell_sieve_hits_, d_cell_max_sieve_hits_, num_total_cells_ * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    // Identify active base and pooled cells
+    // Identify active base and pooled cells that exhibit periodic micro-sieve confirmation (>= 2 hits)
+    // or high activity density (>= 25.0 events) to reject aperiodic sparse foliage clutter
     for (int i = 0; i < num_total_cells_; ++i) {
-        if (h_cell_totals_[i] >= min_events) {
+        float ev = h_cell_totals_[i];
+        uint32_t hits = h_cell_sieve_hits_[i];
+        if ((hits >= 2 && ev >= min_events) || (ev >= 25.0f)) {
             out_cell_indices.push_back(i);
             if (out_cell_indices.size() >= 128) break; // Capped at max batch size
         }
@@ -794,7 +798,7 @@ void CudaFlickerCore::get_active_cells_with_spectra(
         auto& spec = out_spectra[b];
         std::vector<float> noise_slice(spec.begin() + 5, spec.begin() + 128);
         std::sort(noise_slice.begin(), noise_slice.end());
-        float median_noise = std::max(1e-6f, noise_slice[noise_slice.size() / 2]);
+        float median_noise = std::max(0.20f, noise_slice[noise_slice.size() / 2]);
         for (int k = 0; k < 257; ++k) {
             spec[k] = std::log10(1.0f + spec[k] / median_noise);
         }

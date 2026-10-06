@@ -696,5 +696,30 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - Real-time live log verification: `CombNet: eval=7 det=4 (p_max=1.00)` actively locking shaded tracks (`[TENT+NET] BPF=211.5 Hz, 6345 RPM`).
     - Web telemetry endpoint `/pipeline_stats` reporting `spectral_combnet_active: true`.
 
+---
 
-
+### 32. Foliage Background False Alarm Elimination & Physical/Neural Co-Gating (Phase 26)
+- **Problem Statement & Root Cause Analysis**:
+  - Drone hovering at altitude 9.8m, ~25ft away against foliage backdrop produced "tents" in the 10s if not approaching hundreds across the display ("sensitivity and classification seem somewhat disconnected").
+  - *RCA Finding 1 (HUD Tentative Swarm)*: `display_encoder_thread_func` drew bounding boxes for all tracks including single-frame unconfirmed `TrackState::TENTATIVE` hypotheses (`[TENT #... 1/3]`).
+  - *RCA Finding 2 (Poisson Clutter Gap in CombNet)*: `SpectralCombNet` was trained on dense exponential noise and harmonic combs vs smooth 1/f decay curves. Sparse Poisson impulses (6 to 25 events per 128ms) generate jagged FFT interference ripples that the model classified as `DroneProb = 0.6016`.
+  - *RCA Finding 3 (Neural Bypass Metric Fabrication)*: In `ev_flicker_detector.cpp`, when `prob >= 0.45`, code bypassed the physical cuFFT detector and fabricated `snr_db = 16.8 dB` and `flatness = 0.02`.
+- **Model Retraining & Re-export (DGX Spark `vollebak@100.114.14.56`)**:
+  - Updated `train_spectral_combnet.py` with `sparse_poisson` (3 to 45 delta spikes) and `foliage_turbulence` negative clutter, plus BCE purity loss on all samples (`target_purity = 0.0` for clutter).
+  - Retrained on DGX Spark using NVIDIA GB10 GPU across 80,000 spectra (Validation Accuracy: **91.14%**).
+  - Verification: `Sparse 6 Events FFT: DroneProb = 0.0177` (down from 0.6016), `Wind Foliage 1/f: DroneProb = 0.0000`, `Realistic Drone 200Hz Comb: DroneProb = 1.0000`.
+  - Exported ONNX (`models/spectral_combnet.onnx`, 225 KB) and compiled TensorRT FP16 engine on Jetson Orin Nano (`models/spectral_combnet_fp16.engine`, 621 KB, 0.99 ms median latency).
+- **C++ Pipeline Updates**:
+  - `cuda_flicker_core.cu`: `get_active_cells_with_spectra` now checks `max_sieve_hits >= 2` (periodic micro-sieve lock) or `total_events >= 25.0f` to exclude aperiodic foliage clutter before neural inference; clamped minimum noise floor to `std::max(0.20f, ...)`.
+  - `spectral_combnet_trt.hpp`: Added physical metric verification (`is_local_max`, `has_valid_peak`, true physical SNR, sharpness Q-factor, DDHF flatness) directly into `SpectralPrediction`.
+  - `ev_flicker_detector.cpp`:
+    1. HUD drawing loop in `display_encoder_thread_func` skips all tentative tracks, drawing green bounding boxes ONLY for `TrackState::CONFIRMED` targets.
+    2. Step 3b evaluation threshold raised to `0.70f`; weak-signal rescue branch requires `np.has_valid_peak && np.physical_snr_db >= 6.0f && np.drone_prob >= 0.70f`, assigning true physical SNR and flatness rather than fabricated constants.
+  - `test_cuda_flicker.cpp`: Updated Test 6 with realistic multi-harmonic drone spectrum and foliage clutter test vectors.
+- **Hardware Verification & Live Deployment (Jetson Orin Nano `orin@10.0.0.34`)**:
+  - All 3 test suites compiled and passed 100%:
+    - `test_cuda_flicker` (7/7 passed, including Drone Recognition `Prob = 0.9604` and Foliage Rejection `Prob = 0.0001`).
+    - `test_flicker_dsp` (12/12 passed).
+    - `test_ego_motion` (7/7 passed).
+  - Live deployment restarted on `predator-camera.service` (PID 99703).
+  - Live telemetry confirmed: 0 false alarm candidates, 0 tentative boxes drawn on HUD, 0 false alarms on foliage background (`CombNet: eval=0 det=0 (p_max=0.00)`, 98.8% background suppression), with clean target confirmation for real drone signatures.

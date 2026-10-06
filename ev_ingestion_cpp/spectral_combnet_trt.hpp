@@ -19,6 +19,10 @@ struct SpectralPrediction {
     float drone_prob{0.0f};
     float fund_freq_hz{0.0f};
     float harmonic_purity{0.0f};
+    float physical_snr_db{0.0f};
+    float spectral_q_factor{0.0f};
+    float spectral_flatness{1.0f};
+    bool has_valid_peak{false};
 };
 
 class SpectralCombNetLogger : public nvinfer1::ILogger {
@@ -175,19 +179,60 @@ public:
                     }
                 }
 
+                // Check local peak validity: must be a strict local maximum
+                bool is_local_max = false;
+                if (best_bin >= 9 && best_bin <= 102) {
+                    is_local_max = (spec[best_bin] > spec[best_bin - 1] && spec[best_bin] > spec[best_bin + 1]);
+                }
+
                 // Subharmonic Fundamental Disambiguation (check if best_bin is 2x or 3x harmonic)
                 for (int sub = 3; sub >= 2; --sub) {
                     int cand_sub = static_cast<int>(std::round(static_cast<float>(best_bin) / sub));
                     if (cand_sub >= 9 && cand_sub <= 102) {
-                        if (spec[cand_sub] >= 0.40f * max_val) {
+                        if (spec[cand_sub] >= 0.40f * max_val &&
+                            spec[cand_sub] > spec[cand_sub - 1] &&
+                            spec[cand_sub] > spec[cand_sub + 1]) {
                             best_bin = cand_sub;
+                            max_val = spec[cand_sub];
+                            is_local_max = true;
                             break;
                         }
                     }
                 }
 
+                // Physical SNR: spec[k] is log10(1 + P / median_noise)
+                // Linear SNR = 10^(spec[k]) - 1
+                float snr_linear = std::max(1.0f, std::pow(10.0f, max_val) - 1.0f);
+                float snr_db = 10.0f * std::log10(snr_linear);
+
+                // Spectral Sharpness Q-factor
+                float neighbor_p = 0.0f;
+                if (best_bin >= 2 && best_bin + 2 < 257) {
+                    neighbor_p = 0.5f * (spec[best_bin - 2] + spec[best_bin + 2]);
+                }
+                float sharpness = (neighbor_p > 1e-4f) ? (max_val / neighbor_p) : (max_val > 0.3f ? 3.0f : 1.0f);
+
+                // DDHF Spectral Flatness across search band [9..102]
+                float sum_log = 0.0f;
+                float sum_val = 0.0f;
+                int n_bins = 0;
+                for (int k = 9; k <= 102; ++k) {
+                    float lin = std::max(1e-4f, std::pow(10.0f, spec[k]) - 1.0f);
+                    sum_log += std::log(lin);
+                    sum_val += lin;
+                    n_bins++;
+                }
+                float geom_mean = (n_bins > 0) ? std::exp(sum_log / static_cast<float>(n_bins)) : 1.0f;
+                float arith_mean = (n_bins > 0) ? (sum_val / static_cast<float>(n_bins)) : 1.0f;
+                float flatness = (arith_mean > 1e-6f) ? (geom_mean / arith_mean) : 1.0f;
+
+                pred.has_valid_peak = is_local_max && (snr_db >= 5.0f) && (sharpness >= 1.25f);
+                pred.physical_snr_db = snr_db;
+                pred.spectral_q_factor = sharpness;
+                pred.spectral_flatness = flatness;
+
                 float f_hz = best_bin * (4000.0f / 512.0f);
-                if (best_bin > 0 && best_bin < 256) {
+                if (best_bin > 0 && best_bin < 256 && is_local_max) {
                     float y1 = spec[best_bin - 1];
                     float y2 = spec[best_bin];
                     float y3 = spec[best_bin + 1];
