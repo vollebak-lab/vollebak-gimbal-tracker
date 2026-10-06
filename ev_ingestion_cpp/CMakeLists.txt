@@ -1,12 +1,16 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
-project(EVPropNet_Ingestion CXX)
+project(EVPropNet_Ingestion CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_ARCHITECTURES 87) # Jetson Orin Nano (Ampere sm_87)
 
 # 1. Find Metavision SDK (OpenEB) & OpenCV
 find_package(MetavisionSDK COMPONENTS stream core REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(OpenMP REQUIRED)
 message(STATUS "Found Metavision SDK: ${MetavisionSDK_FOUND}")
 message(STATUS "Found OpenCV: ${OpenCV_VERSION}")
 
@@ -49,13 +53,26 @@ target_link_libraries(test_ego_motion PRIVATE pthread)
 add_executable(test_nicla_live test_nicla_live.cpp)
 target_link_libraries(test_nicla_live PRIVATE pthread)
 
+# 6c. Build CUDA & cuFFT Acceleration Test Suite
+add_executable(test_cuda_flicker test_cuda_flicker.cpp cuda_flicker_core.cu)
+target_link_libraries(test_cuda_flicker PRIVATE 
+    MetavisionSDK::stream
+    MetavisionSDK::core
+    nvinfer
+    cufft
+    cudart
+    pthread
+)
+
 # 7. Build Real-Time Propeller Flicker Detector Engine (with Ego-Motion Suppression & TensorRT FP16)
-add_executable(ev_flicker_detector ev_flicker_detector.cpp)
+add_executable(ev_flicker_detector ev_flicker_detector.cpp cuda_flicker_core.cu)
 target_link_libraries(ev_flicker_detector PRIVATE 
     MetavisionSDK::stream 
     MetavisionSDK::core
     ${OpenCV_LIBS}
+    OpenMP::OpenMP_CXX
     nvinfer
+    cufft
     cudart
     pthread
 )

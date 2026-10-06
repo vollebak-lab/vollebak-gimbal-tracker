@@ -16,99 +16,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
+#ifdef __linux__
+#include <linux/serial.h>
+#include <sys/ioctl.h>
+#endif
 
 #include "flicker_dsp.hpp"
 
 namespace predator {
-
-/**
- * @brief 3D Vector for angular velocity and acceleration
- */
-struct Vector3d {
-    double x{0.0};
-    double y{0.0};
-    double z{0.0};
-
-    Vector3d() = default;
-    Vector3d(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
-
-    Vector3d operator+(const Vector3d& o) const { return {x + o.x, y + o.y, z + o.z}; }
-    Vector3d operator-(const Vector3d& o) const { return {x - o.x, y - o.y, z - o.z}; }
-    Vector3d operator*(double s) const { return {x * s, y * s, z * s}; }
-    double norm() const { return std::sqrt(x * x + y * y + z * z); }
-};
-
-/**
- * @brief 3x3 Matrix for 3D Rotations and Homographies
- */
-struct Matrix3x3 {
-    std::array<double, 9> m{};
-
-    Matrix3x3() {
-        m.fill(0.0);
-    }
-
-    static Matrix3x3 identity() {
-        Matrix3x3 mat;
-        mat.m[0] = 1.0; mat.m[4] = 1.0; mat.m[8] = 1.0;
-        return mat;
-    }
-
-    double at(int r, int c) const { return m[r * 3 + c]; }
-    double& at(int r, int c) { return m[r * 3 + c]; }
-
-    Matrix3x3 operator*(const Matrix3x3& o) const {
-        Matrix3x3 res;
-        for (int r = 0; r < 3; ++r) {
-            for (int c = 0; c < 3; ++c) {
-                double sum = 0.0;
-                for (int k = 0; k < 3; ++k) {
-                    sum += at(r, k) * o.at(k, c);
-                }
-                res.at(r, c) = sum;
-            }
-        }
-        return res;
-    }
-
-    Vector3d operator*(const Vector3d& v) const {
-        return {
-            at(0, 0) * v.x + at(0, 1) * v.y + at(0, 2) * v.z,
-            at(1, 0) * v.x + at(1, 1) * v.y + at(1, 2) * v.z,
-            at(2, 0) * v.x + at(2, 1) * v.y + at(2, 2) * v.z
-        };
-    }
-
-    /**
-     * @brief Computes analytical matrix inverse for 3x3 matrix
-     */
-    Matrix3x3 inverse() const {
-        double det = at(0, 0) * (at(1, 1) * at(2, 2) - at(1, 2) * at(2, 1)) -
-                     at(0, 1) * (at(1, 0) * at(2, 2) - at(1, 2) * at(2, 0)) +
-                     at(0, 2) * (at(1, 0) * at(2, 1) - at(1, 1) * at(2, 0));
-
-        if (std::abs(det) < 1e-12) {
-            return identity();
-        }
-
-        double invdet = 1.0 / det;
-        Matrix3x3 inv;
-
-        inv.at(0, 0) = (at(1, 1) * at(2, 2) - at(1, 2) * at(2, 1)) * invdet;
-        inv.at(0, 1) = (at(0, 2) * at(2, 1) - at(0, 1) * at(2, 2)) * invdet;
-        inv.at(0, 2) = (at(0, 1) * at(1, 2) - at(0, 2) * at(1, 1)) * invdet;
-
-        inv.at(1, 0) = (at(1, 2) * at(2, 0) - at(1, 0) * at(2, 2)) * invdet;
-        inv.at(1, 1) = (at(0, 0) * at(2, 2) - at(0, 2) * at(2, 0)) * invdet;
-        inv.at(1, 2) = (at(1, 0) * at(0, 2) - at(0, 0) * at(1, 2)) * invdet;
-
-        inv.at(2, 0) = (at(1, 0) * at(2, 1) - at(2, 0) * at(1, 1)) * invdet;
-        inv.at(2, 1) = (at(2, 0) * at(0, 1) - at(0, 0) * at(2, 1)) * invdet;
-        inv.at(2, 2) = (at(0, 0) * at(1, 1) - at(1, 0) * at(0, 1)) * invdet;
-
-        return inv;
-    }
-};
 
 /**
  * @brief High-rate 6-DoF IMU sample
@@ -153,9 +68,60 @@ public:
     const LensParameters& lens() const { return lens_; }
 
     /**
+     * @brief Anchor camera microsecond clock with host clock
+     */
+    void set_camera_time_anchor(uint64_t cam_t0_us, uint64_t host_t0_us) {
+        int64_t offset = static_cast<int64_t>(cam_t0_us) - static_cast<int64_t>(host_t0_us);
+        clock_offset_us_.store(offset, std::memory_order_release);
+        time_anchored_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Continuously tracks clock drift between camera microsecond clock and host clock
+     */
+    void update_camera_time_anchor(uint64_t cam_t_us, uint64_t host_t_us) {
+        int64_t measured_offset = static_cast<int64_t>(cam_t_us) - static_cast<int64_t>(host_t_us);
+        if (!time_anchored_.load(std::memory_order_acquire)) {
+            clock_offset_us_.store(measured_offset, std::memory_order_release);
+            time_anchored_.store(true, std::memory_order_release);
+            return;
+        }
+        int64_t current_offset = clock_offset_us_.load(std::memory_order_relaxed);
+        // Exponential Moving Average filter for clock offset (alpha = 0.05) with ZERO lag on time advancement
+        int64_t filtered_offset = static_cast<int64_t>(current_offset * 0.95 + measured_offset * 0.05);
+        clock_offset_us_.store(filtered_offset, std::memory_order_release);
+    }
+
+    bool is_time_anchored() const {
+        return time_anchored_.load(std::memory_order_acquire);
+    }
+
+    uint64_t host_to_camera_time(uint64_t host_t_us) const {
+        if (!time_anchored_.load(std::memory_order_acquire)) {
+            return host_t_us;
+        }
+        int64_t offset = clock_offset_us_.load(std::memory_order_relaxed);
+        int64_t cam_t = static_cast<int64_t>(host_t_us) + offset;
+        return (cam_t > 0) ? static_cast<uint64_t>(cam_t) : 0;
+    }
+
+    /**
      * @brief Ingests an IMU sample into the circular buffer
      */
     void ingest_imu(const ImuSample& sample) {
+        // Physical sanity gate: reject corrupted/glitched samples
+        if (!std::isfinite(sample.gyro_rad_s.x) || !std::isfinite(sample.gyro_rad_s.y) || !std::isfinite(sample.gyro_rad_s.z) ||
+            std::abs(sample.gyro_rad_s.x) > 35.0 || std::abs(sample.gyro_rad_s.y) > 35.0 || std::abs(sample.gyro_rad_s.z) > 35.0) {
+            return;
+        }
+
+        latest_wx_.store(sample.gyro_rad_s.x, std::memory_order_relaxed);
+        latest_wy_.store(sample.gyro_rad_s.y, std::memory_order_relaxed);
+        latest_wz_.store(sample.gyro_rad_s.z, std::memory_order_relaxed);
+        latest_ax_.store(sample.accel_m_s2.x, std::memory_order_relaxed);
+        latest_ay_.store(sample.accel_m_s2.y, std::memory_order_relaxed);
+        latest_az_.store(sample.accel_m_s2.z, std::memory_order_relaxed);
+
         std::lock_guard<std::mutex> lock(imu_mutex_);
         if (!imu_buffer_.empty() && sample.timestamp_us <= imu_buffer_.back().timestamp_us) {
             return; // Ignore non-monotonic samples
@@ -178,12 +144,37 @@ public:
     }
 
     /**
+     * @brief Instantly returns latest raw angular velocity without searching buffer
+     */
+    Vector3d get_latest_angular_velocity() const {
+        return Vector3d(latest_wx_.load(std::memory_order_relaxed),
+                        latest_wy_.load(std::memory_order_relaxed),
+                        latest_wz_.load(std::memory_order_relaxed));
+    }
+
+    /**
+     * @brief Ultra-fast direct homography unwarping for batch event processing (zero mutex / matrix ops)
+     */
+    static inline bool apply_homography_fast(const Matrix3x3& H, int x, int y, int max_w, int max_h, double& wx, double& wy) {
+        double pz = H.at(2, 0) * x + H.at(2, 1) * y + H.at(2, 2);
+        if (std::abs(pz) < 1e-6) {
+            wx = static_cast<double>(x);
+            wy = static_cast<double>(y);
+            return false;
+        }
+        double inv_z = 1.0 / pz;
+        wx = (H.at(0, 0) * x + H.at(0, 1) * y + H.at(0, 2)) * inv_z;
+        wy = (H.at(1, 0) * x + H.at(1, 1) * y + H.at(1, 2)) * inv_z;
+        return (wx >= 0.0 && wx < max_w && wy >= 0.0 && wy < max_h);
+    }
+
+    /**
      * @brief Interpolates angular velocity at timestamp t_us
      */
     bool get_angular_velocity(uint64_t t_us, Vector3d& out_omega) const {
         std::lock_guard<std::mutex> lock(imu_mutex_);
         if (imu_buffer_.empty()) {
-            out_omega = Vector3d(0, 0, 0);
+            out_omega = get_latest_angular_velocity();
             return false;
         }
 
@@ -317,11 +308,21 @@ public:
     }
 
     /**
-     * @brief Computes 3x3 spherical homography H = K * R * K_inv
+     * @brief Computes 3x3 spherical unwarping homography mapping current camera coordinates at t_target to stabilized world anchor at t_ref:
+     *   H_cam_to_world = K * R(t_ref, t_target) * K^-1
      */
     Matrix3x3 compute_homography(uint64_t t_ref_us, uint64_t t_target_us) const {
         Matrix3x3 R = compute_rotation_matrix(t_ref_us, t_target_us);
         return K_ * R * K_inv_;
+    }
+
+    /**
+     * @brief Computes forward projection homography mapping stabilized world anchor at t_ref to current camera view at t_cam:
+     *   H_world_to_cam = K * R(t_ref, t_cam)^-1 * K^-1
+     */
+    Matrix3x3 compute_forward_homography(uint64_t t_ref_us, uint64_t t_cam_us) const {
+        Matrix3x3 R = compute_rotation_matrix(t_ref_us, t_cam_us);
+        return K_ * R.inverse() * K_inv_;
     }
 
     /**
@@ -420,6 +421,16 @@ private:
     Matrix3x3 K_;
     Matrix3x3 K_inv_;
 
+    std::atomic<bool> time_anchored_{false};
+    std::atomic<int64_t> clock_offset_us_{0};
+
+    std::atomic<double> latest_wx_{0.0};
+    std::atomic<double> latest_wy_{0.0};
+    std::atomic<double> latest_wz_{0.0};
+    std::atomic<double> latest_ax_{0.0};
+    std::atomic<double> latest_ay_{0.0};
+    std::atomic<double> latest_az_{0.0};
+
     mutable std::mutex imu_mutex_;
     std::deque<ImuSample> imu_buffer_;
 };
@@ -496,58 +507,146 @@ private:
                 continue;
             }
 
+#ifdef __linux__
+            struct serial_struct ser_info;
+            if (ioctl(fd, TIOCGSERIAL, &ser_info) == 0) {
+                ser_info.flags |= ASYNC_LOW_LATENCY;
+                ioctl(fd, TIOCSSERIAL, &ser_info);
+            }
+#endif
+
             connected_.store(true);
-            std::cout << "[INFO] Nicla Sense ME IMU connected on " << port_ << "\n";
+            std::cout << "[INFO] Nicla Sense ME IMU connected on " << port_ << " (Low Latency Mode Active)\n";
 
             uint64_t sync_offset_us = 0;
             bool first_sync = true;
 
+            std::vector<uint8_t> rx_buf;
+            rx_buf.reserve(1024);
+            uint8_t chunk[256];
+
+            auto compute_chk = [](const uint8_t* data, size_t length) -> uint16_t {
+                uint16_t chk = 0;
+                for (size_t i = 0; i < length; i += 2) {
+                    if (i + 1 < length) {
+                        chk ^= static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i + 1]) << 8);
+                    } else {
+                        chk ^= static_cast<uint16_t>(data[i]);
+                    }
+                }
+                return chk;
+            };
+
             while (running_.load()) {
-                uint8_t b1 = 0;
-                if (read(fd, &b1, 1) <= 0) {
+                ssize_t n = read(fd, chunk, sizeof(chunk));
+                if (n <= 0) {
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(500));
+                        continue;
+                    }
                     break; // Error or disconnect
                 }
 
-                if (b1 == 0xAA) {
-                    uint8_t b2 = 0;
-                    if (read(fd, &b2, 1) <= 0) break;
-                    if (b2 == 0x55) {
-                        uint8_t payload[30];
-                        size_t bytes_read = 0;
-                        while (bytes_read < 30 && running_.load()) {
-                            ssize_t n = read(fd, payload + bytes_read, 30 - bytes_read);
-                            if (n <= 0) break;
-                            bytes_read += n;
-                        }
+                rx_buf.insert(rx_buf.end(), chunk, chunk + n);
 
-                        if (bytes_read == 30) {
-                            uint32_t t_nicla_us = 0;
-                            float wx = 0, wy = 0, wz = 0;
-                            float ax = 0, ay = 0, az = 0;
-                            uint16_t chk = 0;
-
-                            std::memcpy(&t_nicla_us, payload + 0, 4);
-                            std::memcpy(&wx, payload + 4, 4);
-                            std::memcpy(&wy, payload + 8, 4);
-                            std::memcpy(&wz, payload + 12, 4);
-                            std::memcpy(&ax, payload + 16, 4);
-                            std::memcpy(&ay, payload + 20, 4);
-                            std::memcpy(&az, payload + 24, 4);
-                            std::memcpy(&chk, payload + 28, 2);
-
-                            uint64_t host_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch()).count();
-
-                            if (first_sync) {
-                                sync_offset_us = host_now_us - t_nicla_us;
-                                first_sync = false;
-                            }
-
-                            uint64_t syncd_timestamp_us = t_nicla_us + sync_offset_us;
-                            warper_.ingest_imu_raw(syncd_timestamp_us, wx, wy, wz, ax, ay, az);
-                            packets_received_++;
+                while (rx_buf.size() >= 32) {
+                    // Search for 0xAA 0x55 preamble
+                    size_t sync_pos = 0;
+                    bool found = false;
+                    for (size_t i = 0; i + 1 < rx_buf.size(); ++i) {
+                        if (rx_buf[i] == 0xAA && rx_buf[i + 1] == 0x55) {
+                            sync_pos = i;
+                            found = true;
+                            break;
                         }
                     }
+
+                    if (!found) {
+                        uint8_t last = rx_buf.back();
+                        rx_buf.clear();
+                        if (last == 0xAA) rx_buf.push_back(last);
+                        break;
+                    }
+
+                    if (sync_pos > 0) {
+                        rx_buf.erase(rx_buf.begin(), rx_buf.begin() + sync_pos);
+                    }
+
+                    if (rx_buf.size() < 32) {
+                        break; // Need more bytes
+                    }
+
+                    // Verify XOR Checksum over 28 bytes of payload (indices 2..29)
+                    uint16_t expected_chk = compute_chk(rx_buf.data() + 2, 28);
+                    uint16_t packet_chk = 0;
+                    std::memcpy(&packet_chk, rx_buf.data() + 30, 2);
+
+                    if (expected_chk != packet_chk) {
+                        // Corrupted packet or false preamble: slide by 1 byte
+                        rx_buf.erase(rx_buf.begin(), rx_buf.begin() + 1);
+                        continue;
+                    }
+
+                    // Valid verified packet! Unpack
+                    uint32_t t_nicla_us = 0;
+                    float wx = 0, wy = 0, wz = 0;
+                    float ax = 0, ay = 0, az = 0;
+
+                    std::memcpy(&t_nicla_us, rx_buf.data() + 2, 4);
+                    std::memcpy(&wx, rx_buf.data() + 6, 4);
+                    std::memcpy(&wy, rx_buf.data() + 10, 4);
+                    std::memcpy(&wz, rx_buf.data() + 14, 4);
+                    std::memcpy(&ax, rx_buf.data() + 18, 4);
+                    std::memcpy(&ay, rx_buf.data() + 22, 4);
+                    std::memcpy(&az, rx_buf.data() + 26, 4);
+
+                    rx_buf.erase(rx_buf.begin(), rx_buf.begin() + 32);
+
+                    if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz) ||
+                        !std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az)) {
+                        continue;
+                    }
+
+                    // Physical sanity check (BHI260AP range is +/- 2000 dps = +/- 34.9 rad/s)
+                    if (std::abs(wx) > 35.0f || std::abs(wy) > 35.0f || std::abs(wz) > 35.0f ||
+                        std::abs(ax) > 100.0f || std::abs(ay) > 100.0f || std::abs(az) > 100.0f) {
+                        continue;
+                    }
+
+                    // Calibrated BHI260AP scale correction factor (32768 / 2000 = 16.384x)
+                    // and physical rear-mount camera optical axis alignment:
+                    //   Camera Yaw (Horizontal pan)  = +Packet WX * 16.384
+                    //   Camera Pitch (Vertical tilt) = +Packet WY * 16.384
+                    //   Camera Roll (Twist)          = +Packet WZ * 16.384
+                    const float BHI260_SCALE = 32768.0f / 2000.0f; // 16.384f
+                    float cam_wx = wy * BHI260_SCALE;
+                    float cam_wy = wx * BHI260_SCALE;
+                    float cam_wz = wz * BHI260_SCALE;
+
+                    float cam_ax = ay;
+                    float cam_ay = ax;
+                    float cam_az = az;
+
+                    uint64_t host_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+                    if (first_sync) {
+                        sync_offset_us = host_now_us - static_cast<uint64_t>(t_nicla_us);
+                        first_sync = false;
+                    } else {
+                        // Gentle drift tracking (0.1% EMA)
+                        int64_t current_drift = static_cast<int64_t>(host_now_us) - static_cast<int64_t>(static_cast<uint64_t>(t_nicla_us) + sync_offset_us);
+                        if (std::abs(current_drift) > 50000) { // If jump > 50ms (e.g. board reset), re-anchor
+                            sync_offset_us = host_now_us - static_cast<uint64_t>(t_nicla_us);
+                        } else {
+                            sync_offset_us = static_cast<uint64_t>(static_cast<int64_t>(sync_offset_us) + static_cast<int64_t>(current_drift * 0.001));
+                        }
+                    }
+
+                    uint64_t sample_host_us = static_cast<uint64_t>(t_nicla_us) + sync_offset_us;
+                    uint64_t cam_time_us = warper_.host_to_camera_time(sample_host_us);
+                    warper_.ingest_imu_raw(cam_time_us, cam_wx, cam_wy, cam_wz, cam_ax, cam_ay, cam_az);
+                    packets_received_++;
                 }
             }
 

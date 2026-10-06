@@ -249,12 +249,12 @@ void test_global_common_mode_and_tracking() {
     std::cout << "PASSED! (Spatial dispersion rejected ambient light, 3-hit confirmation validated, and coasted across dropout)\n";
 }
 
-// Unit test 9: Lens Bearing Geometry
+// Unit test 9: Lens Bearing Geometry (12mm f/2.0 M12 Lens)
 void test_lens_bearing_geometry() {
-    std::cout << "[TEST 9] Testing Edmund Optics 8mm f/8 M12 Lens Bearing Geometry... ";
+    std::cout << "[TEST 9] Testing 12mm f/2.0 M12 Lens Bearing Geometry... ";
     
     predator::LensParameters lens;
-    lens.focal_length_mm = 8.0;
+    lens.focal_length_mm = 12.0;
     lens.pixel_pitch_um = 4.86;
     lens.sensor_width = 1280;
     lens.sensor_height = 720;
@@ -265,10 +265,10 @@ void test_lens_bearing_geometry() {
     assert(std::abs(az) < 1e-4);
     assert(std::abs(el) < 1e-4);
 
-    // Top-Right corner (1280, 0)
+    // Top-Right corner (1280, 0) -> HFOV/2 = ~14.53 deg, VFOV/2 = ~8.29 deg
     lens.pixel_to_angles(1280.0, 0.0, az, el);
-    assert(az > 20.0 && az < 23.0); // Expect ~21.2 deg
-    assert(el > 11.0 && el < 14.0); // Expect ~12.3 deg
+    assert(az > 13.5 && az < 15.5); // Expect ~14.53 deg
+    assert(el > 7.5 && el < 9.0);   // Expect ~8.29 deg
 
     std::cout << "PASSED! (Center: [0, 0] deg | Corner: [" << az << ", " << el << "] deg)\n";
 }
@@ -381,6 +381,85 @@ void test_shaded_multirotor_fusion() {
               << "] | Unified Confidence: " << f3[0].confidence << ")\n";
 }
 
+// Unit test 12: Micro-Neighborhood Recurrent Periodicity Sieve (HelixTrack / FrequencyCam Core)
+void test_micro_neighborhood_periodicity_sieve() {
+    std::cout << "[TEST 12] Testing Micro-Neighborhood Periodicity Sieve (Rotor vs Ego-Motion Edge vs Wind Trees)... ";
+    
+    predator::MicroNeighborhoodPeriodicitySieve sieve(1280, 720, 70.0, 800.0);
+
+    // 1. Test Drone Rotor Blade Chops (140 Hz BPF => T = 7142 us)
+    int drone_x = 640;
+    int drone_y = 360;
+    int drone_passed = 0;
+    int drone_total = 50; // 50 blade passages = ~350ms
+    for (int i = 0; i < drone_total; ++i) {
+        uint64_t t = 1000000 + i * 7142;
+        // Blade tip micro-jitter (+- 1 pixel)
+        int px = drone_x + (i % 2);
+        int py = drone_y + ((i + 1) % 2);
+        if (sieve.is_periodic_event(px, py, t)) {
+            drone_passed++;
+        }
+    }
+    // After 1 initial priming event, 100% of periodic blade sweeps must pass
+    assert(drone_passed >= 48);
+
+    // 2. Test Single-Shot Ego-Motion Moving Contrast Edge (Sweeping across sensor at 20 deg/s)
+    sieve.reset();
+    int edge_passed = 0;
+    int edge_total = 100;
+    for (int i = 0; i < edge_total; ++i) {
+        // Edge moves horizontally: pixel changes every 1ms (1000 us)
+        int ex = 100 + i * 4; // moves to next tile
+        int ey = 200;
+        uint64_t t = 2000000 + i * 1000;
+        // Each tile sees only 1 edge entry
+        if (sieve.is_periodic_event(ex, ey, t)) {
+            edge_passed++;
+        }
+    }
+    // Moving edge non-repeating steps must be 100% rejected!
+    assert(edge_passed == 0);
+
+    // 3. Test Windblown Foliage Sway (3 Hz sway => T = 333,333 us)
+    sieve.reset();
+    int tree_passed = 0;
+    int tree_total = 30;
+    for (int i = 0; i < tree_total; ++i) {
+        int tx = 800;
+        int ty = 400;
+        uint64_t t = 3000000 + i * 333333; // 3 Hz leaf flutter
+        if (sieve.is_periodic_event(tx, ty, t)) {
+            tree_passed++;
+        }
+    }
+    // Slow foliage sway (> 14.3ms period) must be 100% rejected!
+    assert(tree_passed == 0);
+
+    // 4. Test Sparse Random Thermal Shot Noise
+    sieve.reset();
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> rand_x(0, 1279);
+    std::uniform_int_distribution<int> rand_y(0, 719);
+    std::uniform_int_distribution<uint64_t> rand_dt(50, 50000);
+    int noise_passed = 0;
+    int noise_total = 1000;
+    uint64_t cur_t = 4000000;
+    for (int i = 0; i < noise_total; ++i) {
+        cur_t += rand_dt(rng);
+        if (sieve.is_periodic_event(rand_x(rng), rand_y(rng), cur_t)) {
+            noise_passed++;
+        }
+    }
+    // Random shot noise should have < 2% accidental pass rate
+    assert(noise_passed < 20);
+
+    std::cout << "PASSED! (Drone Pass: " << drone_passed << "/" << drone_total 
+              << " | Ego-Motion Edge Rej: " << (edge_total - edge_passed) << "/" << edge_total
+              << " | Tree Sway Rej: " << (tree_total - tree_passed) << "/" << tree_total
+              << " | Noise Rej: " << (noise_total - noise_passed) << "/" << noise_total << ")\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "  Predator — Frequency-Domain DSP Unit Verification     \n";
@@ -397,9 +476,10 @@ int main() {
     test_lens_bearing_geometry();
     test_floodlight_drone_coexistence();
     test_shaded_multirotor_fusion();
+    test_micro_neighborhood_periodicity_sieve();
 
     std::cout << "========================================================\n";
-    std::cout << "  ALL 11 MATHEMATICAL DSP UNIT TESTS PASSED SUCCESSFULLY!\n";
+    std::cout << "  ALL 12 MATHEMATICAL DSP UNIT TESTS PASSED SUCCESSFULLY!\n";
     std::cout << "========================================================\n";
     return 0;
 }

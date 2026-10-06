@@ -46,27 +46,46 @@ public:
         buffer_ready_.assign(2 * num_pixels_, 0.0f);
     }
 
-    void ingest_event(double x, double y, uint64_t timestamp_us, short polarity) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
+    /**
+     * @brief Checks and swaps accumulation window once per batch (ZERO locks in event loop)
+     */
+    void update_window(uint64_t timestamp_us) {
         if (window_start_us_ == 0) {
             window_start_us_ = timestamp_us;
         }
 
-        // Check if window period has elapsed (40ms => 25 Hz inference cycle)
         if (timestamp_us >= window_start_us_ + window_duration_us_) {
+            std::lock_guard<std::mutex> lock(mutex_);
             std::swap(buffer_active_, buffer_ready_);
             std::fill(buffer_active_.begin(), buffer_active_.end(), 0.0f);
             has_new_frame_ = true;
             window_start_us_ = timestamp_us;
         }
+    }
 
-        int px = std::clamp(static_cast<int>(x * (static_cast<double>(width_) / 1280.0)), 0, width_ - 1);
-        int py = std::clamp(static_cast<int>(y * (static_cast<double>(height_) / 720.0)), 0, height_ - 1);
+    /**
+     * @brief Ultra-fast lock-free per-event pixel binning with integer bit shifts (zero mutex contention)
+     */
+    inline void ingest_event_fast(uint16_t x, uint16_t y, short polarity) {
+        int px = x >> 1;
+        int py = y >> 1;
+        if (px >= width_) px = width_ - 1;
+        if (py >= height_) py = height_ - 1;
 
         int channel = (polarity > 0) ? 0 : 1; // Channel 0: ON (+), Channel 1: OFF (-)
         size_t idx = channel * num_pixels_ + (py * width_ + px);
         buffer_active_[idx] += 1.0f;
+    }
+
+    inline void ingest_event_fast(double x, double y, short polarity) {
+        uint16_t ux = (x > 0.0) ? static_cast<uint16_t>(x) : 0;
+        uint16_t uy = (y > 0.0) ? static_cast<uint16_t>(y) : 0;
+        ingest_event_fast(ux, uy, polarity);
+    }
+
+    void ingest_event(double x, double y, uint64_t timestamp_us, short polarity) {
+        update_window(timestamp_us);
+        ingest_event_fast(x, y, polarity);
     }
 
     bool get_latest_stack(std::vector<float>& out_stack, bool force = false) {
@@ -107,7 +126,9 @@ public:
           height_(height),
           num_pixels_(width * height) {
         
-        dynamic_mask_host_.assign(num_pixels_, 1.0f); // Default 1.0 (pass-through)
+        mask_buffers_[0].assign(num_pixels_, 1.0f); // Default 1.0 (pass-through)
+        mask_buffers_[1].assign(num_pixels_, 1.0f);
+        active_mask_ptr_.store(mask_buffers_[0].data(), std::memory_order_release);
     }
 
     ~AnticipatorySuppressionEngine() {
@@ -196,40 +217,51 @@ public:
             return false;
         }
 
-        // 3. Read back warped dynamic mask
-        std::vector<float> mask_result(num_pixels_);
-        cudaMemcpyAsync(mask_result.data(), d_warped_mask_, mask_size, cudaMemcpyDeviceToHost, stream_);
+        // 3. Read back warped dynamic mask into back buffer
+        int back_idx = 1 - current_mask_idx_.load(std::memory_order_relaxed);
+        cudaMemcpyAsync(mask_buffers_[back_idx].data(), d_warped_mask_, mask_size, cudaMemcpyDeviceToHost, stream_);
         cudaStreamSynchronize(stream_);
 
-        {
-            std::lock_guard<std::mutex> lock(mask_mutex_);
-            dynamic_mask_host_ = std::move(mask_result);
-        }
+        // 4. Atomically swap active mask pointer for lock-free camera callback reads
+        active_mask_ptr_.store(mask_buffers_[back_idx].data(), std::memory_order_release);
+        current_mask_idx_.store(back_idx, std::memory_order_relaxed);
 
         return true;
     }
 
     /**
      * @brief Evaluates whether an incoming event belongs to an independently moving object (IMO)
+     * Lock-free, zero-mutex direct array lookup!
      * @param x Event pixel X in 1280x720 coordinates
      * @param y Event pixel Y in 1280x720 coordinates
      * @param threshold Gating threshold (default 0.35)
      * @return true if event should be RETAINED, false if SUPPRESSED (ego-motion)
      */
-    bool is_event_retained(double x, double y, float threshold = 0.35f) const {
-        if (!is_ready_) {
+    inline bool is_event_retained(double x, double y, float threshold = 0.35f) const {
+        if (!is_ready_.load(std::memory_order_relaxed)) {
             return true; // Pass-through when engine is not active
         }
 
-        int px = std::clamp(static_cast<int>(x * (static_cast<double>(width_) / 1280.0)), 0, width_ - 1);
-        int py = std::clamp(static_cast<int>(y * (static_cast<double>(height_) / 720.0)), 0, height_ - 1);
+        const float* mask = active_mask_ptr_.load(std::memory_order_acquire);
+        if (!mask) return true;
 
-        std::lock_guard<std::mutex> lock(mask_mutex_);
-        float prob = dynamic_mask_host_[py * width_ + px];
-        return prob >= threshold;
+        int px = static_cast<int>(x * (static_cast<double>(width_) / 1280.0));
+        int py = static_cast<int>(y * (static_cast<double>(height_) / 720.0));
+        if (px < 0) px = 0; else if (px >= width_) px = width_ - 1;
+        if (py < 0) py = 0; else if (py >= height_) py = height_ - 1;
+
+        return mask[py * width_ + px] >= threshold;
     }
 
     bool is_ready() const { return is_ready_; }
+
+    /**
+     * @brief Returns raw CUDA device pointer to the latest warped suppression probability mask
+     * Enables direct GPU-to-GPU kernel evaluation without host copies.
+     */
+    const float* get_device_mask() const {
+        return is_ready_.load(std::memory_order_relaxed) ? static_cast<const float*>(d_warped_mask_) : nullptr;
+    }
 
 private:
     void cleanup() {
@@ -267,8 +299,9 @@ private:
     void* d_warped_mask_{nullptr};
     void* d_optical_flow_{nullptr};
 
-    mutable std::mutex mask_mutex_;
-    std::vector<float> dynamic_mask_host_;
+    std::array<std::vector<float>, 2> mask_buffers_;
+    std::atomic<int> current_mask_idx_{0};
+    std::atomic<const float*> active_mask_ptr_{nullptr};
 };
 
 } // namespace predator
