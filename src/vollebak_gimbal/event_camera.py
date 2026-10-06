@@ -33,6 +33,7 @@ class EventCameraMonitor:
             "mode": "unknown",
             "num_targets": 0,
             "targets": [],
+            "ego_motion": {},
             "error": None,
         }
 
@@ -101,10 +102,37 @@ class EventCameraMonitor:
         if not isinstance(targets, list):
             targets = []
         targets = [target for target in targets if isinstance(target, dict)]
+        raw_ego_motion = payload.get("ego_motion", {})
+        if not isinstance(raw_ego_motion, dict):
+            raw_ego_motion = {}
         event_rate = float(payload.get("event_rate_ev_s", 0.0) or 0.0)
-        if event_rate <= 0 and isinstance(payload.get("ego_motion"), dict):
+        if event_rate <= 0 and raw_ego_motion:
             # Older Bart detector builds expose a 25 Hz event-count window only.
-            event_rate = float(payload["ego_motion"].get("total_raw_events", 0.0) or 0.0) * 25.0
+            event_rate = float(raw_ego_motion.get("total_raw_events", 0.0) or 0.0) * 25.0
+        ego_motion = {
+            "imu_connected": bool(raw_ego_motion.get("imu_connected", False)),
+            "imu_packets": int(raw_ego_motion.get("imu_packets", 0) or 0),
+            "trt_suppression_active": bool(
+                raw_ego_motion.get("trt_suppression_active", False)
+            ),
+            "spectral_combnet_active": bool(
+                raw_ego_motion.get("spectral_combnet_active", False)
+            ),
+            "spectral_eval_cells": int(raw_ego_motion.get("spectral_eval_cells", 0) or 0),
+            "spectral_detections": int(raw_ego_motion.get("spectral_detections", 0) or 0),
+            "gyro_speed_deg_s": float(raw_ego_motion.get("gyro_speed_deg_s", 0.0) or 0.0),
+            "active_cells": int(raw_ego_motion.get("active_cells", 0) or 0),
+            "foliage_dispersion_pct": float(
+                raw_ego_motion.get("foliage_dispersion_pct", 0.0) or 0.0
+            ),
+            "suppressed_events_pct": float(
+                raw_ego_motion.get("suppressed_events_pct", 0.0) or 0.0
+            ),
+            "total_raw_events": int(raw_ego_motion.get("total_raw_events", 0) or 0),
+            "retained_imo_events": int(
+                raw_ego_motion.get("retained_imo_events", 0) or 0
+            ),
+        }
         return {
             "enabled": True,
             "connected": True,
@@ -120,6 +148,7 @@ class EventCameraMonitor:
             "mode": "flicker_detector" if "num_targets" in payload else "event_viewer",
             "num_targets": int(payload.get("num_targets", len(targets)) or 0),
             "targets": targets,
+            "ego_motion": ego_motion,
             "error": None,
         }
 

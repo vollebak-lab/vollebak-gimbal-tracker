@@ -7,7 +7,7 @@ from .event_camera import primary_event_target
 from .models import Angles, Detection
 
 UPSTREAM_REPOSITORY = "vollebak-lab/predator"
-UPSTREAM_COMMIT = "ea46468"
+UPSTREAM_COMMIT = "d5ff183"
 OPERATING_MODE = "OBSERVATION_ONLY"
 
 
@@ -30,6 +30,10 @@ def build_observer_telemetry(
     event_camera = event_camera or {}
     event_online = bool(event_camera.get("connected"))
     event_detector_active = event_camera.get("mode") == "flicker_detector"
+    ego_motion = event_camera.get("ego_motion", {})
+    if not isinstance(ego_motion, dict):
+        ego_motion = {}
+    spectral_active = bool(ego_motion.get("spectral_combnet_active"))
     event_target = primary_event_target(event_camera)
     target_locked = target is not None or event_target is not None
     detector_name = str(config.detector.get("type", "motion")).upper()
@@ -76,7 +80,9 @@ def build_observer_telemetry(
                 else "SYNTHETIC"
             ),
             "detector": (
-                f"{detector_name} + BART FFT"
+                f"{detector_name} + BART COMBNET"
+                if spectral_active
+                else f"{detector_name} + BART FFT"
                 if event_detector_active
                 else f"{detector_name} + EVENT STREAM"
                 if event_online
@@ -88,6 +94,17 @@ def build_observer_telemetry(
             "bpf_hz": event_target.get("bpf_hz") if event_target else None,
             "rotor_rpm": event_target.get("estimated_rpm") if event_target else None,
             "snr_db": event_target.get("snr_db") if event_target else None,
+            "imu_connected": bool(ego_motion.get("imu_connected", False)),
+            "imu_packets": int(ego_motion.get("imu_packets", 0) or 0),
+            "trt_suppression_active": bool(
+                ego_motion.get("trt_suppression_active", False)
+            ),
+            "spectral_combnet_active": spectral_active,
+            "spectral_eval_cells": int(ego_motion.get("spectral_eval_cells", 0) or 0),
+            "spectral_detections": int(ego_motion.get("spectral_detections", 0) or 0),
+            "suppressed_events_pct": float(
+                ego_motion.get("suppressed_events_pct", 0.0) or 0.0
+            ),
         },
         "layer2": {
             "name": "RADAR",

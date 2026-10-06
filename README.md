@@ -1,12 +1,12 @@
 # Predator Observation Console
 
-This repository combines Bart's complete [Vollebak Predator](https://github.com/vollebak-lab/predator) source tree at commit `ea46468` with a working Raspberry Pi 5 camera-to-gimbal application.
+This repository combines Bart's complete [Vollebak Predator](https://github.com/vollebak-lab/predator) source tree at commit `d5ff183` with a working Raspberry Pi 5 camera-to-gimbal application.
 
-The runnable Pi profile is deliberately scoped to passive observation, target tracking, and two-axis pointing. A stationary Logitech USB camera detects a target, a calibration maps image pixels to pan/tilt angles, and the Waveshare 360-degree two-axis module follows those angles. Until the gimbal arrives, the exact same loop drives the on-screen digital twin through the mock driver.
+The runnable Pi profile is deliberately scoped to passive observation, target tracking, and two-axis pointing. The regular-camera path uses OpenCV MOG2 background subtraction to find moving regions, rejects small contours, selects the largest remaining moving region, and maps its center through the saved camera-to-gimbal calibration. A rate-limited controller smooths that pan/tilt demand before the Waveshare driver sends serial commands. This is motion following, not object-identity recognition: any sufficiently large moving object can become the target.
 
 The GUI also exposes the readiness of Bart's layered stack without pretending disconnected hardware is live:
 
-- L1: the Logitech RGB camera and connected IDS UE-39B0XCP/Sony IMX636 event camera are selectable live feeds. Bart's CPU FFT/HPS flicker detector is running live and publishes event rate, tracks, bearing, BPF, RPM, and SNR when it finds a qualifying target.
+- L1: the Logitech RGB camera and connected IDS UE-39B0XCP/Sony IMX636 event camera are selectable live feeds. The verified CPU FFT/HPS detector publishes event rate, tracks, bearing, BPF, RPM, and SNR. Bart's latest source additionally includes Nicla IMU compensation and a CUDA/TensorRT FP16 SpectralCombNet classifier; the dashboard reports those features when a compatible Jetson build exposes them.
 - L2: Uhnder radar is shown as not connected; its real backend in Bart's current tree is a stub.
 - L3: the Pi profile provides one bearing-only visual track; Bart's full IMM/JPDA fusion source remains in the repository.
 - L4: mock or Waveshare gimbal pointing only. Engagement is hard-disabled and no engagement command endpoint exists.
@@ -25,14 +25,14 @@ Open <http://127.0.0.1:8080>. Camera index `0` is configured for the Logitech ca
 
 The development dashboard also consumes Bart's event-camera service at <http://127.0.0.1:8081>. On this Windows workstation the IDS camera is passed into WSL with `usbipd`; both event services cap the sensor in hardware at 10 MEv/s to stay within the virtual USB bridge's practical limit. Use the feed selector in the dashboard to switch between `LOGITECH RGB` and `IMX636 EVENT`.
 
-Start the already-built full detector after attaching USB bus `2-14`:
+Start the already-built CPU detector after attaching USB bus `2-14`:
 
 ```powershell
 usbipd attach --wsl --busid 2-14
 wsl -d Ubuntu -- bash /mnt/c/Users/gutie/Downloads/vollebak-gimbal-tracker/scripts/run_event_detector_wsl.sh
 ```
 
-The bus ID can change after reconnecting the camera; confirm it with `usbipd list`. `run_event_viewer_wsl.sh` is a lower-CPU raw-event fallback. Native USB on the Pi remains the preferred deployment path because it removes USB/IP from the capture chain.
+The bus ID can change after reconnecting the camera; confirm it with `usbipd list`. `run_event_viewer_wsl.sh` is a lower-CPU raw-event fallback. The newest CUDA/TensorRT detector must be rebuilt on compatible NVIDIA hardware (the upstream CMake profile targets Jetson Orin, CUDA architecture 87); it cannot run natively on the Raspberry Pi 5 GPU. The existing CPU build remains available for this workstation/WSL setup.
 
 Useful checks:
 

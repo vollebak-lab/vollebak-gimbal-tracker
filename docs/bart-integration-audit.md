@@ -3,9 +3,9 @@
 ## Source reviewed
 
 - Repository: `vollebak-lab/predator`
-- Integrated main-branch commit: `ea46468`
-- Main-branch history reviewed: four Bart commits through 2026-09-30
-- Imported tracked files: 104
+- Integrated main-branch commit: `d5ff183`
+- Main-branch history reviewed: eight Bart commits through 2026-10-06
+- Imported tracked files: 123
 - Python verification: 48 upstream tests passed after installing SciPy
 - Native verification: OpenEB 5.2.0 was built under WSL with the IDS USB identifiers from Bart's integration notes. The camera test, live viewer, CPU flicker detector, all 11 flicker-DSP tests, and all 6 ego-motion tests ran successfully against the connected IMX636. A sensor-side 10 MEv/s cap makes the full detector stable through WSL USB/IP; native USB remains preferred for deployment.
 
@@ -15,6 +15,10 @@
 - `b197dc5` is the substantive expansion: 91 files changed and roughly 37,500 lines added, including the C++/CUDA event pipeline, Rust workspace, research corpus, additional fusion/tracking modules, and revised hardware architecture.
 - `3239ec2` recorded the repository release in the engineering log; it did not introduce another runtime subsystem.
 - `ea46468` added the final architecture note formally superseding SpMiniUNet with the frequency-domain DSP core.
+- `c0c4317` added Arduino Nicla Sense ME 200 Hz IMU ingestion and connected its gyro stream to ego-motion telemetry.
+- `c726aa6` documented the Nicla firmware, serial transport, calibration, and deployment workflow.
+- `7662600` added the SPAD 23 optical-ranging research and integration plan; it does not add a live Pi sensor backend.
+- `d5ff183` added the CUDA flicker core, TensorRT FP16 SpectralCombNet classifier, ONNX model, diagnostics, and tests.
 
 Every tracked file from the reviewed commit was copied into this repository. The Pi application in `src/vollebak_gimbal` remains the executable integration layer because it already supports the connected Logitech camera, fixed-camera calibration, the Waveshare serial protocol, and a hardware-free mock driver.
 
@@ -24,9 +28,13 @@ The two upstream files replaced by integration-specific versions are preserved v
 
 ### Layer 1: neuromorphic sensing
 
-Bart's newest implementation makes frequency-domain DSP the authoritative propeller detector. `ev_ingestion_cpp/flicker_dsp.hpp` uses a 4 kHz analysis rate, 512-sample windows, FFT/harmonic-product-spectrum scoring, spatial patch clustering, common AC-carrier suppression, and M-of-N track persistence. The C++ daemon combines that path with an OpenEB event stream, gyro motion compensation, and optional TensorRT suppression.
+Bart's implementation makes frequency-domain DSP the authoritative propeller detector. `ev_ingestion_cpp/flicker_dsp.hpp` uses a 4 kHz analysis rate, 512-sample windows, FFT/harmonic-product-spectrum scoring, spatial patch clustering, common AC-carrier suppression, and M-of-N track persistence. The newest C++ daemon combines that path with an OpenEB event stream, Nicla gyro motion compensation, CUDA cell spectra, TensorRT suppression, and an FP16 SpectralCombNet classifier.
 
-This path is designed for a Sony IMX636/DVX-class event camera, not for a conventional Logitech frame camera. The connected IDS UE-39B0XCP was identified as a 1280x720 IMX636 and verified with OpenEB. The dashboard displays its real MJPEG event surface and full detector telemetry alongside the Logitech feed. Under WSL, a 10 MEv/s sensor-side ERC cap avoids overwhelming USB/IP. BPF/RPM/SNR remain empty when the detector has no qualifying target instead of being fabricated.
+This path is designed for a Sony IMX636/DVX-class event camera, not for a conventional Logitech frame camera. The connected IDS UE-39B0XCP was identified as a 1280x720 IMX636 and verified with OpenEB. The dashboard displays its real MJPEG event surface and full detector telemetry alongside the Logitech feed. Under WSL, a 10 MEv/s sensor-side ERC cap avoids overwhelming USB/IP. BPF/RPM/SNR remain empty when the detector has no qualifying target instead of being fabricated. The Pi adapter now also preserves and displays Bart's IMU, TensorRT suppression, SpectralCombNet evaluation, and neural-detection diagnostics.
+
+The regular Logitech path is an integration-specific fallback. OpenCV MOG2 background subtraction produces foreground contours, contours smaller than the configured area are discarded, and the largest remaining region is selected. Its bounding-box center is converted to a bearing using the fixed-camera calibration and passed through smoothing, deadband, step, rate, and mechanical-limit controls. It follows motion; it does not perform Bart's rotor-frequency classification or guarantee persistent object identity.
+
+The newest upstream CMake configuration requires CUDA, TensorRT, and compute capability 8.7 and is aimed at Jetson Orin. Its complete source and model are included here, but it cannot be rebuilt for the Raspberry Pi 5 GPU or the current non-NVIDIA WSL environment. The previously verified CPU/OpenEB FFT/HPS binary remains the runnable event-camera path on this workstation until a compatible Jetson node is added.
 
 ### Layer 2: radar
 
@@ -71,6 +79,7 @@ smoothing + deadband + range/step/rate limits
 
 IDS IMX636 event surface + rate telemetry        L1 LIVE (selectable)
 Event camera FFT/HPS detector                    L1 LIVE (CPU / WSL)
+Nicla IMU + CUDA/TensorRT SpectralCombNet        L1 INTEGRATED (JETSON REQUIRED)
 Uhnder radar                                     L2 NOT CONNECTED
 Directed-energy/engagement path                  HARD DISABLED
 ```

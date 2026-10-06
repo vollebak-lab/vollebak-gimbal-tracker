@@ -10,6 +10,7 @@ const ui = {
   tiltOutput: $("tiltOutput"), log: $("eventLog"), toast: $("toast"), cameraStage: $("cameraStage"),
   safetyMode: $("safetyMode"), l1Status: $("l1Status"), l1Sensor: $("l1Sensor"),
   l1Detector: $("l1Detector"), l1Event: $("l1Event"), flickerStats: $("flickerStats"),
+  neuralStats: $("neuralStats"),
   l2Status: $("l2Status"), l2Sensor: $("l2Sensor"), l2Simulation: $("l2Simulation"),
   l3Status: $("l3Status"), l3Mode: $("l3Mode"), trackCount: $("trackCount"),
   trackAngles: $("trackAngles"), trackConfidence: $("trackConfidence"),
@@ -83,6 +84,11 @@ function updatePredatorUI(predator) {
         ? "SCANNING / NO FLICKER LOCK"
         : "RAW EVENT STREAM / FFT READY")
     : `${Number(l1.bpf_hz).toFixed(1)} Hz / ${Number(l1.rotor_rpm).toFixed(0)} / ${Number(l1.snr_db).toFixed(1)} dB`;
+  const imu = l1.imu_connected ? `200 Hz (${l1.imu_packets})` : "OFFLINE";
+  const combnet = l1.spectral_combnet_active
+    ? `FP16 / ${l1.spectral_detections} LOCK`
+    : "OFF";
+  ui.neuralStats.textContent = `${imu} / ${combnet}`;
   ui.l2Status.textContent = l2.status;
   ui.l2Sensor.textContent = l2.sensor;
   ui.l2Simulation.textContent = l2.simulated ? "ON" : "OFF";

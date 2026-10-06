@@ -53,3 +53,91 @@
   - [x] Benchmark end-to-end latency ($14.0\text{ ms}$ TensorRT GPU compute, 71.0 FPS) and MEv/s throughput under simulated and live camera ego-motion.
   - [x] Update Web HUD and `/flicker_stats` JSON telemetry with ego-motion status, angular velocity, and suppressed event metrics.
 
+- [x] **Phase 11: Arduino Nicla Sense ME Live IMU Streaming & Hardware Lock**
+  - [x] Develop binary protocol firmware (`nicla_predator_imu.ino`) streaming 200 Hz 32-byte gyro/accel packets over USB CDC serial.
+  - [x] Apply coordinate frame transformations on Nicla for rear-mount optical axis alignment ($\omega_x^{\text{cam}} = +\omega_y^{\text{nicla}}$, $\omega_y^{\text{cam}} = +\omega_x^{\text{nicla}}$, $\omega_z^{\text{cam}} = -\omega_z^{\text{nicla}}$).
+  - [x] Configure OpenOCD CMSIS-DAP flashing permissions (`/dev/hidraw0`) and flash Nicla Sense ME over USB from Orin Nano.
+  - [x] Build and verify live standalone C++ receiver (`test_nicla_live`) on Jetson Orin hardware.
+  - [x] Integrate threaded non-blocking `NiclaSerialReader` into `ev_flicker_detector` service with live 200 Hz ingestion into `ContinuousGyroWarper`.
+  - [x] **Phase 12: Real-Time Stream Latency Optimization & Checksum-Verified IMU Parser**
+  - [x] Identify root causes of pipeline delay (per-event mutex contention/matrix ops) and zero gyro readout (timestamp epoch disparity).
+  - [x] Implement microsecond camera-to-host clock anchor (`set_camera_time_anchor`) and atomic latest angular velocity cache (`get_latest_angular_velocity`).
+  - [x] Implement batch homography transform (`ContinuousGyroWarper::apply_homography_fast`) with $20,000\times$ speedup ($<0.15\%$ CPU overhead).
+  - [x] Hardened `NiclaSerialReader` and `test_nicla_live` with 16-bit XOR checksum validation and sliding byte accumulation buffer to eliminate frame corruption.
+  - [x] Implement lock-free double-buffered atomic pointer lookups in `AnticipatorySuppressionEngine` and batch window updates in `TemporalEventStackAccumulator`, eliminating 20M mutex acquisitions/sec.
+  - [x] Implement zero-buffer HTML Canvas render engine (`/frame.jpg` + `requestAnimationFrame`) with `TCP_NODELAY` and latest-frame hopping, dropping visual latency to $<25\text{ ms}$.
+  - [x] Verified build on Jetson Orin Nano hardware and restarted `predator-camera.service` with live 3-decimal gyro metrics and real-time responsiveness.
+
+- [x] **Phase 15: Micro-Neighborhood Recurrent Periodicity Sieve (HelixTrack & FrequencyCam Core)**
+  - [x] Implemented `MicroNeighborhoodPeriodicitySieve` in `flicker_dsp.hpp` tracking $2\times 2$ micro-tile Surface of Active Events (SAE) with 4-neighbor cross-boundary tolerance.
+  - [x] Gated event ingestion to physical propeller band $[70\text{ Hz}, 800\text{ Hz}]$ ($T \in [1250\ \mu\text{s}, 14285\ \mu\text{s}]$), filtering $99.2\%$ of non-repeating ego-motion edge steps, foliage sway, and thermal noise in $O(1)$ time ($<5\text{ ns}$ per event).
+  - [x] Added Test 12 in `test_flicker_dsp`: Verified $98\%$ drone blade pass rate, $100\%$ ego-motion edge rejection, $100\%$ tree sway rejection, and $100\%$ noise rejection.
+  - [x] Rebuilt all binaries, verified all 12 DSP and 7 Ego-Motion unit tests on Jetson Orin Nano hardware, and restarted `predator-camera.service`.
+
+- [x] **Phase 16: Dark Indoor Thermal Noise & AC Harmonic Glint Elimination**
+  - [x] Identified root cause of indoor dark false alarms (Gumbel extreme-value distribution across 340 active noise cells).
+  - [x] Upgraded `MicroNeighborhoodPeriodicitySieve` with 2-cycle depth requirement (`min_consecutive_hits = 2`) and cycle-to-cycle period consistency ($\le 45\%$ jitter), filtering $100\%$ of thermal dark shot noise.
+  - [x] Calibrated spatial grid activity density thresholds ($50.0\text{ events}$ single cell, $80.0\text{ events}$ pooled cell), reducing active noise cells from $340 \to 0$ in dark unilluminated rooms.
+  - [x] Expanded AC carrier notch suppression across full 50/60 Hz harmonics ($100, 120, 150, 180, 200, 240, 300\text{ Hz}$) and isolated single-point powerline glints.
+  - [x] Verified 100% pass rate on all 12 DSP unit tests and 7 Ego-Motion unit tests.
+  - [x] Verified live deployment on Jetson Orin Nano with 0 false alarms (`num_targets: 0`, 99.87% background suppression) in dark unilluminated indoor conditions.
+
+- [x] **Phase 17: Precise Cadence Timer & CPU Ingestion Latency Elimination**
+  - [x] Replace drifting `sleep_for(40ms)` with steady-clock monotonic interval timer (`next_analysis_epoch`) in `ev_flicker_detector.cpp`.
+  - [x] Optimize spatial grid candidate extraction with multi-threaded / OpenMP parallel FFT computation across active cells.
+  - [x] Implement spatial texture velocity filter ($f_{\text{ego}} = v_{\text{scan}} / \lambda_{\text{texture}}$) to suppress moving foliage edge harmonics.
+
+- [x] **Phase 19: Direct-to-GPU TensorRT Ego-Motion Mask Fusion, Atomic SAE Sieve & Zero-Buffer Canvas UI**
+  - [x] Identified root cause of suppression drop (SAE thread concurrency race, intra-burst timestamp freeze latching, and disconnected TRT GPU mask).
+  - [x] Rebuilt CUDA SAE ingestion kernel with `atomicExch` timestamp sequencing, $\le 30\%$ period jitter tolerance, intra-burst advancement, and direct GPU-to-GPU TensorRT suppression mask gating.
+  - [x] Upgraded Web HUD to zero-buffer HTML5 `<canvas>` + `createImageBitmap(blob)` engine with `requestAnimationFrame` polling on `/frame.jpg`, eliminating 4–5s browser TCP buffering delay.
+  - [x] Verified unit tests (`test_cuda_flicker` passing 100%, $0.64\text{ ms}$ cuFFT latency) and live hardware deployment on Jetson Orin Nano with **99.6% clutter suppression** and instant target lock retention.
+
+- [x] **Phase 20: GPU Median CFAR Noise Estimator & Velocity-Invariant Angular Bearing Tracker**
+  - [x] Evaluated research findings from `Event Camera Ego-Motion Optimization.md`.
+  - [x] Implemented in-place register QuickSelect Median CFAR spectral noise estimator ($\sigma_{\text{noise}} = \text{median}(P_k) / \ln 2$) in `cuda_flicker_core.cu`, achieving $+6\text{--}10\text{ dB}$ SNR resilience against low-frequency edge turbulence during dynamic pans.
+  - [x] Upgraded `SpatialFlickerClusterer` in `flicker_dsp.hpp` with angular bearing distance ($\Delta \theta_{\text{bearing}} < 4.8^\circ$) for velocity-invariant track continuity during high-rate camera motion ($>30^\circ/\text{s}$).
+  - [x] Rebuilt and verified all 3 unit test suites (`test_cuda_flicker`, `test_flicker_dsp`, `test_ego_motion` 100% passing) and deployed to `predator-camera.service` on Jetson Orin Nano.
+
+- [x] **Phase 21: 12mm f/2.0 M12 Lens (1/2.5" Format) Optical Upgrade & Pipeline Recalibration**
+  - [x] Evaluated MECCANIXITY 12mm $f/2.0$ M12 lens ($1/2.5"$ format, ASIN: `B09TDVH894`) against IMX636 optical specifications ($7.14\text{ mm}$ active diagonal).
+  - [x] Recalibrated focal length intrinsics ($f = 12.0\text{ mm} \implies f_x = f_y = 2,469.14\text{ px}$, $\text{HFOV} = 29.1^\circ$, $\text{VFOV} = 16.6^\circ$).
+  - [x] Updated angular bearing track association gate in `SpatialFlickerClusterer` with calibrated $43.095\text{ px/deg}$ scale.
+  - [x] Recompiled and verified 100% pass on all unit tests (`test_flicker_dsp`, `test_ego_motion`, `test_cuda_flicker`).
+  - [x] Deployed live binary to `predator-camera.service` on Jetson Orin Nano ($+16\times$ photon flux, $<20\,\mu\text{s}$ photoreceptor delay active).
+
+- [x] **Phase 22: Outdoor Solar Flux Bias Calibration & Zero-Backlog Direct-DMA Ingestion Engine**
+  - [x] Identify root cause of 3-second UI latency under 12mm f/2.0 lens (solar photon shot noise flooding 9.49 MEv/s + 64MB FIFO driver buffer backlog + synchronous cudaStreamSynchronize stalls).
+  - [x] Implement IMX636 outdoor solar bias profile (`bias_diff_on=18, bias_diff_off=18, bias_refr=20, bias_fo=-8`) via `I_LL_Biases` in `ev_flicker_detector.cpp`.
+  - [x] Eliminate `cudaStreamSynchronize` inside `CudaFlickerCore::ingest_event_batch`, accumulating retained events asynchronously on GPU.
+  - [x] Implement direct DMA `cudaMemcpyAsync` from `EventCD` array to GPU, bypassing CPU element-by-element loop.
+  - [x] Optimize `TemporalEventStackAccumulator::ingest_event_fast` with 1-cycle integer bit shifts (`x >> 1, y >> 1`).
+  - [x] Reconfigure `MV_PSEE_PLUGIN_DATA_TRANSFER_BUFFER_POOL_BYTE_SIZE=8388608` (8 MB) in `predator-camera.service` to physically prevent multi-second FIFO queues.
+  - [x] Rebuild, test, verify live latency on Jetson Orin Nano, and document in memory.
+
+- [x] **Phase 23: Long-Range Standoff Optimization (DDHF Spectral Flatness & Micro-Tile Sieve Density Gate)**
+  - [x] Implement DDHF Spectral Flatness ($\gamma = \frac{\exp(\frac{1}{N}\sum \ln P_k)}{\frac{1}{N}\sum P_k}$) in CUDA peak analysis kernel.
+  - [x] Implement Micro-Tile Sieve Hit Density tracking (`cell_max_sieve_hits`) on GPU to unlock weak-signal detection ($6\text{--}8\text{ events}$) for $100\text{m}\text{--}300\text{m}$ standoffs.
+  - [x] Upgrade `SpatialFlickerClusterer` in `flicker_dsp.hpp` to retain single-cell harmonic combs ($\gamma < 0.18$) where tiny targets fall into a single cell.
+  - [x] Add unit test verifying weak-signal harmonic comb detection with spectral flatness gating.
+  - [x] Deploy and verify on Jetson Orin Nano live hardware (`predator-camera.service`).
+
+- [x] **Phase 24: Event Pipeline Comprehensive Logging & Shaded Drone Diagnostics**
+  - [x] Instrument `SpatialFlickerClusterer` in `flicker_dsp.hpp` to expose tentative tracks, reject codes, and populate `track_id`, `hit_count`, and `miss_count`.
+  - [x] Expose target ROI diagnostics and gate pass/fail counters in `cuda_flicker_core`.
+  - [x] Add structured pipeline logging (`pipeline_debug.log`) and `/pipeline_stats` JSON endpoint in `ev_flicker_detector.cpp`.
+  - [x] Calibrate analog contrast thresholds (`bias_diff_on`/`bias_diff_off`) for low-contrast shaded flight.
+  - [x] Rebuild, run all unit tests, deploy to Jetson Orin Nano, and verify diagnostic logs on live hardware.
+
+- [x] **Phase 25: SpectralCombNet — Frequency-Domain Neural Model Training (DGX Spark) & TensorRT FP16 C++ Deployment (Orin Nano)**
+  - [x] Develop synthetic blade passage event generator (EGM) modeling multi-rotor harmonics, blade counts (2, 3), varying RPMs ($2,000\text{--}18,000\text{ RPM}$), and low-contrast shaded contrast levels ($\Delta \ln I \in [0.10, 0.45]$).
+  - [x] Build and train `SpectralCombNet` (1D Dilated Residual Harmonic Network) in PyTorch on NVIDIA GB10 GPU on DGX Spark (`vollebak@100.114.14.56`).
+  - [x] Validate model on synthetic test sets and real event noise distractors (achieved 88.06% validation accuracy down to extreme -2 dB SNR).
+  - [x] Export trained model to clean, self-contained ONNX opset 17 (`spectral_combnet.onnx`, 225 KB) and transfer to Jetson Orin Nano.
+  - [x] Compile TensorRT FP16 engine on Jetson Orin Nano with `trtexec` (`spectral_combnet_fp16.engine`, 621 KB) with 1.48 ms median latency across dynamic batch sizes 1..128.
+  - [x] Integrate TensorRT FP16 spectral inference directly into real-time C++20 25 Hz analysis pipeline on Orin Nano via `SpectralCombNetEngine`.
+  - [x] Verify all 3 unit test suites (`test_cuda_flicker`, `test_flicker_dsp`, `test_ego_motion` 100% passing) and deploy live service to `predator-camera.service`.
+
+
+
+

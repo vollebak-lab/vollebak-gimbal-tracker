@@ -31,7 +31,15 @@ def test_predator_uses_live_event_target_bearing():
     config = load_config("config/dev.yaml")
     event_camera = {
         "connected": True,
+        "mode": "flicker_detector",
         "event_rate_mev_s": 19.25,
+        "ego_motion": {
+            "imu_connected": True,
+            "imu_packets": 900,
+            "spectral_combnet_active": True,
+            "spectral_eval_cells": 7,
+            "spectral_detections": 1,
+        },
         "num_targets": 1,
         "targets": [
             {
@@ -55,6 +63,9 @@ def test_predator_uses_live_event_target_bearing():
     )
 
     assert telemetry["layer1"]["event_camera"] == "ONLINE / 19.25 MEV/S"
+    assert telemetry["layer1"]["detector"] == "MOTION + BART COMBNET"
+    assert telemetry["layer1"]["imu_connected"] is True
+    assert telemetry["layer1"]["spectral_detections"] == 1
     assert telemetry["layer1"]["bpf_hz"] == 180.0
     assert telemetry["layer3"]["mode"] == "EVENT FLICKER BEARING"
     assert telemetry["layer3"]["azimuth_deg"] == 4.5

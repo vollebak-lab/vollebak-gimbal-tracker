@@ -34,3 +34,28 @@ def test_normalizes_legacy_detector_event_window():
     )
 
     assert state["event_rate_mev_s"] == 20.0
+
+
+def test_normalizes_latest_bart_imu_and_spectral_diagnostics():
+    monitor = EventCameraMonitor(EventCameraConfig(enabled=True))
+    state = monitor._normalize(
+        {
+            "num_targets": 0,
+            "targets": [],
+            "ego_motion": {
+                "imu_connected": True,
+                "imu_packets": 4200,
+                "trt_suppression_active": True,
+                "spectral_combnet_active": True,
+                "spectral_eval_cells": 18,
+                "spectral_detections": 2,
+                "suppressed_events_pct": 37.5,
+            },
+        }
+    )
+
+    assert state["ego_motion"]["imu_connected"] is True
+    assert state["ego_motion"]["imu_packets"] == 4200
+    assert state["ego_motion"]["spectral_combnet_active"] is True
+    assert state["ego_motion"]["spectral_detections"] == 2
+    assert state["ego_motion"]["suppressed_events_pct"] == 37.5

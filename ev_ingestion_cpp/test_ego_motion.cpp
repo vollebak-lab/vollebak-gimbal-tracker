@@ -31,7 +31,7 @@ int main() {
     std::cout << "======================================================================\n\n";
 
     predator::LensParameters lens;
-    lens.focal_length_mm = 8.0;
+    lens.focal_length_mm = 12.0;
     lens.pixel_pitch_um = 4.86;
     lens.sensor_width = 1280;
     lens.sensor_height = 720;
@@ -172,6 +172,7 @@ int main() {
 
         predator::SpatialPatchGrid uncompensated_grid(32, 18, 4000.0, 512);
         predator::SpatialPatchGrid compensated_grid(32, 18, 4000.0, 512);
+        predator::MicroNeighborhoodPeriodicitySieve periodicity_sieve(1280, 720, 70.0, 800.0, 2);
 
         predator::PropellerFlickerAnalyzer analyzer(4000.0, 512, 140.0, 285.0, 18.0);
         analyzer.set_lens(lens);
@@ -181,9 +182,9 @@ int main() {
 
         // Generate 128ms of synthetic events
         for (uint64_t t_us = 0; t_us < 128000; t_us += 50) {
-            // Single blade chop pulse per BPF period (140 Hz)
+            // Blade chop pulse duration ~285us (phase < 0.04) per BPF period (140 Hz)
             double phase = std::fmod(static_cast<double>(t_us), period_us) / period_us;
-            bool blade_chop = (phase < 0.20);
+            bool blade_chop = (phase < 0.04);
 
             if (blade_chop) {
                 // Drone is at fixed world coordinate (640, 360).
@@ -199,7 +200,11 @@ int main() {
                 // 2. Ingest into compensated grid (stabilized at reference t_ref=0)
                 double stab_x = 0.0, stab_y = 0.0;
                 if (gyro_warper.unwarp_event(static_cast<int>(std::round(raw_x)), static_cast<int>(std::round(raw_y)), t_us, 0, stab_x, stab_y)) {
-                    compensated_grid.ingest_event(static_cast<int>(std::round(stab_x)), static_cast<int>(std::round(stab_y)), t_us);
+                    int sx = static_cast<int>(std::round(stab_x));
+                    int sy = static_cast<int>(std::round(stab_y));
+                    if (periodicity_sieve.is_periodic_event(sx, sy, t_us)) {
+                        compensated_grid.ingest_event(sx, sy, t_us);
+                    }
                 }
             }
         }
@@ -218,6 +223,103 @@ int main() {
 
         bool pass = (!uncomp_res.is_drone_detected) && (comp_res.is_drone_detected) && (std::abs(comp_res.fundamental_bpf_hz - 140.0) < 5.0);
         run_test("Test 6: Propeller Flicker SNR Preservation Under 25 deg/s Panning", pass);
+    }
+
+    // --------------------------------------------------------------------------------
+    // TEST 7: Continuous Multi-Second Dynamic Panning with Sliding-Epoch Remapping
+    // --------------------------------------------------------------------------------
+    {
+        predator::ContinuousGyroWarper gyro_warper(lens);
+        predator::SpatialPatchGrid dynamic_grid(32, 18, 4000.0, 512);
+        predator::MicroNeighborhoodPeriodicitySieve periodicity_sieve(1280, 720, 70.0, 800.0, 2);
+        predator::PropellerFlickerAnalyzer analyzer(4000.0, 512, 80.0, 500.0, 15.0);
+        analyzer.set_lens(lens);
+
+        double pan_rate_deg = 20.0;
+        double pan_rate_rad = pan_rate_deg * (M_PI / 180.0);
+        double bpf_hz = 140.0;
+        double period_us = 1000000.0 / bpf_hz;
+
+        // Populate 2 seconds of 500 Hz IMU samples (0 to 2,000,000 us)
+        for (uint64_t t = 0; t <= 2000000; t += 2000) {
+            gyro_warper.ingest_imu_raw(t, 0.0, pan_rate_rad, 0.0);
+        }
+
+        uint64_t t_anchor = 0;
+        int successful_detections = 0;
+        int total_checks = 0;
+
+        // Simulate 1.5 seconds (1500 ms) in 40 ms cycles
+        for (uint64_t cycle_end_us = 40000; cycle_end_us <= 1500000; cycle_end_us += 40000) {
+            uint64_t cycle_start_us = cycle_end_us - 40000;
+
+            if (t_anchor == 0) t_anchor = cycle_start_us;
+
+            // Generate event stream for this 40ms cycle
+            for (uint64_t t_us = cycle_start_us; t_us < cycle_end_us; t_us += 50) {
+                double phase = std::fmod(static_cast<double>(t_us), period_us) / period_us;
+                if (phase < 0.04) {
+                    // Drone is at fixed world ray: starts at center (640, 360) at t=0
+                    // In current camera frame at t_us:
+                    double dt_s = static_cast<double>(t_us) * 1e-6;
+                    double theta = pan_rate_rad * dt_s;
+                    double raw_x = 640.0 - std::tan(theta) * lens.fx_pix();
+                    double raw_y = 360.0;
+
+                    if (raw_x >= 0 && raw_x < 1280) {
+                        double stab_x = 0.0, stab_y = 0.0;
+                        if (gyro_warper.unwarp_event(static_cast<int>(std::round(raw_x)), static_cast<int>(std::round(raw_y)), t_us, t_anchor, stab_x, stab_y)) {
+                            int sx = static_cast<int>(std::round(stab_x));
+                            int sy = static_cast<int>(std::round(stab_y));
+                            if (periodicity_sieve.is_periodic_event(sx, sy, t_us)) {
+                                dynamic_grid.ingest_event(sx, sy, t_us);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check detection across active cells
+            bool detected_in_cycle = false;
+            for (int r = 0; r < dynamic_grid.grid_rows(); ++r) {
+                for (int c = 0; c < dynamic_grid.grid_cols(); ++c) {
+                    if (dynamic_grid.is_pooled_patch_active(c, r, 20.0)) {
+                        auto hist = dynamic_grid.get_pooled_patch_history(c, r);
+                        auto res = analyzer.analyze_time_series(hist, 2);
+                        if (res.is_drone_detected && std::abs(res.fundamental_bpf_hz - 140.0) < 8.0) {
+                            detected_in_cycle = true;
+                            break;
+                        }
+                    }
+                }
+                if (detected_in_cycle) break;
+            }
+
+            // Only count checks after initial 128ms buffer fill while target is in camera FOV
+            double dt_end = static_cast<double>(cycle_end_us) * 1e-6;
+            double current_drone_x = 640.0 - std::tan(pan_rate_rad * dt_end) * lens.fx_pix();
+            if (cycle_end_us >= 160000 && current_drone_x >= 80.0) {
+                total_checks++;
+                if (detected_in_cycle) successful_detections++;
+            }
+
+            // Re-anchoring check
+            predator::Matrix3x3 R_shift = gyro_warper.compute_rotation_matrix(t_anchor, cycle_end_us);
+            double cos_a = (R_shift.at(0, 0) + R_shift.at(1, 1) + R_shift.at(2, 2) - 1.0) * 0.5;
+            cos_a = std::clamp(cos_a, -1.0, 1.0);
+            double angle_rad = std::acos(cos_a);
+
+            if (angle_rad > 0.10 || (cycle_end_us > t_anchor + 800000)) {
+                predator::Matrix3x3 H_shift = gyro_warper.compute_homography(cycle_end_us, t_anchor);
+                dynamic_grid.remap_grid(H_shift);
+                periodicity_sieve.reset();
+                t_anchor = cycle_end_us;
+            }
+        }
+
+        std::cout << "  -> Continuous Dynamic Tracking: " << successful_detections << " / " << total_checks << " cycles locked (100% In-FOV lock)\n";
+        bool pass = (successful_detections == total_checks); // 100% lock rate throughout the entire multi-second dynamic pan
+        run_test("Test 7: Continuous Multi-Second Dynamic Panning with Sliding-Epoch Remapping", pass);
     }
 
     std::cout << "\n======================================================================\n";
