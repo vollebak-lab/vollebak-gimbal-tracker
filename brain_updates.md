@@ -723,3 +723,32 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - `test_ego_motion` (7/7 passed).
   - Live deployment restarted on `predator-camera.service` (PID 99703).
   - Live telemetry confirmed: 0 false alarm candidates, 0 tentative boxes drawn on HUD, 0 false alarms on foliage background (`CombNet: eval=0 det=0 (p_max=0.00)`, 98.8% background suppression), with clean target confirmation for real drone signatures.
+
+---
+
+### 33. Standoff Range Recovery (30ft–100ft) & Cross-Boundary Sieve Gating (Phase 27)
+- **Problem Statement & Root Cause Analysis**:
+  - Following Phase 26 deployment, detection range dropped beyond approximately $30\text{--}40\text{ ft}$, failing to detect the drone even in full sunlight.
+  - *RCA Finding 1 (Micro-Tile Boundary Dropping)*: On 12mm lens ($2469\text{ px/rad}$), a drone rotor at $40\text{--}100\text{ ft}$ projects to only $10\text{--}25\text{ px}$ across with a chord width $\le 1.6\text{ px}$. Aerodynamic hover drift of just $1\text{ cm}$ moves the rotor by $\ge 2\text{ px}$, causing consecutive blade passes to alternate across adjacent $2\times 2$ micro-tiles. The GPU SAE sieve kernel lacked spatial neighbor checking and strictly enforced 30% jitter on a single isolated tile, dropping $\ge 98\%$ of rotor events before entering the temporal ring buffer.
+  - *RCA Finding 2 (Distribution Mismatch in Log-Power Normalization)*: In Phase 26, `median_noise` in `cuda_flicker_core.cu` was clamped to `std::max(0.20f, ...)`. In training (`train_spectral_combnet.py`), the scale floor was $10^{-6}$. For faint distant peaks ($P_{\text{peak}} \approx 0.5\text{--}2.0$) with low noise floor ($0.005$), clamping to $0.20$ squashed normalized peak heights by $73\%$ (from $2.00 \to 0.54$), collapsing `SpectralCombNet` predictions and reducing calculated physical SNR from $>15\text{ dB}$ to $<4\text{ dB}$ (failing validity gates).
+  - *RCA Finding 3 (Disproportionate Activity & Energy Thresholds)*: cuFFT peak analysis required $\ge 15\text{ events}$ unless `max_sieve_hits >= 4` and set `min_energy = 5.0f`. Faint distant rotors generate $6\text{--}12\text{ events}$ in 128ms with peak power $1.5\text{--}3.0$, so both gates rejected them.
+  - *RCA Finding 4 (HUD Total Blackout of Unconfirmed Tentative Targets)*: Telemetry showed the cuFFT detector actually detected the drone at $30\text{--}40\text{ ft}$ (`bpf=249.88 Hz, snr=13.41 dB, tent=1`), but because $M=3$ consecutive frames were required for confirmation and tentative tracks were hidden, the HUD rendered zero boxes.
+- **Architectural & Algorithmic Upgrades**:
+  - `cuda_flicker_core.cu`:
+    1. Implemented 4-neighbor SAE cross-tile boundary check (`dx = {1, -1, 0, 0}, dy = {0, 0, 1, -1}`) in `kernel_warp_sieve_ingest` with $45\%$ jitter tolerance, allowing drifting rotors to retain periodicity across micro-tiles.
+    2. Restored FFT log-power median noise normalization floor to `std::max(1e-4f, ...)` to align runtime spectra with CombNet training.
+    3. Scaled standoff activity requirement to $\ge 6.0\text{ events}$ when `max_sieve_hits >= 2` (was $\ge 4$).
+    4. Included active cells in `get_active_cells_with_spectra` with `hits >= 1 && ev >= 6.0` or `ev >= 18.0`.
+  - `flicker_dsp.hpp`:
+    1. Upgraded track confirmation: confirm in 2 frames ($80\text{ ms}$) if `hit_count >= 2` and `peak_snr_db >= 10.0f` or neural-confirmed.
+    2. Expanded tentative track coasting from 2 to 3 miss frames ($120\text{ ms}$) to bridge sparse standoff sweep intermittency.
+  - `ev_flicker_detector.cpp`:
+    1. Lowered cuFFT search thresholds: `min_energy = 2.5f` (scales to $1.25$ with sieve lock), `min_snr_db = 7.0f` (scales to $4.0\text{ dB}$ with sieve + flatness).
+    2. Lowered neural rescue threshold to `prob >= 0.55f` and `snr >= 5.0f`.
+    3. HUD rendering: draw CONFIRMED targets in Green (`DRONE #id LOCKED`), and ACQUIRING targets (`hit >= 2` or `SNR >= 10.0 dB`) in Amber (`[ACQUIRING #id 2/3]`), while completely suppressing single 1-hit noise blips.
+- **Hardware Verification & Live Deployment (Jetson Orin Nano `orin@10.0.0.34`)**:
+  - `test_cuda_flicker`: 7/7 PASSED (Standoff Weak-Signal Detection PASSED, cuFFT 1.52 ms, CombNet Recognition `Prob=0.9604, SNR=17.1 dB`, Foliage Clutter `Prob=0.0001`).
+  - `test_flicker_dsp`: 12/12 PASSED (Multi-rotor fusion, sieve, bearing geometry).
+  - `test_ego_motion`: 7/7 PASSED (Gyro homography unwarping).
+  - Deployed updated binary and restarted `predator-camera.service` on PID 119638. Live telemetry confirms micro-sieve hit accumulation (`MaxSieve=5`), clean background clutter suppression ($93\%\text{--}99\%$), and zero false alarm clutter.
+

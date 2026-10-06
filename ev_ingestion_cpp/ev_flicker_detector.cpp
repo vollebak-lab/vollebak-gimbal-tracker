@@ -472,10 +472,11 @@ void display_encoder_thread_func(int width, int height) {
             auto ego_stats = g_detection_mgr.get_ego_stats();
 
             // Draw detection bounding boxes and HUD on frame
-            // Render ONLY confirmed drone targets to avoid cluttering HUD with unconfirmed tentative track hypotheses
+            // Render CONFIRMED drone targets in bright green, and ACQUIRING targets (hit >= 2 or SNR >= 10.0 dB) in Amber
             for (const auto& trk : all_tracks) {
-                if (trk.state != predator::SpatialFlickerClusterer::TrackState::CONFIRMED) {
-                    continue; // Suppress tentative tracks from HUD
+                bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
+                if (!is_confirmed && trk.hit_count < 2 && trk.last_detection.peak_snr_db < 10.0f) {
+                    continue; // Suppress single-frame 1-hit noise blips
                 }
                 const auto& d = trk.last_detection;
                 int bx = d.centroid_px_x - 40;
@@ -484,13 +485,18 @@ void display_encoder_thread_func(int width, int height) {
                                      std::min(80, width - std::max(0, bx)), 
                                      std::min(80, height - std::max(0, by)));
                 
-                cv::Scalar box_color(0, 255, 128); // Green for confirmed target
-                cv::rectangle(frame, target_rect, box_color, 2);
+                cv::Scalar box_color = is_confirmed ? cv::Scalar(0, 255, 128) : cv::Scalar(0, 215, 255); // Green vs Amber
+                cv::rectangle(frame, target_rect, box_color, is_confirmed ? 2 : 1);
                 
                 char label[128];
                 const char* net_tag = d.is_neural_detection ? " [NET]" : "";
-                snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
-                         trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
+                if (is_confirmed) {
+                    snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
+                             trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
+                } else {
+                    snprintf(label, sizeof(label), "[ACQUIRING #%d %d/3] %.0fHz [%.1fdB]%s", 
+                             trk.track_id, trk.hit_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
+                }
                 cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
                             cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
             }
@@ -1159,7 +1165,7 @@ int main(int argc, char* argv[]) {
 
             // 3. Batched cuFFT and GPU Spectral Harmonic Analysis across all 1152 cells in parallel (<0.4 ms)
             std::vector<predator::FlickerDetectionResult> raw_detections;
-            cuda_core.execute_batched_spectral_analysis(75.0, 1000.0, 5.0, 8.0, gyro_speed_deg_s, raw_detections);
+            cuda_core.execute_batched_spectral_analysis(75.0, 1000.0, 2.5, 7.0, gyro_speed_deg_s, raw_detections);
 
             // 3b. TensorRT SpectralCombNet Neural Classification on Active Cells (Shade & Weak Signal Boost)
             int spectral_eval_cells = 0;
@@ -1179,7 +1185,7 @@ int main(int argc, char* argv[]) {
                         ptrs[i] = active_spectra[i].data();
                     }
                     std::vector<predator::SpectralPrediction> neural_preds;
-                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.70f);
+                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.55f);
 
                     for (const auto& np : neural_preds) {
                         top_neural_prob = std::max(top_neural_prob, np.drone_prob);
@@ -1194,7 +1200,7 @@ int main(int argc, char* argv[]) {
                                 already_detected = true;
                                 rd.is_neural_detection = true;
                                 rd.neural_drone_prob = np.drone_prob;
-                                if (np.drone_prob > 0.70f) {
+                                if (np.drone_prob > 0.65f) {
                                     rd.confidence = std::min(1.0, rd.confidence + 0.20);
                                 }
                                 break;
@@ -1202,7 +1208,7 @@ int main(int argc, char* argv[]) {
                         }
 
                         // Neural Weak-Signal Rescue: ONLY rescue if cell has true physical peak validity!
-                        if (!already_detected && np.has_valid_peak && np.physical_snr_db >= 6.0f && np.drone_prob >= 0.70f &&
+                        if (!already_detected && np.has_valid_peak && np.physical_snr_db >= 5.0f && np.drone_prob >= 0.55f &&
                             np.fund_freq_hz >= 75.0f && np.fund_freq_hz <= 1000.0f) {
                             predator::FlickerDetectionResult res;
                             res.is_drone_detected = true;

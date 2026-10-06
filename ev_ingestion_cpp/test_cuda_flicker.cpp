@@ -180,7 +180,7 @@ int main() {
         // Log10 median normalization
         std::vector<float> noise_slice(realistic_drone_spec.begin() + 5, realistic_drone_spec.begin() + 128);
         std::sort(noise_slice.begin(), noise_slice.end());
-        float median_noise = std::max(0.20f, noise_slice[noise_slice.size() / 2]);
+        float median_noise = std::max(1e-4f, noise_slice[noise_slice.size() / 2]);
         for (int k = 0; k < 257; ++k) {
             realistic_drone_spec[k] = std::log10(1.0f + realistic_drone_spec[k] / median_noise);
         }

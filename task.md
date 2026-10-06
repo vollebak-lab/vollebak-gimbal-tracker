@@ -145,3 +145,11 @@
   - [x] Retrain `SpectralCombNet` on DGX Spark (`100.114.14.56`) with sparse Poisson event impulse noise ($N \in [4, 50]$ events) and negative purity loss, export ONNX, and compile TRT FP16 engine on Orin Nano.
   - [x] Verify unit tests on Orin Nano, deploy updated binary, and verify clean live tracking of drone against foliage background.
 
+- [x] **Phase 27: Standoff Range Recovery (30ft–100ft) & Cross-Boundary Sieve Gating**
+  - [x] Identify root causes of detection range loss at 30-40ft+ (single-tile SAE micro-sieve boundary crossing during hover drift dropping periodic events; log-power median noise clamped to 0.20 squashing faint harmonic combs; cuFFT activity gate requiring 15-25 events; and HUD suppression of unconfirmed tentative tracks).
+  - [x] Implement 4-neighbor SAE cross-tile boundary check in `kernel_warp_sieve_ingest` with 45% periodic jitter tolerance and intra-burst retention.
+  - [x] Restore FFT log-power median noise normalization scale to $\ge 10^{-4}$ in `cuda_flicker_core.cu`, matching PyTorch training distribution and preserving weak-signal harmonic comb contrast.
+  - [x] Calibrate cuFFT standoff activity density ($\ge 6.0\text{ events}$ when `max_sieve_hits >= 2`) and energy threshold ($2.5\text{ peak power}$, scaling to $1.25$ with sieve lock).
+  - [x] Upgraded tracker confirmation: confirm in 2 frames ($80\text{ ms}$) if $\text{SNR} \ge 10.0\text{ dB}$ or neural-confirmed; expanded tentative coasting to 3 miss frames ($120\text{ ms}$) across sparse blade sweep dropouts.
+  - [x] Upgraded HUD rendering to display ACQUIRING targets (hit $\ge 2$ or $\text{SNR} \ge 10.0\text{ dB}$) in Amber, and CONFIRMED targets in Green, while completely suppressing 1-hit noise blips.
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed) and deployed live binary to `predator-camera.service` on Jetson Orin Nano (PID 119638).

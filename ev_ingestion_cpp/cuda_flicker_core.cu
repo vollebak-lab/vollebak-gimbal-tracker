@@ -111,35 +111,65 @@ __global__ void kernel_warp_sieve_ingest(
     uint32_t dt = t_cur - t_last;
     bool is_periodic = false;
 
-    // 4. Intra-burst event (< 250 us): Event belongs to the SAME active blade sweep!
-    if (dt < 250) {
+    // 4. Intra-burst event (< min_period_us): Event belongs to the SAME active blade sweep!
+    if (dt < min_period_us) {
         if (sae_hits[tile_idx] >= 2) {
             is_periodic = true;
         }
     }
     // 5. Inter-blade period match [min_period, max_period] (75 Hz to 1200 Hz => 833 us to 13333 us)
-    else if (dt >= min_period_us && dt <= max_period_us) {
+    else if (dt <= max_period_us) {
         uint32_t prev_dt = sae_last_dt_us[tile_idx];
-        if (prev_dt > 0) {
-            uint32_t delta = (dt > prev_dt) ? (dt - prev_dt) : (prev_dt - dt);
-            // Strict periodic jitter tolerance <= 30% between consecutive blade chops
-            if (delta * 100 <= prev_dt * 30) {
-                uint8_t h = sae_hits[tile_idx];
-                if (h < 255) h++;
-                sae_hits[tile_idx] = h;
-                if (h >= 2) {
-                    is_periodic = true;
-                }
-            } else {
-                sae_hits[tile_idx] = 1;
+        bool period_consistent = (prev_dt > 0) &&
+            (((dt > prev_dt) ? (dt - prev_dt) : (prev_dt - dt)) * 100 <= prev_dt * 45); // 45% jitter tolerance
+
+        if (period_consistent) {
+            uint8_t h = sae_hits[tile_idx];
+            if (h < 255) h++;
+            sae_hits[tile_idx] = h;
+            if (h >= 2) {
+                is_periodic = true;
             }
         } else {
             sae_hits[tile_idx] = 1;
         }
         sae_last_dt_us[tile_idx] = dt;
     }
-    // 6. Non-rotor edge transient (250us <= dt < min_period_us) or time gap > max_period_us: Reset tracking
-    else {
+
+    // 6. Cross-tile neighbor boundary check (for small rotors at 30-100ft drifting across 2x2 micro-tiles)
+    if (!is_periodic) {
+        const int n_offsets[4][2] = { {1, 0}, {-1, 0}, {0, 1}, {0, -1} };
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            int nx = tx + n_offsets[k][0];
+            int ny = ty + n_offsets[k][1];
+            if (nx >= 0 && nx < tile_w && ny >= 0 && ny < tile_h) {
+                int n_idx = ny * tile_w + nx;
+                uint32_t nt_last = sae_timestamp_us[n_idx];
+                if (nt_last > 0 && t_cur > nt_last) {
+                    uint32_t ndt = t_cur - nt_last;
+                    if (ndt >= min_period_us && ndt <= max_period_us) {
+                        uint32_t nprev_dt = sae_last_dt_us[n_idx];
+                        bool n_consistent = (nprev_dt > 0) &&
+                            (((ndt > nprev_dt) ? (ndt - nprev_dt) : (nprev_dt - ndt)) * 100 <= nprev_dt * 45);
+                        if (n_consistent) {
+                            uint8_t nh = sae_hits[n_idx];
+                            uint8_t h = (nh < 255) ? (nh + 1) : 255;
+                            sae_hits[tile_idx] = h;
+                            sae_last_dt_us[tile_idx] = ndt;
+                            if (h >= 2) {
+                                is_periodic = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Time gap > max_period_us: Reset tracking
+    if (dt > max_period_us && !is_periodic) {
         sae_hits[tile_idx] = 0;
         sae_last_dt_us[tile_idx] = 0;
     }
@@ -268,9 +298,9 @@ __global__ void kernel_analyze_spectral_peaks(
     }
 
     // Standoff Dynamic Activity Gate:
-    // If a 2x2 micro-tile has locked into repetitive periodic blade passes (>= 4 hits),
+    // If a 2x2 micro-tile has locked into repetitive periodic blade passes (>= 2 hits),
     // allow weak standoff signals with as few as 6 events!
-    float min_activity_req = (max_sieve_hits >= 4) ? 6.0f : (is_pooled ? 25.0f : 15.0f);
+    float min_activity_req = (max_sieve_hits >= 2) ? 6.0f : (is_pooled ? 20.0f : 12.0f);
     if (total_events < min_activity_req) return;
 
     // Peak search using Harmonic Product Spectrum (HPS) in [min_freq_hz, max_freq_hz] (bins 9 to 102 for 70..800 Hz)
@@ -299,7 +329,7 @@ __global__ void kernel_analyze_spectral_peaks(
     float max_hps = 0.0f;
 
     // Minimum energy threshold: scale down if high-purity micro-sieve hit
-    float effective_min_energy = (max_sieve_hits >= 4) ? (0.5f * min_energy) : min_energy;
+    float effective_min_energy = (max_sieve_hits >= 2) ? (0.5f * min_energy) : min_energy;
 
     for (int k = min_bin; k <= max_bin; ++k) {
         float p1 = power[k];
@@ -419,7 +449,7 @@ __global__ void kernel_analyze_spectral_peaks(
     float snr_db = 10.0f * log10f(max(1.0f, snr_linear));
 
     // Dynamic SNR Threshold: Standoff low-SNR tolerance if confirmed by DDHF flatness and micro-sieve
-    float effective_min_snr = (max_sieve_hits >= 4 && spectral_flatness < 0.15f) ? (min_snr_db - 3.0f) : min_snr_db;
+    float effective_min_snr = (max_sieve_hits >= 2 && spectral_flatness < 0.18f) ? (min_snr_db - 3.0f) : min_snr_db;
     if (snr_db < effective_min_snr) return;
 
     // Harmonic Bonus (2nd and 3rd harmonics)
@@ -429,7 +459,7 @@ __global__ void kernel_analyze_spectral_peaks(
 
     // Standoff DDHF Flatness Bonus & Micro-Sieve Bonus
     float flatness_bonus = (spectral_flatness < 0.18f) ? (0.25f * (0.18f - spectral_flatness) / 0.18f) : 0.0f;
-    float sieve_bonus = (max_sieve_hits >= 4) ? 0.15f : 0.0f;
+    float sieve_bonus = (max_sieve_hits >= 2) ? 0.15f : 0.0f;
 
     float fund_score = min(1.0f, max(0.20f, (snr_db - 6.0f) / 10.0f));
     float confidence = min(1.0f, fund_score + harmonic_bonus + flatness_bonus + sieve_bonus);
@@ -766,12 +796,12 @@ void CudaFlickerCore::get_active_cells_with_spectra(
     CUDA_CHECK(cudaMemcpy(h_cell_totals_, d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_cell_sieve_hits_, d_cell_max_sieve_hits_, num_total_cells_ * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    // Identify active base and pooled cells that exhibit periodic micro-sieve confirmation (>= 2 hits)
-    // or high activity density (>= 25.0 events) to reject aperiodic sparse foliage clutter
+    // Identify active base and pooled cells that exhibit periodic micro-sieve confirmation (>= 1 hit)
+    // or moderate activity density (>= 18.0 events)
     for (int i = 0; i < num_total_cells_; ++i) {
         float ev = h_cell_totals_[i];
         uint32_t hits = h_cell_sieve_hits_[i];
-        if ((hits >= 2 && ev >= min_events) || (ev >= 25.0f)) {
+        if ((hits >= 1 && ev >= min_events) || (ev >= 18.0f)) {
             out_cell_indices.push_back(i);
             if (out_cell_indices.size() >= 128) break; // Capped at max batch size
         }
@@ -798,7 +828,7 @@ void CudaFlickerCore::get_active_cells_with_spectra(
         auto& spec = out_spectra[b];
         std::vector<float> noise_slice(spec.begin() + 5, spec.begin() + 128);
         std::sort(noise_slice.begin(), noise_slice.end());
-        float median_noise = std::max(0.20f, noise_slice[noise_slice.size() / 2]);
+        float median_noise = std::max(1e-4f, noise_slice[noise_slice.size() / 2]);
         for (int k = 0; k < 257; ++k) {
             spec[k] = std::log10(1.0f + spec[k] / median_noise);
         }
