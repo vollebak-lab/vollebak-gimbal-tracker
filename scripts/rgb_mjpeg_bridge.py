@@ -13,17 +13,59 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 
 
+def _open_capture(source: int, width: int, height: int, fps: int):
+    """Open and configure one DirectShow camera index."""
+    backend = cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else cv2.CAP_ANY
+    capture = cv2.VideoCapture(source, backend)
+    if not capture.isOpened():
+        capture.release()
+        return None
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if hasattr(cv2, "VideoWriter_fourcc"):
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    capture.set(cv2.CAP_PROP_FPS, fps)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return capture
+
+
+def _select_fastest_source(width: int, height: int, fps: int) -> int:
+    """Choose the camera that can actually deliver the highest frame rate.
+
+    DirectShow indexes can change whenever USB devices are reattached. Measuring
+    the candidates is more reliable than assuming that the MX Brio is index 0.
+    """
+    best_source = -1
+    best_rate = 0.0
+    for candidate in range(4):
+        capture = _open_capture(candidate, width, height, fps)
+        if capture is None:
+            continue
+        frames = 0
+        started = time.monotonic()
+        deadline = started + 1.5
+        while time.monotonic() < deadline:
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                frames += 1
+        elapsed = max(time.monotonic() - started, 1e-6)
+        measured = frames / elapsed
+        capture.release()
+        if measured > best_rate:
+            best_source = candidate
+            best_rate = measured
+    if best_source < 0:
+        raise RuntimeError("Could not open any Windows camera source")
+    return best_source
+
+
 class CameraBridge:
     def __init__(self, source: int, width: int, height: int, fps: int, quality: int) -> None:
-        backend = cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else cv2.CAP_ANY
-        self.capture = cv2.VideoCapture(source, backend)
-        if hasattr(cv2, "VideoWriter_fourcc"):
-            self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.capture.set(cv2.CAP_PROP_FPS, fps)
-        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.capture.isOpened():
+        self.source = (
+            _select_fastest_source(width, height, fps) if source < 0 else source
+        )
+        self.capture = _open_capture(self.source, width, height, fps)
+        if self.capture is None:
             raise RuntimeError(f"Could not open camera source {source}")
 
         self.quality = quality
@@ -76,6 +118,7 @@ def make_handler(bridge: CameraBridge):
                     {
                         "ok": bridge.frame is not None,
                         "fps": round(bridge.measured_fps, 1),
+                        "source": bridge.source,
                         "width": bridge.actual_width,
                         "height": bridge.actual_height,
                     }
@@ -98,7 +141,9 @@ def make_handler(bridge: CameraBridge):
                 while not bridge.stopped.is_set():
                     with bridge.condition:
                         bridge.condition.wait_for(
-                            lambda: bridge.frame_id != previous_id or bridge.stopped.is_set(),
+                            lambda frame_id=previous_id: (
+                                bridge.frame_id != frame_id or bridge.stopped.is_set()
+                            ),
                             timeout=2.0,
                         )
                         previous_id = bridge.frame_id
@@ -120,7 +165,12 @@ def make_handler(bridge: CameraBridge):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=int, default=0)
+    parser.add_argument(
+        "--source",
+        type=int,
+        default=-1,
+        help="DirectShow camera index; -1 probes and selects the fastest camera",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8082)
     parser.add_argument("--width", type=int, default=640)

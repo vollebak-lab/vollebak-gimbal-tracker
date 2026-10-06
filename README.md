@@ -13,6 +13,17 @@ The GUI also exposes the readiness of Bart's layered stack without pretending di
 
 See [Bart integration audit](docs/bart-integration-audit.md) for the component-by-component review.
 
+## One-click handoff
+
+For the prepared Windows laptop and Raspberry Pi pair, daily operation is now:
+
+1. Connect and power the hardware.
+2. Double-click `RUN_SYSTEM.cmd`.
+3. Confirm camera health in the browser, clear the gimbal area, and press **START TRACKING**.
+4. Double-click `STOP_SYSTEM.cmd` when finished.
+
+The launcher restores the Logitech bridge, WSL IMX636 detector, USB/IP attachment, both SSH tunnels, Pi dashboard, and browser automatically. It always starts tracking paused and homes the gimbal. Run `SETUP_HANDOFF.cmd` once when provisioning another operator or laptop. See [system handoff](docs/HANDOFF.md) for prerequisites and troubleshooting.
+
 ## Run it now
 
 ```powershell
@@ -21,7 +32,7 @@ cd C:\Users\gutie\Downloads\vollebak-gimbal-tracker
 gimbal-tracker ui -c config/dev.yaml
 ```
 
-Open <http://127.0.0.1:8080>. Camera index `0` is configured for the Logitech camera. If it is unavailable, the app falls back to a synthetic target and probes for the camera every five seconds.
+Open <http://127.0.0.1:8080>. The Windows bridge probes the available DirectShow indexes and selects the camera delivering the highest frame rate, so reconnecting USB devices does not silently switch tracking to a slow built-in/IR camera. If no camera is available, the app falls back to a synthetic target and probes again every five seconds.
 
 The development dashboard also consumes Bart's event-camera service at <http://127.0.0.1:8081>. On this Windows workstation the IDS camera is passed into WSL with `usbipd`; both event services cap the sensor in hardware at 10 MEv/s to stay within the virtual USB bridge's practical limit. Use the feed selector in the dashboard to switch between `LOGITECH RGB` and `IMX636 EVENT`.
 

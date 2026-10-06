@@ -58,5 +58,7 @@ captures/
 *.avi
 *.mp4
 .env
+.pi-ssh/
+.runtime/
 .edge-qa*/
 dashboard-qa*.png

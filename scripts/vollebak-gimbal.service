@@ -1,13 +1,14 @@
 [Unit]
 Description=Vollebak fixed-camera gimbal tracker
-After=multi-user.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=vollebak
 WorkingDirectory=/home/vollebak/vollebak-gimbal-tracker
 ExecStart=/home/vollebak/vollebak-gimbal-tracker/.venv/bin/gimbal-tracker ui -c config/pi.yaml --host 0.0.0.0 --port 8080
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 [Install]

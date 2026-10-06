@@ -1,0 +1,29 @@
+VOLLEBAK GIMBAL - OPERATOR QUICK START
+======================================
+
+NORMAL START
+1. Give the gimbal clear space and connect its external 12 V power.
+2. Connect the Pi Ethernet cable, Logitech camera, and IMX636 event camera.
+3. Power on the Raspberry Pi and wait 30 seconds.
+4. Double-click RUN_SYSTEM.cmd.
+5. Wait for http://192.168.0.3:8080 to open.
+6. Confirm LOGITECH and IMX636 show ONLINE.
+7. Clear people and cables, then click START TRACKING.
+
+NORMAL STOP
+1. Double-click STOP_SYSTEM.cmd.
+2. Wait for "gimbal parked."
+3. Turn off servo power before handling the mechanism.
+
+FIRST TIME ON A NEW WINDOWS USER OR FRESH CHECKOUT
+1. Connect the hardware and Pi.
+2. Double-click SETUP_HANDOFF.cmd.
+3. Approve the Windows administrator prompt if shown.
+4. Enter the Pi password when requested.
+5. Use RUN_SYSTEM.cmd from then on.
+
+The launcher always starts paused and centers the gimbal. It does not begin
+tracking until the operator clicks START TRACKING.
+
+If anything fails, read docs\HANDOFF.md. For an unsafe movement, disconnect the
+physical servo power immediately; do not rely on software as an emergency stop.
