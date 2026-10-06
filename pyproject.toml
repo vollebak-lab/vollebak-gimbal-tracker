@@ -16,7 +16,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vision = ["opencv-python>=4.8,<5"]
+vision = [
+  "opencv-python>=4.8,<5",
+  "pygrabber==0.2; platform_system == 'Windows'",
+]
 dev = ["pytest>=8,<9", "ruff>=0.8,<1"]
 
 [project.scripts]

@@ -32,7 +32,7 @@ cd C:\Users\gutie\Downloads\vollebak-gimbal-tracker
 gimbal-tracker ui -c config/dev.yaml
 ```
 
-Open <http://127.0.0.1:8080>. The Windows bridge probes the available DirectShow indexes and selects the camera delivering the highest frame rate, so reconnecting USB devices does not silently switch tracking to a slow built-in/IR camera. If no camera is available, the app falls back to a synthetic target and probes again every five seconds.
+Open <http://127.0.0.1:8080>. The Windows bridge selects the DirectShow device named `MX Brio`; only if named-device enumeration is unavailable does it probe indexes for the fastest camera. This prevents the laptop webcam from silently replacing the external tracking camera when USB indexes change. If no camera is available, the app falls back to a synthetic target and probes again every five seconds.
 
 The development dashboard also consumes Bart's event-camera service at <http://127.0.0.1:8081>. On this Windows workstation the IDS camera is passed into WSL with `usbipd`; both event services cap the sensor in hardware at 10 MEv/s to stay within the virtual USB bridge's practical limit. Use the feed selector in the dashboard to switch between `LOGITECH RGB` and `IMX636 EVENT`.
 

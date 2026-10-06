@@ -28,7 +28,7 @@ At the end of a session, double-click `STOP_SYSTEM.cmd`. It pauses tracking, ret
 `RUN_SYSTEM.cmd` calls `scripts/start_system.ps1`, which:
 
 1. Verifies passwordless SSH access to the Pi.
-2. Probes Windows camera indexes, automatically selects the full-rate camera, and starts or verifies the Logitech MJPEG bridge on laptop port `8082`.
+2. Selects the Windows DirectShow device named `MX Brio` (independent of USB index) and starts or verifies its MJPEG bridge on laptop port `8082`.
 3. Keeps Ubuntu WSL running.
 4. Finds USB VID/PID `1409:8e00` and attaches the IMX636 through `usbipd`.
 5. Starts or verifies Bart's OpenEB CPU detector on laptop/WSL port `8081`.
@@ -119,7 +119,7 @@ Stop and detach the IMX636 from WSL:
 
 - **Pi unavailable:** verify the direct Ethernet adapter is up and has `192.168.0.2/24`, then ping `192.168.0.3`.
 - **Logitech says demo:** rerun `RUN_SYSTEM.cmd`; it recreates the port-8082 tunnel.
-- **Wrong/slow RGB camera:** rerun `RUN_SYSTEM.cmd`; it measures the available cameras and selects the fastest source instead of relying on a USB index.
+- **Wrong/slow RGB camera:** rerun `RUN_SYSTEM.cmd`; it validates the friendly name and rebuilds the bridge on `MX Brio` instead of relying on a USB index.
 - **Event tab disabled:** ensure the IMX636 appears in `usbipd list`, then rerun the launcher.
 - **Event camera times out:** unplug/reconnect the IMX636 or run `usbipd detach --busid <BUSID>` before rerunning the launcher.
 - **Gimbal unavailable:** verify external 12 V power, `/dev/ttyUSB0`, and membership of the Pi user in the `dialout` group.

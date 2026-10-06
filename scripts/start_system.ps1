@@ -79,6 +79,17 @@ function Convert-ToWslPath([string]$WindowsPath) {
     return "/mnt/$drive/$tail"
 }
 
+function Invoke-Usbipd([string[]]$Arguments, [int]$TimeoutSeconds = 10) {
+    $process = Start-Process -FilePath "usbipd.exe" -ArgumentList $Arguments `
+        -WindowStyle Hidden -PassThru
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        Write-Warning "usbipd $($Arguments -join ' ') timed out after ${TimeoutSeconds}s."
+        return $false
+    }
+    return ($process.ExitCode -eq 0)
+}
+
 $SshArgs = @(
     "-i", $KeyPath,
     "-o", "BatchMode=yes",
@@ -136,7 +147,8 @@ $null = Invoke-Pi "true"
 
 $python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 $rgbArgs = @(
-    "scripts/rgb_mjpeg_bridge.py", "--source", "-1", "--host", "127.0.0.1", "--port", "8082",
+    "scripts/rgb_mjpeg_bridge.py", "--source", "-1", "--preferred-name", "Brio",
+    "--host", "127.0.0.1", "--port", "8082",
     "--width", "640", "--height", "480", "--fps", "30", "--quality", "60"
 )
 if (-not (Test-JsonEndpoint "http://127.0.0.1:8082/health")) {
@@ -169,22 +181,29 @@ if (-not (Test-JsonEndpoint "http://127.0.0.1:8081/stats")) {
             # Reset an offline device before launching OpenEB.
             if ($cameraLine -match '\bAttached\b') {
                 Write-Step "Resetting stale/offline IMX636 USB attachment"
-                & usbipd detach --busid $busId | Out-Host
+                $null = Invoke-Usbipd -Arguments @("detach", "--busid", $busId)
                 Start-Sleep -Seconds 1
             }
             Write-Step "Attaching IMX636 USB device $busId to WSL"
-            & usbipd attach --wsl --busid $busId | Out-Host
+            $null = Invoke-Usbipd -Arguments @("attach", "--wsl", "--busid", $busId)
             Start-Sleep -Seconds 1
 
-            $wslRepo = Convert-ToWslPath $RepoRoot
-            $null = Start-TrackedProcess "event-detector" "wsl.exe" @(
-                "-d", $WslDistro, "--", "bash", "$wslRepo/scripts/run_event_detector_wsl.sh"
-            )
-            try {
-                Wait-For "IMX636 detector" { Test-JsonEndpoint "http://127.0.0.1:8081/stats" } 20
-                $eventAvailable = $true
-            } catch {
-                Write-Warning "IMX636 detector did not start. RGB tracking will still work. $($_.Exception.Message)"
+            $refreshedLine = @(& usbipd list) |
+                Where-Object { $_ -match [regex]::Escape($EventCameraVidPid) } |
+                Select-Object -First 1
+            if ($refreshedLine -match '\bAttached\b') {
+                $wslRepo = Convert-ToWslPath $RepoRoot
+                $null = Start-TrackedProcess "event-detector" "wsl.exe" @(
+                    "-d", $WslDistro, "--", "bash", "$wslRepo/scripts/run_event_detector_wsl.sh"
+                )
+                try {
+                    Wait-For "IMX636 detector" { Test-JsonEndpoint "http://127.0.0.1:8081/stats" } 20
+                    $eventAvailable = $true
+                } catch {
+                    Write-Warning "IMX636 detector did not start. RGB tracking will still work. $($_.Exception.Message)"
+                }
+            } else {
+                Write-Warning "IMX636 did not attach to WSL. Continuing with MX Brio tracking."
             }
         }
     } else {
@@ -198,8 +217,10 @@ if (-not (Test-JsonEndpoint "http://127.0.0.1:8081/stats")) {
 # Resetting/attaching the SuperSpeed event camera can disturb another camera
 # already open through DirectShow. Recover the Brio if its measured rate fell.
 $rgbHealth = Invoke-RestMethod -Uri "http://127.0.0.1:8082/health" -TimeoutSec 5
-if ([double]$rgbHealth.fps -lt 20.0) {
-    Write-Step "Restarting Logitech bridge after USB reset"
+$hasSourceName = $rgbHealth.PSObject.Properties.Name -contains "source_name"
+$isLogitech = $hasSourceName -and ($rgbHealth.source_name -match 'Brio|Logitech')
+if ([double]$rgbHealth.fps -lt 15.0 -or -not $isLogitech) {
+    Write-Step "Restarting bridge on the named Logitech MX Brio"
     Get-NetTCPConnection -LocalPort 8082 -State Listen -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique |
         ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
@@ -209,7 +230,12 @@ if ([double]$rgbHealth.fps -lt 20.0) {
     Wait-For "full-rate Logitech bridge" {
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:8082/health" -TimeoutSec 3
-            return ([double]$health.fps -ge 20.0)
+            $named = $health.PSObject.Properties.Name -contains "source_name"
+            return (
+                [double]$health.fps -ge 15.0 -and
+                $named -and
+                $health.source_name -match 'Brio|Logitech'
+            )
         } catch {
             return $false
         }
@@ -253,7 +279,7 @@ if ($StartTracking) {
 Wait-For "settled Pi camera telemetry" {
     try {
         $readyState = Invoke-RestMethod -Uri "$DashboardUrl/api/state" -TimeoutSec 3
-        $rgbReady = $readyState.camera_mode -eq "live" -and [double]$readyState.fps -ge 20.0
+        $rgbReady = $readyState.camera_mode -eq "live" -and [double]$readyState.fps -ge 15.0
         $eventReady = (-not $eventAvailable) -or [bool]$readyState.event_camera.connected
         return ($rgbReady -and $eventReady)
     } catch {

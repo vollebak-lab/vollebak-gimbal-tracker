@@ -59,11 +59,41 @@ def _select_fastest_source(width: int, height: int, fps: int) -> int:
     return best_source
 
 
+def _find_named_source(preferred_name: str) -> tuple[int, str] | None:
+    """Resolve a DirectShow friendly name to the matching OpenCV index."""
+    if not preferred_name:
+        return None
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+
+        devices = FilterGraph().get_input_devices()
+    except (ImportError, OSError):
+        return None
+    needle = preferred_name.casefold()
+    for index, name in enumerate(devices):
+        if needle in name.casefold():
+            return index, name
+    return None
+
+
 class CameraBridge:
-    def __init__(self, source: int, width: int, height: int, fps: int, quality: int) -> None:
-        self.source = (
-            _select_fastest_source(width, height, fps) if source < 0 else source
-        )
+    def __init__(
+        self,
+        source: int,
+        preferred_name: str,
+        width: int,
+        height: int,
+        fps: int,
+        quality: int,
+    ) -> None:
+        named_source = _find_named_source(preferred_name) if source < 0 else None
+        if named_source:
+            self.source, self.source_name = named_source
+        else:
+            self.source = (
+                _select_fastest_source(width, height, fps) if source < 0 else source
+            )
+            self.source_name = f"DirectShow index {self.source}"
         self.capture = _open_capture(self.source, width, height, fps)
         if self.capture is None:
             raise RuntimeError(f"Could not open camera source {source}")
@@ -119,6 +149,7 @@ def make_handler(bridge: CameraBridge):
                         "ok": bridge.frame is not None,
                         "fps": round(bridge.measured_fps, 1),
                         "source": bridge.source,
+                        "source_name": bridge.source_name,
                         "width": bridge.actual_width,
                         "height": bridge.actual_height,
                     }
@@ -171,6 +202,11 @@ def main() -> None:
         default=-1,
         help="DirectShow camera index; -1 probes and selects the fastest camera",
     )
+    parser.add_argument(
+        "--preferred-name",
+        default="MX Brio",
+        help="DirectShow friendly-name fragment preferred during automatic selection",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8082)
     parser.add_argument("--width", type=int, default=640)
@@ -179,7 +215,14 @@ def main() -> None:
     parser.add_argument("--quality", type=int, default=70)
     args = parser.parse_args()
 
-    bridge = CameraBridge(args.source, args.width, args.height, args.fps, args.quality)
+    bridge = CameraBridge(
+        args.source,
+        args.preferred_name,
+        args.width,
+        args.height,
+        args.fps,
+        args.quality,
+    )
     worker = threading.Thread(target=bridge.run, name="rgb-capture", daemon=True)
     worker.start()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(bridge))
