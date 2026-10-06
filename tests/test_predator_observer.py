@@ -41,6 +41,8 @@ def test_predator_uses_live_event_target_bearing():
             "spectral_detections": 1,
         },
         "num_targets": 1,
+        "num_tracks": 2,
+        "roi_diagnostics": {"active_cells": 14, "max_sieve_hits": 5},
         "targets": [
             {
                 "bpf_hz": 180.0,
@@ -66,6 +68,9 @@ def test_predator_uses_live_event_target_bearing():
     assert telemetry["layer1"]["detector"] == "MOTION + BART COMBNET"
     assert telemetry["layer1"]["imu_connected"] is True
     assert telemetry["layer1"]["spectral_detections"] == 1
+    assert telemetry["layer1"]["event_tracks"] == 2
+    assert telemetry["layer1"]["roi_active_cells"] == 14
+    assert telemetry["layer1"]["roi_max_sieve_hits"] == 5
     assert telemetry["layer1"]["bpf_hz"] == 180.0
     assert telemetry["layer3"]["mode"] == "EVENT FLICKER BEARING"
     assert telemetry["layer3"]["azimuth_deg"] == 4.5

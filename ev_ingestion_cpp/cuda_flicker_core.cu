@@ -67,10 +67,8 @@ __global__ void kernel_warp_sieve_ingest(
     float stab_x = (H[0] * x + H[1] * y + H[2]) * inv_denom;
     float stab_y = (H[3] * x + H[4] * y + H[5]) * inv_denom;
 
-    if (stab_x < 0.0f || stab_x >= static_cast<float>(width) ||
-        stab_y < 0.0f || stab_y >= static_cast<float>(height)) {
-        return;
-    }
+    stab_x = fmaxf(0.0f, fminf(static_cast<float>(width - 1), stab_x));
+    stab_y = fmaxf(0.0f, fminf(static_cast<float>(height - 1), stab_y));
 
     // 2. Direct-to-GPU TensorRT Ego-Motion Suppression Gating
     if (suppression_mask != nullptr) {
@@ -98,32 +96,28 @@ __global__ void kernel_warp_sieve_ingest(
     // 3. Atomic timestamp exchange to serialize concurrent micro-tile events
     uint32_t t_last = atomicExch(&sae_timestamp_us[tile_idx], t_cur);
 
+    bool is_periodic = false;
     if (t_last == 0) {
         sae_hits[tile_idx] = 0;
         sae_last_dt_us[tile_idx] = 0;
-        return;
-    }
-
-    if (t_cur < t_last) {
+    } else if (t_cur < t_last) {
         return; // Reject out-of-order bus packets
-    }
+    } else {
+        uint32_t dt = t_cur - t_last;
 
-    uint32_t dt = t_cur - t_last;
-    bool is_periodic = false;
-
-    // 4. Intra-burst event (< 250 us): Event belongs to the SAME active blade sweep!
-    if (dt < 250) {
-        if (sae_hits[tile_idx] >= 2) {
-            is_periodic = true;
+        // 4. Intra-burst event (< min_period_us): Event belongs to the SAME active blade sweep!
+        if (dt < min_period_us) {
+            if (sae_hits[tile_idx] >= 2) {
+                is_periodic = true;
+            }
         }
-    }
-    // 5. Inter-blade period match [min_period, max_period] (75 Hz to 1200 Hz => 833 us to 13333 us)
-    else if (dt >= min_period_us && dt <= max_period_us) {
-        uint32_t prev_dt = sae_last_dt_us[tile_idx];
-        if (prev_dt > 0) {
-            uint32_t delta = (dt > prev_dt) ? (dt - prev_dt) : (prev_dt - dt);
-            // Strict periodic jitter tolerance <= 30% between consecutive blade chops
-            if (delta * 100 <= prev_dt * 30) {
+        // 5. Inter-blade period match [min_period, max_period] (75 Hz to 1200 Hz => 833 us to 13333 us)
+        else if (dt <= max_period_us) {
+            uint32_t prev_dt = sae_last_dt_us[tile_idx];
+            bool period_consistent = (prev_dt > 0) &&
+                (((dt > prev_dt) ? (dt - prev_dt) : (prev_dt - dt)) * 100 <= prev_dt * 45); // 45% jitter tolerance
+
+            if (period_consistent) {
                 uint8_t h = sae_hits[tile_idx];
                 if (h < 255) h++;
                 sae_hits[tile_idx] = h;
@@ -133,22 +127,54 @@ __global__ void kernel_warp_sieve_ingest(
             } else {
                 sae_hits[tile_idx] = 1;
             }
-        } else {
-            sae_hits[tile_idx] = 1;
+            sae_last_dt_us[tile_idx] = dt;
         }
-        sae_last_dt_us[tile_idx] = dt;
+
+        // 6. Cross-tile neighbor boundary check (for small rotors at 30-100ft drifting across 2x2 micro-tiles)
+        if (!is_periodic) {
+            const int n_offsets[4][2] = { {1, 0}, {-1, 0}, {0, 1}, {0, -1} };
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                int nx = tx + n_offsets[k][0];
+                int ny = ty + n_offsets[k][1];
+                if (nx >= 0 && nx < tile_w && ny >= 0 && ny < tile_h) {
+                    int n_idx = ny * tile_w + nx;
+                    uint32_t nt_last = sae_timestamp_us[n_idx];
+                    if (nt_last > 0 && t_cur > nt_last) {
+                        uint32_t ndt = t_cur - nt_last;
+                        if (ndt >= min_period_us && ndt <= max_period_us) {
+                            uint32_t nprev_dt = sae_last_dt_us[n_idx];
+                            bool n_consistent = (nprev_dt > 0) &&
+                                (((ndt > nprev_dt) ? (ndt - nprev_dt) : (nprev_dt - ndt)) * 100 <= nprev_dt * 45);
+                            if (n_consistent) {
+                                uint8_t nh = sae_hits[n_idx];
+                                uint8_t h = (nh < 255) ? (nh + 1) : 255;
+                                sae_hits[tile_idx] = h;
+                                sae_last_dt_us[tile_idx] = ndt;
+                                if (h >= 2) {
+                                    is_periodic = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 7. Time gap > max_period_us: Reset tracking
+        if (dt > max_period_us && !is_periodic) {
+            sae_hits[tile_idx] = 0;
+            sae_last_dt_us[tile_idx] = 0;
+        }
     }
-    // 6. Non-rotor edge transient (250us <= dt < min_period_us) or time gap > max_period_us: Reset tracking
-    else {
-        sae_hits[tile_idx] = 0;
-        sae_last_dt_us[tile_idx] = 0;
+
+    if (is_periodic) {
+        atomicAdd(retained_counter, 1);
     }
 
-    if (!is_periodic) return;
-
-    atomicAdd(retained_counter, 1);
-
-    // 7. Accumulate into base spatial grid (32 cols x 18 rows, 40x40 px cells)
+    // 8. Accumulate into base spatial grid (32 cols x 18 rows, 40x40 px cells)
+    // Preserves all unsuppressed events so the 512-point cuFFT can perform 128ms coherent matched filtering
     int col = sx / 40;
     int row = sy / 40;
     if (col < 0) col = 0; if (col >= 32) col = 31;
@@ -157,17 +183,17 @@ __global__ void kernel_warp_sieve_ingest(
     int cell_idx = row * 32 + col;
     atomicAdd(&ring_buffers[cell_idx * 512 + head_idx], 1.0f);
     atomicAdd(&cell_total_events[cell_idx], 1.0f);
-    if (cell_max_sieve_hits != nullptr) {
+    if (cell_max_sieve_hits != nullptr && is_periodic) {
         atomicMax(&cell_max_sieve_hits[cell_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
     }
 
-    // 8. Also accumulate into 2x2 pooled cells (576..1151)
+    // 9. Also accumulate into 2x2 pooled cells (576..1151)
     for (int pr = max(0, row - 1); pr <= min(17, row); ++pr) {
         for (int pc = max(0, col - 1); pc <= min(31, col); ++pc) {
             int pooled_idx = 576 + (pr * 32 + pc);
             atomicAdd(&ring_buffers[pooled_idx * 512 + head_idx], 1.0f);
             atomicAdd(&cell_total_events[pooled_idx], 1.0f);
-            if (cell_max_sieve_hits != nullptr) {
+            if (cell_max_sieve_hits != nullptr && is_periodic) {
                 atomicMax(&cell_max_sieve_hits[pooled_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
             }
         }
@@ -268,9 +294,8 @@ __global__ void kernel_analyze_spectral_peaks(
     }
 
     // Standoff Dynamic Activity Gate:
-    // If a 2x2 micro-tile has locked into repetitive periodic blade passes (>= 4 hits),
-    // allow weak standoff signals with as few as 6 events!
-    float min_activity_req = (max_sieve_hits >= 4) ? 6.0f : (is_pooled ? 25.0f : 15.0f);
+    // Allow weak standoff signals (>= 5.0 events) to proceed to spectral harmonic analysis and CombNet
+    float min_activity_req = is_pooled ? 8.0f : 5.0f;
     if (total_events < min_activity_req) return;
 
     // Peak search using Harmonic Product Spectrum (HPS) in [min_freq_hz, max_freq_hz] (bins 9 to 102 for 70..800 Hz)
@@ -299,7 +324,7 @@ __global__ void kernel_analyze_spectral_peaks(
     float max_hps = 0.0f;
 
     // Minimum energy threshold: scale down if high-purity micro-sieve hit
-    float effective_min_energy = (max_sieve_hits >= 4) ? (0.5f * min_energy) : min_energy;
+    float effective_min_energy = (max_sieve_hits >= 2) ? (0.5f * min_energy) : min_energy;
 
     for (int k = min_bin; k <= max_bin; ++k) {
         float p1 = power[k];
@@ -393,19 +418,6 @@ __global__ void kernel_analyze_spectral_peaks(
     }
     float peak_freq_hz = (static_cast<float>(best_bin) + delta_bin) * df;
 
-    // Motion-induced background texture scanning frequency filter:
-    // v_scan = fx * omega (px/s). Apparent texture frequency band: [0.22 v_scan, 0.70 v_scan]
-    if (gyro_speed_deg_s > 4.0f) {
-        float omega_rad_s = gyro_speed_deg_s * (3.14159265f / 180.0f);
-        float v_scan = 1646.0f * omega_rad_s;
-        float f_texture_min = 0.22f * v_scan;
-        float f_texture_max = 0.70f * v_scan;
-        if (peak_freq_hz >= f_texture_min && peak_freq_hz <= f_texture_max) {
-            // Background moving foliage scan artifact: reject
-            return;
-        }
-    }
-
     // Spectral Sharpness (Q-Factor): blade spike vs broad wind/foliage turbulence
     float neighbor_p = 1e-9f;
     if (best_bin >= 2 && best_bin + 2 < 257) {
@@ -414,12 +426,28 @@ __global__ void kernel_analyze_spectral_peaks(
     float sharpness = (neighbor_p > 1e-9f) ? (p_mid / neighbor_p) : 10.0f;
     if (sharpness < 1.5f) return;
 
+    // Motion-induced background texture scanning frequency filter:
+    // v_scan = fx * omega (px/s). Apparent texture frequency band: [0.22 v_scan, 0.70 v_scan]
+    // ONLY reject broad foliage texture scan clutter; NEVER reject high-Q, low-flatness mechanical blade harmonics!
+    if (gyro_speed_deg_s > 4.0f) {
+        float omega_rad_s = gyro_speed_deg_s * (3.14159265f / 180.0f);
+        float v_scan = 1646.0f * omega_rad_s;
+        float f_texture_min = 0.22f * v_scan;
+        float f_texture_max = 0.70f * v_scan;
+        if (peak_freq_hz >= f_texture_min && peak_freq_hz <= f_texture_max) {
+            if (sharpness < 2.5f && spectral_flatness > 0.20f && max_sieve_hits < 2) {
+                // Background moving foliage scan artifact: reject broad diffuse clutter
+                return;
+            }
+        }
+    }
+
     // SNR Calculation
     float snr_linear = p_mid / mean_noise;
     float snr_db = 10.0f * log10f(max(1.0f, snr_linear));
 
     // Dynamic SNR Threshold: Standoff low-SNR tolerance if confirmed by DDHF flatness and micro-sieve
-    float effective_min_snr = (max_sieve_hits >= 4 && spectral_flatness < 0.15f) ? (min_snr_db - 3.0f) : min_snr_db;
+    float effective_min_snr = (max_sieve_hits >= 2 && spectral_flatness < 0.18f) ? (min_snr_db - 3.0f) : min_snr_db;
     if (snr_db < effective_min_snr) return;
 
     // Harmonic Bonus (2nd and 3rd harmonics)
@@ -429,7 +457,7 @@ __global__ void kernel_analyze_spectral_peaks(
 
     // Standoff DDHF Flatness Bonus & Micro-Sieve Bonus
     float flatness_bonus = (spectral_flatness < 0.18f) ? (0.25f * (0.18f - spectral_flatness) / 0.18f) : 0.0f;
-    float sieve_bonus = (max_sieve_hits >= 4) ? 0.15f : 0.0f;
+    float sieve_bonus = (max_sieve_hits >= 2) ? 0.15f : 0.0f;
 
     float fund_score = min(1.0f, max(0.20f, (snr_db - 6.0f) / 10.0f));
     float confidence = min(1.0f, fund_score + harmonic_bonus + flatness_bonus + sieve_bonus);
@@ -764,10 +792,12 @@ void CudaFlickerCore::get_active_cells_with_spectra(
     out_spectra.clear();
 
     CUDA_CHECK(cudaMemcpy(h_cell_totals_, d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_cell_sieve_hits_, d_cell_max_sieve_hits_, num_total_cells_ * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    // Identify active base and pooled cells
+    // Identify active base and pooled cells with sufficient event density (>= min_events)
     for (int i = 0; i < num_total_cells_; ++i) {
-        if (h_cell_totals_[i] >= min_events) {
+        float ev = h_cell_totals_[i];
+        if (ev >= min_events) {
             out_cell_indices.push_back(i);
             if (out_cell_indices.size() >= 128) break; // Capped at max batch size
         }
@@ -794,7 +824,7 @@ void CudaFlickerCore::get_active_cells_with_spectra(
         auto& spec = out_spectra[b];
         std::vector<float> noise_slice(spec.begin() + 5, spec.begin() + 128);
         std::sort(noise_slice.begin(), noise_slice.end());
-        float median_noise = std::max(1e-6f, noise_slice[noise_slice.size() / 2]);
+        float median_noise = std::max(1e-4f, noise_slice[noise_slice.size() / 2]);
         for (int k = 0; k < 257; ++k) {
             spec[k] = std::log10(1.0f + spec[k] / median_noise);
         }

@@ -100,12 +100,24 @@ int main() {
     t_now = 2000000;
     for (int cycle = 0; cycle < 35; ++cycle) {
         std::vector<Metavision::EventCD> batch;
-        Metavision::EventCD ev;
-        ev.x = 320;
-        ev.y = 180;
-        ev.p = 1;
-        ev.t = t_now;
-        batch.push_back(ev);
+        // Primary rotor blade pass (250 Hz) with finite chord width (3 intra-burst events)
+        for (int b = 0; b < 3; ++b) {
+            Metavision::EventCD ev;
+            ev.x = 320;
+            ev.y = 180;
+            ev.p = 1;
+            ev.t = t_now + b * 60;
+            batch.push_back(ev);
+        }
+        // Secondary harmonic pass (2x harmonic at 500 Hz)
+        for (int b = 0; b < 2; ++b) {
+            Metavision::EventCD ev;
+            ev.x = 320;
+            ev.y = 180;
+            ev.p = 1;
+            ev.t = t_now + 2000 + b * 60;
+            batch.push_back(ev);
+        }
         uint64_t raw_c = 0, ret_c = 0;
         cuda_core.ingest_event_batch(batch.data(), batch.size(), H_identity, raw_c, ret_c, nullptr, 0.35f, true);
         t_now += 4000; // 250 Hz blade chop
@@ -145,24 +157,52 @@ int main() {
     bool engine_loaded = spectral_engine.load_engine(engine_path);
     run_test("Load SpectralCombNet TensorRT Engine", engine_loaded);
 
-    if (engine_loaded && !active_spectra.empty()) {
-        std::vector<const float*> ptrs(active_spectra.size());
-        for (size_t i = 0; i < active_spectra.size(); ++i) {
-            ptrs[i] = active_spectra[i].data();
+    if (engine_loaded) {
+        // Construct realistic multi-harmonic drone spectrum (200 Hz with 400 and 600 Hz harmonics on ambient noise floor)
+        std::vector<float> realistic_drone_spec(257, 0.0f);
+        for (int k = 0; k < 257; ++k) {
+            realistic_drone_spec[k] = 1.0f + 0.2f * std::sin(k * 0.15f);
         }
-        std::vector<predator::SpectralPrediction> preds;
-        bool infer_ok = spectral_engine.infer_spectra(ptrs, active_cells, preds, 0.40f);
-        run_test("SpectralCombNet Batched Inference Execution", infer_ok);
-        std::cout << "  -> Neural Predictions Passing Threshold: " << preds.size() << "\n";
-        bool found_target = false;
-        for (const auto& p : preds) {
-            std::cout << "     Cell #" << p.cell_idx << " | Drone Prob: " << std::fixed << std::setprecision(3)
-                      << p.drone_prob << " | Freq: " << p.fund_freq_hz << " Hz | Purity: " << p.harmonic_purity << "\n";
-            if (p.drone_prob >= 0.40f && p.fund_freq_hz >= 75.0f && p.fund_freq_hz <= 800.0f) {
-                found_target = true;
+        for (int h = 1; h <= 3; ++h) {
+            float f_h = h * 200.0f;
+            float bin_pos = f_h / 7.8125f;
+            int center_bin = static_cast<int>(std::round(bin_pos));
+            float h_amp = 60.0f / std::pow(static_cast<float>(h), 1.1f);
+            for (int offset = -2; offset <= 2; ++offset) {
+                int k = center_bin + offset;
+                if (k >= 0 && k < 257) {
+                    float dist = std::abs(k - bin_pos);
+                    float spread = std::exp(-0.5f * std::pow(dist / 0.75f, 2.0f));
+                    realistic_drone_spec[k] += h_amp * spread;
+                }
             }
         }
-        run_test("SpectralCombNet Target Recognition & Frequency Extracted", found_target);
+        // Log10 median normalization
+        std::vector<float> noise_slice(realistic_drone_spec.begin() + 5, realistic_drone_spec.begin() + 128);
+        std::sort(noise_slice.begin(), noise_slice.end());
+        float median_noise = std::max(1e-4f, noise_slice[noise_slice.size() / 2]);
+        for (int k = 0; k < 257; ++k) {
+            realistic_drone_spec[k] = std::log10(1.0f + realistic_drone_spec[k] / median_noise);
+        }
+
+        // Construct sparse foliage clutter spectrum (3 sparse peaks, no harmonics)
+        std::vector<float> foliage_spec(257, 0.0f);
+        foliage_spec[10] = 5.0f; foliage_spec[18] = 4.0f; foliage_spec[47] = 3.0f;
+
+        std::vector<const float*> test_ptrs = { realistic_drone_spec.data(), foliage_spec.data() };
+        std::vector<int> test_cells = { 42, 99 };
+        std::vector<predator::SpectralPrediction> preds;
+
+        bool infer_ok = spectral_engine.infer_spectra(test_ptrs, test_cells, preds, 0.0f);
+        run_test("SpectralCombNet Batched Inference Execution", infer_ok);
+
+        std::cout << "  -> Drone Spectrum Recognition: Prob=" << std::fixed << std::setprecision(4)
+                  << preds[0].drone_prob << " | BPF=" << preds[0].fund_freq_hz << " Hz | PeakValid="
+                  << (preds[0].has_valid_peak ? "YES" : "NO") << " | SNR=" << preds[0].physical_snr_db << " dB\n";
+        std::cout << "  -> Foliage Clutter Rejection : Prob=" << preds[1].drone_prob << "\n";
+
+        run_test("SpectralCombNet Drone Recognition (Prob >= 0.70)", preds[0].drone_prob >= 0.70f);
+        run_test("SpectralCombNet Foliage Clutter Rejection (Prob <= 0.10)", preds[1].drone_prob <= 0.10f);
     }
 
     std::cout << "\n========================================================\n";

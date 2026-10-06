@@ -180,19 +180,44 @@ class SyntheticSpectrumDataset(Dataset):
                         spread = math.exp(-0.5 * (dist / 0.75) ** 2)
                         spectrum[k] += h_amp * spread
         else:
-            # Negative Clutter Generation
-            clutter_type = random.choice(["wind_foliage", "ac_powerline", "pure_noise", "wideband_step"])
+            # Negative Clutter Generation (Wind foliage, sparse Poisson noise, foliage turbulence, AC, wideband steps)
+            clutter_type = random.choice(["wind_foliage", "foliage_turbulence", "sparse_poisson", "ac_powerline", "pure_noise", "wideband_step"])
 
             if clutter_type == "wind_foliage":
                 # Low-frequency 1/f red noise (5 to 50 Hz wind sway)
-                decay = np.random.uniform(1.5, 2.5)
-                amp = np.random.uniform(5.0, 30.0)
-                for k in range(1, 20):
+                decay = np.random.uniform(1.2, 2.5)
+                amp = np.random.uniform(5.0, 40.0)
+                for k in range(1, 30):
                     spectrum[k] += amp / ((k + 1) ** decay)
 
+            elif clutter_type == "foliage_turbulence":
+                # Multi-frequency wind turbulence across leaves (5 to 60 Hz with fluttering phase)
+                num_leaves = random.randint(3, 8)
+                for _ in range(num_leaves):
+                    f_leaf = np.random.uniform(4.0, 65.0)
+                    bin_pos = f_leaf / self.df
+                    center_bin = int(round(bin_pos))
+                    leaf_amp = base_noise_level * np.random.uniform(5.0, 40.0)
+                    for offset in [-2, -1, 0, 1, 2]:
+                        k = center_bin + offset
+                        if 0 <= k < self.num_bins:
+                            spectrum[k] += leaf_amp * math.exp(-0.5 * (offset / 1.2) ** 2)
+
+            elif clutter_type == "sparse_poisson":
+                # Real event camera sparse Poisson noise: 3 to 45 delta spikes in 512-sample temporal buffer
+                num_events = random.randint(3, 45)
+                t_indices = np.random.choice(512, size=num_events, replace=False)
+                t_signal = np.zeros(512, dtype=np.float32)
+                t_signal[t_indices] = np.random.uniform(1.0, 3.0, size=num_events)
+                hanning = 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(512) / 511.0))
+                windowed = t_signal * hanning
+                fft_res = np.fft.rfft(windowed)
+                power_sparse = (np.abs(fft_res[:self.num_bins]) ** 2).astype(np.float32)
+                spectrum += power_sparse * np.random.uniform(2.0, 20.0)
+
             elif clutter_type == "ac_powerline":
-                # 100/120/200/240 Hz building lighting flicker without drone harmonics
-                ac_freqs = [100.0, 120.0, 180.0, 200.0, 240.0, 300.0]
+                # 100/120/150/180/200/240/300 Hz lighting flicker without drone harmonics
+                ac_freqs = [100.0, 120.0, 150.0, 180.0, 200.0, 240.0, 300.0]
                 selected_ac = random.sample(ac_freqs, k=random.randint(1, 3))
                 for ac_f in selected_ac:
                     bin_pos = ac_f / self.df
@@ -268,12 +293,13 @@ def train_model(epochs: int = 15, batch_size: int = 128, lr: float = 1e-3):
             mask = (y_drone > 0.5).squeeze(-1)
             if mask.sum() > 0:
                 loss_freq = criterion_mse(pred_f0[mask] / 100.0, y_f0[mask] / 100.0)
-                loss_purity = criterion_mse(pred_purity[mask], y_purity[mask])
             else:
-                loss_freq = 0.0
-                loss_purity = 0.0
+                loss_freq = torch.tensor(0.0, device=device)
 
-            total_loss = loss_cls + 0.25 * loss_freq + 0.15 * loss_purity
+            # Enforce purity across ALL samples: push to 0.0 for noise/foliage/clutter, push to target for drones
+            loss_purity = criterion_bce(pred_purity, y_purity)
+
+            total_loss = loss_cls + 0.25 * loss_freq + 0.25 * loss_purity
             total_loss.backward()
             optimizer.step()
 

@@ -42,6 +42,14 @@ def test_normalizes_latest_bart_imu_and_spectral_diagnostics():
         {
             "num_targets": 0,
             "targets": [],
+            "num_tracks": 1,
+            "tracks": [{"track_id": 4, "state": "TENTATIVE"}],
+            "roi_diagnostics": {
+                "total_events": 8100,
+                "max_cell_events": 73,
+                "max_sieve_hits": 3,
+                "active_cells": 12,
+            },
             "ego_motion": {
                 "imu_connected": True,
                 "imu_packets": 4200,
@@ -59,3 +67,7 @@ def test_normalizes_latest_bart_imu_and_spectral_diagnostics():
     assert state["ego_motion"]["spectral_combnet_active"] is True
     assert state["ego_motion"]["spectral_detections"] == 2
     assert state["ego_motion"]["suppressed_events_pct"] == 37.5
+    assert state["num_tracks"] == 1
+    assert state["tracks"][0]["state"] == "TENTATIVE"
+    assert state["roi_diagnostics"]["active_cells"] == 12
+    assert state["roi_diagnostics"]["max_sieve_hits"] == 3

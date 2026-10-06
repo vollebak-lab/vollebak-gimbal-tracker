@@ -3,8 +3,8 @@
 ## Source reviewed
 
 - Repository: `vollebak-lab/predator`
-- Integrated main-branch commit: `d5ff183`
-- Main-branch history reviewed: eight Bart commits through 2026-10-06
+- Integrated main-branch commit: `032be3d`
+- Main-branch history reviewed: thirteen Bart commits through 2026-10-06
 - Imported tracked files: 123
 - Python verification: 48 upstream tests passed after installing SciPy
 - Native verification: OpenEB 5.2.0 was built under WSL with the IDS USB identifiers from Bart's integration notes. The camera test, live viewer, CPU flicker detector, all 11 flicker-DSP tests, and all 6 ego-motion tests ran successfully against the connected IMX636. A sensor-side 10 MEv/s cap makes the full detector stable through WSL USB/IP; native USB remains preferred for deployment.
@@ -19,6 +19,11 @@
 - `c726aa6` documented the Nicla firmware, serial transport, calibration, and deployment workflow.
 - `7662600` added the SPAD 23 optical-ranging research and integration plan; it does not add a live Pi sensor backend.
 - `d5ff183` added the CUDA flicker core, TensorRT FP16 SpectralCombNet classifier, ONNX model, diagnostics, and tests.
+- `6f94921` added physical foliage co-gating and retrained the sparse Poisson model to suppress foliage false alarms.
+- `fc5b9c0` restored 30–100 ft detection using cross-boundary SAE neighbors, log normalization, and standoff gates.
+- `43e5f9d` extended standoff-lock recovery and dynamic-camera tracking.
+- `d74f2a7` fixed hover dropout with a TensorRT bypass and zero-velocity gyro-bias calibration.
+- `032be3d` streamlined the frequency pipeline, corrected Nicla gyro scaling, and enabled active ego-warp.
 
 Every tracked file from the reviewed commit was copied into this repository. The Pi application in `src/vollebak_gimbal` remains the executable integration layer because it already supports the connected Logitech camera, fixed-camera calibration, the Waveshare serial protocol, and a hardware-free mock driver.
 
@@ -30,7 +35,7 @@ The two upstream files replaced by integration-specific versions are preserved v
 
 Bart's implementation makes frequency-domain DSP the authoritative propeller detector. `ev_ingestion_cpp/flicker_dsp.hpp` uses a 4 kHz analysis rate, 512-sample windows, FFT/harmonic-product-spectrum scoring, spatial patch clustering, common AC-carrier suppression, and M-of-N track persistence. The newest C++ daemon combines that path with an OpenEB event stream, Nicla gyro motion compensation, CUDA cell spectra, TensorRT suppression, and an FP16 SpectralCombNet classifier.
 
-This path is designed for a Sony IMX636/DVX-class event camera, not for a conventional Logitech frame camera. The connected IDS UE-39B0XCP was identified as a 1280x720 IMX636 and verified with OpenEB. The dashboard displays its real MJPEG event surface and full detector telemetry alongside the Logitech feed. Under WSL, a 10 MEv/s sensor-side ERC cap avoids overwhelming USB/IP. BPF/RPM/SNR remain empty when the detector has no qualifying target instead of being fabricated. The Pi adapter now also preserves and displays Bart's IMU, TensorRT suppression, SpectralCombNet evaluation, and neural-detection diagnostics.
+This path is designed for a Sony IMX636/DVX-class event camera, not for a conventional Logitech frame camera. The connected IDS UE-39B0XCP was identified as a 1280x720 IMX636 and verified with OpenEB. The dashboard displays its real MJPEG event surface and full detector telemetry alongside the Logitech feed. Under WSL, a 10 MEv/s sensor-side ERC cap avoids overwhelming USB/IP. BPF/RPM/SNR remain empty when the detector has no qualifying target instead of being fabricated. The Pi adapter now also preserves and displays Bart's IMU, TensorRT suppression, SpectralCombNet, ROI-cell, tentative-track, and neural-detection diagnostics. The latest source is calibrated for a 12 mm f/2 M12 lens; the currently running older CPU binary still reports its 8 mm f/8 profile until a compatible rebuild is available.
 
 The regular Logitech path is an integration-specific fallback. OpenCV MOG2 background subtraction produces foreground contours, contours smaller than the configured area are discarded, and the largest remaining region is selected. Its bounding-box center is converted to a bearing using the fixed-camera calibration and passed through smoothing, deadband, step, rate, and mechanical-limit controls. It follows motion; it does not perform Bart's rotor-frequency classification or guarantee persistent object identity.
 

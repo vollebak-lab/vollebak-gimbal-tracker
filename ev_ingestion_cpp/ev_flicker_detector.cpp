@@ -32,7 +32,6 @@
 
 #include "flicker_dsp.hpp"
 #include "ego_motion.hpp"
-#include "event_suppression_trt.hpp"
 #include "spectral_combnet_trt.hpp"
 #include "cuda_flicker_core.cuh"
 #include <omp.h>
@@ -472,62 +471,45 @@ void display_encoder_thread_func(int width, int height) {
             auto ego_stats = g_detection_mgr.get_ego_stats();
 
             // Draw detection bounding boxes and HUD on frame
-            if (!all_tracks.empty()) {
-                for (const auto& trk : all_tracks) {
-                    const auto& d = trk.last_detection;
-                    int bx = d.centroid_px_x - 40;
-                    int by = d.centroid_px_y - 40;
-                    cv::Rect target_rect(std::max(0, bx), std::max(0, by), 
-                                         std::min(80, width - std::max(0, bx)), 
-                                         std::min(80, height - std::max(0, by)));
-                    
-                    bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
-                    cv::Scalar box_color = is_confirmed ? cv::Scalar(0, 255, 128) : cv::Scalar(0, 215, 255); // Green vs Gold
-                    
-                    cv::rectangle(frame, target_rect, box_color, is_confirmed ? 2 : 1);
-                    
-                    char label[128];
-                    const char* net_tag = d.is_neural_detection ? " [NET]" : "";
-                    if (is_confirmed) {
-                        snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
-                                 trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
-                    } else {
-                        snprintf(label, sizeof(label), "[TENT #%d %d/3] %.0fHz [%.1fdB]%s", 
-                                 trk.track_id, trk.hit_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
-                    }
-                    cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
+            // Render CONFIRMED drone targets in bright green, and ACQUIRING targets (hit >= 2 or SNR >= 10.0 dB) in Amber
+            for (const auto& trk : all_tracks) {
+                bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
+                if (!is_confirmed && trk.hit_count < 2 && trk.last_detection.peak_snr_db < 10.0f) {
+                    continue; // Suppress single-frame 1-hit noise blips
                 }
-            } else {
-                for (size_t i = 0; i < active_dets.size(); ++i) {
-                    const auto& d = active_dets[i];
-                    int bx = d.centroid_px_x - 40;
-                    int by = d.centroid_px_y - 40;
-                    cv::Rect target_rect(std::max(0, bx), std::max(0, by), 
-                                         std::min(80, width - std::max(0, bx)), 
-                                         std::min(80, height - std::max(0, by)));
-                    
-                    cv::rectangle(frame, target_rect, cv::Scalar(0, 255, 128), 2);
-                    char label[128];
-                    const char* net_tag = d.is_neural_detection ? " [NET]" : "";
-                    snprintf(label, sizeof(label), "DRONE %.0fHz (%.0f RPM) [%.1fdB]%s", 
-                             d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
-                    cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 128), 1, cv::LINE_AA);
+                const auto& d = trk.last_detection;
+                int bx = d.centroid_px_x - 40;
+                int by = d.centroid_px_y - 40;
+                cv::Rect target_rect(std::max(0, bx), std::max(0, by), 
+                                     std::min(80, width - std::max(0, bx)), 
+                                     std::min(80, height - std::max(0, by)));
+                
+                cv::Scalar box_color = is_confirmed ? cv::Scalar(0, 255, 128) : cv::Scalar(0, 215, 255); // Green vs Amber
+                cv::rectangle(frame, target_rect, box_color, is_confirmed ? 2 : 1);
+                
+                char label[128];
+                const char* net_tag = d.is_neural_detection ? " [NET]" : "";
+                if (is_confirmed) {
+                    snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
+                             trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
+                } else {
+                    snprintf(label, sizeof(label), "[ACQUIRING #%d %d/3] %.0fHz [%.1fdB]%s", 
+                             trk.track_id, trk.hit_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
                 }
+                cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
             }
 
             // Top HUD
             std::string hud_top = "PREDATOR-01 | 12mm f/2.0 M12 | DDHF + Ego-Motion Core";
             cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
 
-            // Ego-Motion & Suppression HUD Badge
+            // Ego-Motion & Frequency-Domain Core HUD Badge
             char ego_badge[256];
-            snprintf(ego_badge, sizeof(ego_badge), "NICLA: %s | GYRO: [%+.2f, %+.2f, %+.2f] | TRT-EGO: %s (%.0f%%) | COMBNET: %s (%d DET)",
+            snprintf(ego_badge, sizeof(ego_badge), "NICLA: %s | GYRO: [%+.2f, %+.2f, %+.2f] (%.1f deg/s) | WARP: %s | COMBNET: %s (%d DET)",
                      ego_stats.imu_connected ? "200Hz" : "OFFLINE",
-                     ego_stats.gyro_wx, ego_stats.gyro_wy, ego_stats.gyro_wz,
-                     ego_stats.trt_suppression_active ? "ACTIVE" : "PASS-THRU",
-                     ego_stats.suppressed_pct,
+                     ego_stats.gyro_wx, ego_stats.gyro_wy, ego_stats.gyro_wz, ego_stats.gyro_speed_deg_s,
+                     ego_stats.trt_suppression_active ? "BYPASS" : "ACTIVE",
                      ego_stats.spectral_combnet_active ? "FP16" : "OFF",
                      ego_stats.spectral_detections);
             cv::putText(frame, ego_badge, cv::Point(16, 56), cv::FONT_HERSHEY_SIMPLEX, 0.48,
@@ -1007,9 +989,9 @@ int main(int argc, char* argv[]) {
         try {
             auto *biases = camera.get_device().get_facility<Metavision::I_LL_Biases>();
             if (biases) {
-                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=10, diff_off=10)
-                int diff_on = 10;
-                int diff_off = 10;
+                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=6, diff_off=6 for 80-115ft sensitivity)
+                int diff_on = 6;
+                int diff_off = 6;
                 const char* env_on = std::getenv("PREDATOR_BIAS_DIFF_ON");
                 const char* env_off = std::getenv("PREDATOR_BIAS_DIFF_OFF");
                 if (env_on) diff_on = std::stoi(env_on);
@@ -1045,14 +1027,6 @@ int main(int argc, char* argv[]) {
         g_diag_logger.start();
         std::cout << "[INFO] High-rate CSV diagnostics logger active at " << g_diag_logger.log_path() << "\n";
 
-        // 2-Bin Temporal Event Stack Accumulator for TensorRT Dynamic Suppression
-        predator::TemporalEventStackAccumulator event_stack_acc(640, 360, 40000); // 40ms frames
-
-        // TensorRT FP16 Dynamic Motion Suppression Engine
-        predator::AnticipatorySuppressionEngine suppression_engine(640, 360);
-        std::string engine_path = "/home/orin/ev_deploy/models/event_suppression_fp16.engine";
-        suppression_engine.load_engine(engine_path);
-
         // TensorRT FP16 SpectralCombNet Engine (Frequency-Domain Propeller Classifier)
         predator::SpectralCombNetEngine spectral_engine(128);
         std::string spectral_engine_path = "/home/orin/ev_deploy/models/spectral_combnet_fp16.engine";
@@ -1062,6 +1036,14 @@ int main(int argc, char* argv[]) {
         } else {
             std::cout << "[WARN] SpectralCombNet TRT Engine not loaded, continuing with cuFFT peak detector.\n";
         }
+
+        // Configurable Ego-Motion Stabilization
+        // Default to active 200 Hz IMU homography de-rotation with calibrated rad/s scaling
+        bool enable_ego_warp = true;
+        const char* env_warp = std::getenv("PREDATOR_ENABLE_EGO_WARP");
+        if (env_warp && std::string(env_warp) == "0") enable_ego_warp = false;
+        std::cout << "[INFO] Pipeline Ingestion Mode: Ego-Warp=" << (enable_ego_warp ? "ACTIVE (Nicla 200Hz)" : "BYPASS (Identity)")
+                  << ", Pure Frequency-Domain Harmonic Pipeline Active.\n";
 
         std::atomic<uint64_t> total_raw_counter{0};
         std::atomic<uint64_t> retained_counter{0};
@@ -1094,21 +1076,17 @@ int main(int argc, char* argv[]) {
                 current_epoch_ref_us.store(t_ref);
             }
 
-            // Compute batch homography ONCE per OpenEB callback batch (1-2 ms window)
-            uint64_t mid_t = (begin->t + (end - 1)->t) / 2;
-            predator::Matrix3x3 batch_H = gyro_warper.compute_homography(t_ref, mid_t);
-
-            // Ingest into 2-bin stack accumulator for TensorRT
-            event_stack_acc.update_window(begin->t);
-            for (auto it = begin; it != end; ++it) {
-                event_stack_acc.ingest_event_fast(it->x, it->y, it->p);
+            predator::Matrix3x3 batch_H = predator::Matrix3x3::identity();
+            if (enable_ego_warp) {
+                uint64_t mid_t = (begin->t + (end - 1)->t) / 2;
+                batch_H = gyro_warper.compute_homography(t_ref, mid_t);
             }
 
-            // Direct GPU Ingestion, Homography Warping, TensorRT Mask Gating, SAE Sieve, and Ring Buffer Accumulation
+            // Direct GPU Ingestion, Homography Warping, SAE Sieve, and Ring Buffer Accumulation
             uint64_t raw_count = 0;
             uint64_t retained_count = 0;
             cuda_core.ingest_event_batch(begin, batch_size, batch_H, raw_count, retained_count,
-                                         suppression_engine.get_device_mask(), 0.35f, false);
+                                         nullptr, 0.35f, false);
 
             total_raw_counter.fetch_add(raw_count, std::memory_order_relaxed);
         });
@@ -1126,12 +1104,6 @@ int main(int argc, char* argv[]) {
         while (g_running && camera.is_running()) {
             next_cycle_epoch += cycle_interval;
 
-            // 1. Run TensorRT Anticipatory Suppression Inference on Latest 2-Bin Event Stack
-            std::vector<float> event_stack;
-            if (event_stack_acc.get_latest_stack(event_stack)) {
-                suppression_engine.infer(event_stack, 40.0f); // 40ms lookahead
-            }
-
             // 2. Snapshot metrics
             uint64_t total_events = total_raw_counter.exchange(0);
             uint64_t retained_events = cuda_core.get_and_reset_retained_count();
@@ -1144,7 +1116,7 @@ int main(int argc, char* argv[]) {
             double foliage_dispersion_pct = (100.0 * static_cast<double>(active_cells)) / 576.0;
 
             DetectionManager::EgoMotionStats ego_stats;
-            ego_stats.trt_suppression_active = suppression_engine.is_ready();
+            ego_stats.trt_suppression_active = false;
             ego_stats.imu_connected = imu_reader.is_connected();
             ego_stats.imu_packets = imu_reader.packet_count();
             ego_stats.gyro_wx = omega.x;
@@ -1181,7 +1153,7 @@ int main(int argc, char* argv[]) {
 
             // 3. Batched cuFFT and GPU Spectral Harmonic Analysis across all 1152 cells in parallel (<0.4 ms)
             std::vector<predator::FlickerDetectionResult> raw_detections;
-            cuda_core.execute_batched_spectral_analysis(75.0, 1000.0, 5.0, 8.0, gyro_speed_deg_s, raw_detections);
+            cuda_core.execute_batched_spectral_analysis(75.0, 1000.0, 2.5, 7.0, gyro_speed_deg_s, raw_detections);
 
             // 3b. TensorRT SpectralCombNet Neural Classification on Active Cells (Shade & Weak Signal Boost)
             int spectral_eval_cells = 0;
@@ -1201,7 +1173,7 @@ int main(int argc, char* argv[]) {
                         ptrs[i] = active_spectra[i].data();
                     }
                     std::vector<predator::SpectralPrediction> neural_preds;
-                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.45f);
+                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.55f);
 
                     for (const auto& np : neural_preds) {
                         top_neural_prob = std::max(top_neural_prob, np.drone_prob);
@@ -1216,26 +1188,26 @@ int main(int argc, char* argv[]) {
                                 already_detected = true;
                                 rd.is_neural_detection = true;
                                 rd.neural_drone_prob = np.drone_prob;
-                                if (np.drone_prob > 0.65f && np.harmonic_purity > 0.40f && np.fund_freq_hz >= 75.0f && np.fund_freq_hz <= 1000.0f) {
-                                    rd.fundamental_bpf_hz = np.fund_freq_hz;
-                                    rd.estimated_rpm = (np.fund_freq_hz * 60.0) / 2.0;
-                                    rd.confidence = std::max(rd.confidence, static_cast<double>(np.drone_prob));
+                                if (np.drone_prob > 0.65f) {
+                                    rd.confidence = std::min(1.0, rd.confidence + 0.20);
                                 }
                                 break;
                             }
                         }
 
-                        if (!already_detected && np.fund_freq_hz >= 75.0f && np.fund_freq_hz <= 1000.0f) {
+                        // Neural Weak-Signal Rescue: ONLY rescue if cell has true physical peak validity!
+                        if (!already_detected && np.has_valid_peak && np.physical_snr_db >= 5.0f && np.drone_prob >= 0.55f &&
+                            np.fund_freq_hz >= 75.0f && np.fund_freq_hz <= 1000.0f) {
                             predator::FlickerDetectionResult res;
                             res.is_drone_detected = true;
                             res.fundamental_bpf_hz = np.fund_freq_hz;
                             res.estimated_rpm = (np.fund_freq_hz * 60.0) / 2.0;
-                            res.confidence = np.drone_prob;
-                            res.peak_snr_db = 10.0 + 8.0 * np.harmonic_purity;
+                            res.confidence = 0.5f * np.drone_prob + 0.5f * std::min(1.0f, np.physical_snr_db / 15.0f);
+                            res.peak_snr_db = np.physical_snr_db;
                             res.harmonic_score = np.harmonic_purity;
-                            res.spectral_q_factor = 2.0 + 3.0 * np.harmonic_purity;
-                            res.spectral_flatness = 0.15f * (1.0f - np.harmonic_purity);
-                            res.peak_power = 4.0f * np.drone_prob;
+                            res.spectral_q_factor = np.spectral_q_factor;
+                            res.spectral_flatness = np.spectral_flatness;
+                            res.peak_power = std::pow(10.0f, np.physical_snr_db / 10.0f);
                             res.noise_floor = 1.0f;
                             res.patch_x = patch_col;
                             res.patch_y = patch_row;
@@ -1257,10 +1229,10 @@ int main(int argc, char* argv[]) {
                 double world_x = res.patch_x * 40.0 + 20.0;
                 double world_y = res.patch_y * 40.0 + 20.0;
 
-                // Project world coordinate to current camera viewpoint
+                // Project world coordinate to current camera viewpoint (only if ego warping active)
                 double cam_x = world_x;
                 double cam_y = world_y;
-                if (t_now_cam > 0 && t_anchor > 0) {
+                if (enable_ego_warp && t_now_cam > 0 && t_anchor > 0) {
                     predator::Vector3d p_world(world_x, world_y, 1.0);
                     predator::Vector3d p_cam = H_world_to_cam * p_world;
                     if (std::abs(p_cam.z) > 1e-6) {

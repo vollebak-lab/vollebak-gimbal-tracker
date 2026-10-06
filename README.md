@@ -1,12 +1,12 @@
 # Predator Observation Console
 
-This repository combines Bart's complete [Vollebak Predator](https://github.com/vollebak-lab/predator) source tree at commit `d5ff183` with a working Raspberry Pi 5 camera-to-gimbal application.
+This repository combines Bart's complete [Vollebak Predator](https://github.com/vollebak-lab/predator) source tree at commit `032be3d` with a working Raspberry Pi 5 camera-to-gimbal application.
 
 The runnable Pi profile is deliberately scoped to passive observation, target tracking, and two-axis pointing. The regular-camera path uses OpenCV MOG2 background subtraction to find moving regions, rejects small contours, selects the largest remaining moving region, and maps its center through the saved camera-to-gimbal calibration. A rate-limited controller smooths that pan/tilt demand before the Waveshare driver sends serial commands. This is motion following, not object-identity recognition: any sufficiently large moving object can become the target.
 
 The GUI also exposes the readiness of Bart's layered stack without pretending disconnected hardware is live:
 
-- L1: the Logitech RGB camera and connected IDS UE-39B0XCP/Sony IMX636 event camera are selectable live feeds. The verified CPU FFT/HPS detector publishes event rate, tracks, bearing, BPF, RPM, and SNR. Bart's latest source additionally includes Nicla IMU compensation and a CUDA/TensorRT FP16 SpectralCombNet classifier; the dashboard reports those features when a compatible Jetson build exposes them.
+- L1: the Logitech RGB camera and connected IDS UE-39B0XCP/Sony IMX636 event camera are selectable live feeds. The verified CPU FFT/HPS detector publishes event rate, tracks, bearing, BPF, RPM, and SNR. Bart's latest source additionally includes corrected Nicla IMU scaling, active ego-warp, foliage/standoff co-gating, hover-lock recovery, CUDA processing, and a TensorRT FP16 SpectralCombNet classifier. The dashboard preserves confirmed targets, tentative tracks, ROI diagnostics, and accelerator status when the detector exposes them.
 - L2: Uhnder radar is shown as not connected; its real backend in Bart's current tree is a stub.
 - L3: the Pi profile provides one bearing-only visual track; Bart's full IMM/JPDA fusion source remains in the repository.
 - L4: mock or Waveshare gimbal pointing only. Engagement is hard-disabled and no engagement command endpoint exists.

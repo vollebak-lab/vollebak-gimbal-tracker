@@ -11,6 +11,7 @@ const ui = {
   safetyMode: $("safetyMode"), l1Status: $("l1Status"), l1Sensor: $("l1Sensor"),
   l1Detector: $("l1Detector"), l1Event: $("l1Event"), flickerStats: $("flickerStats"),
   neuralStats: $("neuralStats"),
+  roiStats: $("roiStats"),
   l2Status: $("l2Status"), l2Sensor: $("l2Sensor"), l2Simulation: $("l2Simulation"),
   l3Status: $("l3Status"), l3Mode: $("l3Mode"), trackCount: $("trackCount"),
   trackAngles: $("trackAngles"), trackConfidence: $("trackConfidence"),
@@ -89,6 +90,7 @@ function updatePredatorUI(predator) {
     ? `FP16 / ${l1.spectral_detections} LOCK`
     : "OFF";
   ui.neuralStats.textContent = `${imu} / ${combnet}`;
+  ui.roiStats.textContent = `${l1.roi_active_cells || 0} / ${l1.event_tracks || 0}`;
   ui.l2Status.textContent = l2.status;
   ui.l2Sensor.textContent = l2.sensor;
   ui.l2Simulation.textContent = l2.simulated ? "ON" : "OFF";

@@ -33,6 +33,9 @@ class EventCameraMonitor:
             "mode": "unknown",
             "num_targets": 0,
             "targets": [],
+            "num_tracks": 0,
+            "tracks": [],
+            "roi_diagnostics": {},
             "ego_motion": {},
             "error": None,
         }
@@ -102,6 +105,19 @@ class EventCameraMonitor:
         if not isinstance(targets, list):
             targets = []
         targets = [target for target in targets if isinstance(target, dict)]
+        tracks = payload.get("tracks", [])
+        if not isinstance(tracks, list):
+            tracks = []
+        tracks = [track for track in tracks if isinstance(track, dict)]
+        raw_roi = payload.get("roi_diagnostics", {})
+        if not isinstance(raw_roi, dict):
+            raw_roi = {}
+        roi_diagnostics = {
+            "total_events": int(raw_roi.get("total_events", 0) or 0),
+            "max_cell_events": int(raw_roi.get("max_cell_events", 0) or 0),
+            "max_sieve_hits": int(raw_roi.get("max_sieve_hits", 0) or 0),
+            "active_cells": int(raw_roi.get("active_cells", 0) or 0),
+        }
         raw_ego_motion = payload.get("ego_motion", {})
         if not isinstance(raw_ego_motion, dict):
             raw_ego_motion = {}
@@ -148,6 +164,9 @@ class EventCameraMonitor:
             "mode": "flicker_detector" if "num_targets" in payload else "event_viewer",
             "num_targets": int(payload.get("num_targets", len(targets)) or 0),
             "targets": targets,
+            "num_tracks": int(payload.get("num_tracks", len(tracks)) or 0),
+            "tracks": tracks,
+            "roi_diagnostics": roi_diagnostics,
             "ego_motion": ego_motion,
             "error": None,
         }

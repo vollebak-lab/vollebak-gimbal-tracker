@@ -115,18 +115,45 @@ public:
             return;
         }
 
-        latest_wx_.store(sample.gyro_rad_s.x, std::memory_order_relaxed);
-        latest_wy_.store(sample.gyro_rad_s.y, std::memory_order_relaxed);
-        latest_wz_.store(sample.gyro_rad_s.z, std::memory_order_relaxed);
+        double raw_wx = sample.gyro_rad_s.x;
+        double raw_wy = sample.gyro_rad_s.y;
+        double raw_wz = sample.gyro_rad_s.z;
+        double raw_norm = std::sqrt(raw_wx * raw_wx + raw_wy * raw_wy + raw_wz * raw_wz);
+
+        // Zero-velocity bias calibration: if raw angular speed < 0.12 rad/s (~6.8 deg/s), camera is resting
+        if (raw_norm < 0.12) {
+            double b_x = bias_wx_.load(std::memory_order_relaxed);
+            double b_y = bias_wy_.load(std::memory_order_relaxed);
+            double b_z = bias_wz_.load(std::memory_order_relaxed);
+            bias_wx_.store(b_x * 0.995 + raw_wx * 0.005, std::memory_order_relaxed);
+            bias_wy_.store(b_y * 0.995 + raw_wy * 0.005, std::memory_order_relaxed);
+            bias_wz_.store(b_z * 0.995 + raw_wz * 0.005, std::memory_order_relaxed);
+        }
+
+        double corr_wx = raw_wx - bias_wx_.load(std::memory_order_relaxed);
+        double corr_wy = raw_wy - bias_wy_.load(std::memory_order_relaxed);
+        double corr_wz = raw_wz - bias_wz_.load(std::memory_order_relaxed);
+
+        // Gyro deadband: if residual rotation < 0.02 rad/s (~1.1 deg/s), snap to 0 to prevent phantom smearing
+        if (std::abs(corr_wx) < 0.02) corr_wx = 0.0;
+        if (std::abs(corr_wy) < 0.02) corr_wy = 0.0;
+        if (std::abs(corr_wz) < 0.02) corr_wz = 0.0;
+
+        latest_wx_.store(corr_wx, std::memory_order_relaxed);
+        latest_wy_.store(corr_wy, std::memory_order_relaxed);
+        latest_wz_.store(corr_wz, std::memory_order_relaxed);
         latest_ax_.store(sample.accel_m_s2.x, std::memory_order_relaxed);
         latest_ay_.store(sample.accel_m_s2.y, std::memory_order_relaxed);
         latest_az_.store(sample.accel_m_s2.z, std::memory_order_relaxed);
 
+        ImuSample corrected_sample = sample;
+        corrected_sample.gyro_rad_s = Vector3d(corr_wx, corr_wy, corr_wz);
+
         std::lock_guard<std::mutex> lock(imu_mutex_);
-        if (!imu_buffer_.empty() && sample.timestamp_us <= imu_buffer_.back().timestamp_us) {
+        if (!imu_buffer_.empty() && corrected_sample.timestamp_us <= imu_buffer_.back().timestamp_us) {
             return; // Ignore non-monotonic samples
         }
-        imu_buffer_.push_back(sample);
+        imu_buffer_.push_back(corrected_sample);
         while (imu_buffer_.size() > max_imu_history_) {
             imu_buffer_.pop_front();
         }
@@ -431,6 +458,10 @@ private:
     std::atomic<double> latest_ay_{0.0};
     std::atomic<double> latest_az_{0.0};
 
+    std::atomic<double> bias_wx_{0.0};
+    std::atomic<double> bias_wy_{0.0};
+    std::atomic<double> bias_wz_{0.0};
+
     mutable std::mutex imu_mutex_;
     std::deque<ImuSample> imu_buffer_;
 };
@@ -613,18 +644,18 @@ private:
                         continue;
                     }
 
-                    // Calibrated BHI260AP scale correction factor (32768 / 2000 = 16.384x)
-                    // and physical rear-mount camera optical axis alignment:
-                    //   Camera Yaw (Horizontal pan)  = +Packet WX * 16.384
-                    //   Camera Pitch (Vertical tilt) = +Packet WY * 16.384
-                    //   Camera Roll (Twist)          = +Packet WZ * 16.384
-                    const float BHI260_SCALE = 32768.0f / 2000.0f; // 16.384f
-                    float cam_wx = wy * BHI260_SCALE;
-                    float cam_wy = wx * BHI260_SCALE;
-                    float cam_wz = wz * BHI260_SCALE;
+                    // Physical camera optical axis alignment from Arduino Nicla Sense ME:
+                    //   nicla_predator_imu.ino already mapped:
+                    //     g_packet.gyro_x = nicla_wy (Camera Pitch rate in rad/s)
+                    //     g_packet.gyro_y = nicla_wx (Camera Yaw rate in rad/s)
+                    //     g_packet.gyro_z = -nicla_wz (Camera Roll rate in rad/s)
+                    // Packet payload is already in SI units of rad/s and m/s^2.
+                    float cam_wx = wx; // Pitch rate around X-axis (rad/s)
+                    float cam_wy = wy; // Yaw rate around Y-axis (rad/s)
+                    float cam_wz = wz; // Roll rate around Z-axis (rad/s)
 
-                    float cam_ax = ay;
-                    float cam_ay = ax;
+                    float cam_ax = ax;
+                    float cam_ay = ay;
                     float cam_az = az;
 
                     uint64_t host_now_us = std::chrono::duration_cast<std::chrono::microseconds>(

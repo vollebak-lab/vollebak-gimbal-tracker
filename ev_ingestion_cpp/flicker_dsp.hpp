@@ -931,9 +931,9 @@ private:
         auto& s_tracks = get_tracks();
         static int s_next_id = 1;
 
-        const int M_HITS_FOR_CONFIRM = 3;  // Robust 3 consecutive frame confirmation (120ms)
+        const int M_HITS_FOR_CONFIRM = 3;  // Robust 3 frame confirmation
         const int MAX_COAST_FRAMES   = 5;  // Coast 5 frames (200ms) across sparse blade sweeps
-        const int MAX_TENTATIVE_MISS = 2;  // Allow 2 miss frames (80ms) for tentative tracks to bridge shade intermittency
+        const int MAX_TENTATIVE_MISS = 3;  // Allow 3 miss frames (120ms) for tentative tracks to bridge standoff intermittency
 
         std::vector<bool> matched_curr(current_dets.size(), false);
         std::vector<Track> next_tracks;
@@ -969,8 +969,13 @@ private:
 
                 double min_assoc_dist = std::min({dist_world, dist_cam, dist_bearing_equiv_px});
 
-                // Association gate: within 140 pixels (world, cam, or angular bearing < 3.25 deg) and +- 8 Hz frequency consistency
-                if (min_assoc_dist < 140.0 && std::abs(track.last_detection.fundamental_bpf_hz - d.fundamental_bpf_hz) < 8.0) {
+                // Association gate: within 140 pixels (or 220 px during motion / standoff coasting) and +- 8 Hz frequency consistency
+                double assoc_gate_px = 140.0;
+                if (track.state == TrackState::CONFIRMED || track.miss_count > 0) {
+                    assoc_gate_px = 220.0; // Expand to 5.1 degrees to maintain lock during fast camera tracking and hover drift
+                }
+
+                if (min_assoc_dist < assoc_gate_px && std::abs(track.last_detection.fundamental_bpf_hz - d.fundamental_bpf_hz) < 8.0) {
                     if (min_assoc_dist < min_dist) {
                         min_dist = min_assoc_dist;
                         best_det_idx = i;
@@ -990,8 +995,11 @@ private:
                 track.miss_count = 0;
                 track.total_age++;
 
-                if (track.state == TrackState::TENTATIVE && track.hit_count >= M_HITS_FOR_CONFIRM) {
-                    track.state = TrackState::CONFIRMED;
+                if (track.state == TrackState::TENTATIVE) {
+                    if (track.hit_count >= M_HITS_FOR_CONFIRM || 
+                        (track.hit_count >= 2 && (track.last_detection.peak_snr_db >= 10.0f || track.last_detection.is_neural_detection))) {
+                        track.state = TrackState::CONFIRMED;
+                    }
                 }
                 track.last_detection.track_state = (track.state == TrackState::CONFIRMED) ? 2 : 1;
                 track.last_detection.hit_count = track.hit_count;

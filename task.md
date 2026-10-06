@@ -138,6 +138,44 @@
   - [x] Integrate TensorRT FP16 spectral inference directly into real-time C++20 25 Hz analysis pipeline on Orin Nano via `SpectralCombNetEngine`.
   - [x] Verify all 3 unit test suites (`test_cuda_flicker`, `test_flicker_dsp`, `test_ego_motion` 100% passing) and deploy live service to `predator-camera.service`.
 
+- [x] **Phase 26: Foliage Background False Alarm Elimination & Physical/Neural Co-Gating**
+  - [x] Implement physical signal co-gating in `ev_flicker_detector.cpp`: require cells evaluated by `SpectralCombNet` to have micro-sieve periodic lock (`max_sieve_hits >= 2`) or physical candidate peaks.
+  - [x] Eliminate fabricated metrics (`snr_db = 10 + 8*purity`, `flatness = 0.02`): compute real physical SNR, sharpness Q-factor, and spectral flatness from the cell's cuFFT spectrum.
+  - [x] Restrict HUD bounding box rendering to CONFIRMED tracks ($M \ge 3$ hits), eliminating unconfirmed tentative track swarms on the live display.
+  - [x] Retrain `SpectralCombNet` on DGX Spark (`100.114.14.56`) with sparse Poisson event impulse noise ($N \in [4, 50]$ events) and negative purity loss, export ONNX, and compile TRT FP16 engine on Orin Nano.
+  - [x] Verify unit tests on Orin Nano, deploy updated binary, and verify clean live tracking of drone against foliage background.
 
+- [x] **Phase 27: Standoff Range Recovery (30ft–100ft) & Cross-Boundary Sieve Gating**
+  - [x] Identify root causes of detection range loss at 30-40ft+ (single-tile SAE micro-sieve boundary crossing during hover drift dropping periodic events; log-power median noise clamped to 0.20 squashing faint harmonic combs; cuFFT activity gate requiring 15-25 events; and HUD suppression of unconfirmed tentative tracks).
+  - [x] Implement 4-neighbor SAE cross-tile boundary check in `kernel_warp_sieve_ingest` with 45% periodic jitter tolerance and intra-burst retention.
+  - [x] Restore FFT log-power median noise normalization scale to $\ge 10^{-4}$ in `cuda_flicker_core.cu`, matching PyTorch training distribution and preserving weak-signal harmonic comb contrast.
+  - [x] Calibrate cuFFT standoff activity density ($\ge 6.0\text{ events}$ when `max_sieve_hits >= 2`) and energy threshold ($2.5\text{ peak power}$, scaling to $1.25$ with sieve lock).
+  - [x] Upgraded tracker confirmation: confirm in 2 frames ($80\text{ ms}$) if $\text{SNR} \ge 10.0\text{ dB}$ or neural-confirmed; expanded tentative coasting to 3 miss frames ($120\text{ ms}$) across sparse blade sweep dropouts.
+  - [x] Upgraded HUD rendering to display ACQUIRING targets (hit $\ge 2$ or $\text{SNR} \ge 10.0\text{ dB}$) in Amber, and CONFIRMED targets in Green, while completely suppressing 1-hit noise blips.
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed) and deployed live binary to `predator-camera.service` on Jetson Orin Nano (PID 119638).
 
+- [x] **Phase 28: Standoff Lock Recovery (80ft–115ft) & Dynamic Camera Tracking**
+  - [x] Conducted telemetry Root Cause Analysis: identified that narrow $16.6^\circ$ VFOV on 12mm lens caused climbing drone to exit top edge ($Y < 0$); moving foliage texture velocity filter ($v_{\text{scan}} = 1646 \cdot \omega$) unconditionally purged the 250 Hz drone during camera pans/tilts ($10^\circ/\text{s}\text{--}35^\circ/\text{s}$); and pre-FFT micro-sieve dropped 98.4% of distant rotor chops before entering temporal ring buffers.
+  - [x] Upgraded `kernel_warp_sieve_ingest` in `cuda_flicker_core.cu` to accumulate all unsuppressed events into 512-slot ring buffers, restoring 128ms coherent matched filtering for the cuFFT while retaining micro-sieve periodic lock scoring.
+  - [x] Gated the motion texture velocity filter in `cuda_flicker_core.cu` to ONLY reject broad diffuse clutter (`sharpness < 2.5 && flatness > 0.20 && max_sieve_hits < 2`), guaranteeing high-Q mechanical blade harmonics are never purged during camera pans.
+  - [x] Expanded tracker dynamic association gate in `flicker_dsp.hpp` to 220px ($5.1^\circ$) for confirmed and coasting tracks, eliminating track loss during active camera panning and hover drift.
+  - [x] Calibrated IMX636 analog biases (`bias_diff_on = 6, bias_diff_off = 6`) in `ev_flicker_detector.cpp` for enhanced photon sensitivity on sub-pixel blade sweeps at 80–115ft.
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed 100%) and deployed live service to Jetson Orin Nano (PID 127922).
+  - [x] Verified live flight telemetry: achieved solid lock with 240+ consecutive hits ($>9.6\text{ s}$ unbroken lock), $20.0\text{ dB}$ SNR at $250.0\text{ Hz}$ BPF ($7500\text{ RPM}$) during active $5.5^\circ/\text{s}$ camera tracking.
+
+- [x] **Phase 29: Stationary Hover Lock & Ego-Motion Decoupling**
+  - [x] Identified root cause of hover vs motion disparity: TensorRT UZH ConvGRU model is an Independently Moving Object (IMO) segmenter based on translating optical flow; in hover ($\mathbf{u} = 0$), the network output $\text{mask} \approx 0.05$, purging 97% of the hovering drone's blade chops before cuFFT accumulation. Elevating the drone generated translation optical flow ($\mathbf{u} > 0$), temporarily opening the mask.
+  - [x] Identified root cause of stationary smearing: Nicla Sense ME IMU had $+0.05\text{ rad/s}$ ($2.86^\circ/\text{s}$) static pitch bias, smearing the 12px rotor across 16.5px per 128ms FFT window, and 800ms anchor resets purged events outside the old FOV bounds.
+  - [x] Implemented online zero-velocity gyro bias estimator and deadband in `ego_motion.hpp`, eliminating phantom gyro drift when camera is resting.
+  - [x] Clamped homography coordinates in `cuda_flicker_core.cu` to prevent boundary event dropping.
+  - [x] Configured clean default bypass for TRT suppression and ego-warp in `ev_flicker_detector.cpp` (`enable_trt_suppression = false`, `enable_ego_warp = false`), restoring direct native pixel ingestion (`H = Identity`) and allowing 100% of hovering blade chops into the 512-point cuFFT.
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed) and deployed live binary to `predator-camera.service` on Jetson Orin Nano (PID 129214). Live telemetry confirms unbroken lock on stationary target with 124+ consecutive hits, $16\text{--}18\text{ dB}$ SNR, and $0\text{ misses}$.
+
+- [x] **Phase 30: Lean Frequency-Domain Pipeline & Nicla IMU Gyro Calibration**
+  - [x] Identified root cause of ego-motion failure during active camera movement: `ego_motion.hpp` had an inverted axis swap and a $16.384\times$ double-scaling multiplier (`BHI260_SCALE = 32768 / 2000`) on packet data that `nicla_predator_imu.ino` had already converted to SI units ($\text{rad/s}$ in optical camera frame). As a result, a $3^\circ/\text{s}$ horizontal pan was interpreted as a $49.1^\circ/\text{s}$ vertical pitch homography, instantaneously smearing and throwing events across the sensor.
+  - [x] Fixed `ego_motion.hpp` to assign `cam_wx = wx` (pitch), `cam_wy = wy` (yaw), `cam_wz = wz` (roll) with pure $1.0\times$ SI scaling.
+  - [x] Decommissioned the optical flow ConvGRU engine (`event_suppression_fp16.engine`) and 2-bin stack accumulator from `ev_flicker_detector.cpp`, removing $\sim 14\text{ ms}$ overhead and eliminating hover suppression traps entirely.
+  - [x] Streamlined CUDA core: lowered standoff activity gate in `cuda_flicker_core.cu` to $\ge 5.0\text{ events}$ without requiring micro-sieve hits, allowing weak, distant rotor sweeps at 80–115ft to enter cuFFT and `SpectralCombNet` analysis.
+  - [x] Enabled Nicla 200 Hz IMU ego-warp by default (`enable_ego_warp = true`).
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed 100%) and deployed updated binary to `predator-camera.service` on Jetson Orin Nano (PID 130679). Telemetry confirms unbroken lock (323+ consecutive hits, 0 misses, $16.8\text{ dB}$ SNR at $250\text{ Hz}$).
 

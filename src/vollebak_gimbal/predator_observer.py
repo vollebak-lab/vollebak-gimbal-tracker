@@ -7,7 +7,7 @@ from .event_camera import primary_event_target
 from .models import Angles, Detection
 
 UPSTREAM_REPOSITORY = "vollebak-lab/predator"
-UPSTREAM_COMMIT = "d5ff183"
+UPSTREAM_COMMIT = "032be3d"
 OPERATING_MODE = "OBSERVATION_ONLY"
 
 
@@ -34,6 +34,9 @@ def build_observer_telemetry(
     if not isinstance(ego_motion, dict):
         ego_motion = {}
     spectral_active = bool(ego_motion.get("spectral_combnet_active"))
+    roi_diagnostics = event_camera.get("roi_diagnostics", {})
+    if not isinstance(roi_diagnostics, dict):
+        roi_diagnostics = {}
     event_target = primary_event_target(event_camera)
     target_locked = target is not None or event_target is not None
     detector_name = str(config.detector.get("type", "motion")).upper()
@@ -104,6 +107,11 @@ def build_observer_telemetry(
             "spectral_detections": int(ego_motion.get("spectral_detections", 0) or 0),
             "suppressed_events_pct": float(
                 ego_motion.get("suppressed_events_pct", 0.0) or 0.0
+            ),
+            "event_tracks": int(event_camera.get("num_tracks", 0) or 0),
+            "roi_active_cells": int(roi_diagnostics.get("active_cells", 0) or 0),
+            "roi_max_sieve_hits": int(
+                roi_diagnostics.get("max_sieve_hits", 0) or 0
             ),
         },
         "layer2": {
