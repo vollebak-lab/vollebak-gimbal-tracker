@@ -1047,6 +1047,17 @@ int main(int argc, char* argv[]) {
             std::cout << "[WARN] SpectralCombNet TRT Engine not loaded, continuing with cuFFT peak detector.\n";
         }
 
+        // Configurable Ego-Motion & TensorRT Suppression Toggles
+        // Default to pure direct native ingestion (0/disabled) to ensure 100% detection of stationary/hovering drones
+        bool enable_trt_suppression = false;
+        bool enable_ego_warp = false;
+        const char* env_trt = std::getenv("PREDATOR_ENABLE_TRT_SUPPRESSION");
+        const char* env_warp = std::getenv("PREDATOR_ENABLE_EGO_WARP");
+        if (env_trt && std::string(env_trt) == "1") enable_trt_suppression = true;
+        if (env_warp && std::string(env_warp) == "1") enable_ego_warp = true;
+        std::cout << "[INFO] Pipeline Ingestion Mode: Ego-Warp=" << (enable_ego_warp ? "ACTIVE" : "BYPASS (Identity)")
+                  << ", TRT-Suppression=" << (enable_trt_suppression ? "ACTIVE" : "BYPASS (Pass-Through)") << ".\n";
+
         std::atomic<uint64_t> total_raw_counter{0};
         std::atomic<uint64_t> retained_counter{0};
         std::atomic<uint64_t> current_epoch_ref_us{0};
@@ -1078,21 +1089,28 @@ int main(int argc, char* argv[]) {
                 current_epoch_ref_us.store(t_ref);
             }
 
-            // Compute batch homography ONCE per OpenEB callback batch (1-2 ms window)
-            uint64_t mid_t = (begin->t + (end - 1)->t) / 2;
-            predator::Matrix3x3 batch_H = gyro_warper.compute_homography(t_ref, mid_t);
+            predator::Matrix3x3 batch_H = predator::Matrix3x3::identity();
+            if (enable_ego_warp) {
+                uint64_t mid_t = (begin->t + (end - 1)->t) / 2;
+                batch_H = gyro_warper.compute_homography(t_ref, mid_t);
+            }
 
             // Ingest into 2-bin stack accumulator for TensorRT
-            event_stack_acc.update_window(begin->t);
-            for (auto it = begin; it != end; ++it) {
-                event_stack_acc.ingest_event_fast(it->x, it->y, it->p);
+            if (enable_trt_suppression) {
+                event_stack_acc.update_window(begin->t);
+                for (auto it = begin; it != end; ++it) {
+                    event_stack_acc.ingest_event_fast(it->x, it->y, it->p);
+                }
             }
+
+            const float* d_suppression_mask = (enable_trt_suppression && suppression_engine.is_ready()) ?
+                suppression_engine.get_device_mask() : nullptr;
 
             // Direct GPU Ingestion, Homography Warping, TensorRT Mask Gating, SAE Sieve, and Ring Buffer Accumulation
             uint64_t raw_count = 0;
             uint64_t retained_count = 0;
             cuda_core.ingest_event_batch(begin, batch_size, batch_H, raw_count, retained_count,
-                                         suppression_engine.get_device_mask(), 0.35f, false);
+                                         d_suppression_mask, 0.35f, false);
 
             total_raw_counter.fetch_add(raw_count, std::memory_order_relaxed);
         });
@@ -1110,10 +1128,12 @@ int main(int argc, char* argv[]) {
         while (g_running && camera.is_running()) {
             next_cycle_epoch += cycle_interval;
 
-            // 1. Run TensorRT Anticipatory Suppression Inference on Latest 2-Bin Event Stack
-            std::vector<float> event_stack;
-            if (event_stack_acc.get_latest_stack(event_stack)) {
-                suppression_engine.infer(event_stack, 40.0f); // 40ms lookahead
+            // 1. Run TensorRT Anticipatory Suppression Inference on Latest 2-Bin Event Stack (if enabled)
+            if (enable_trt_suppression && suppression_engine.is_ready()) {
+                std::vector<float> event_stack;
+                if (event_stack_acc.get_latest_stack(event_stack)) {
+                    suppression_engine.infer(event_stack, 40.0f); // 40ms lookahead
+                }
             }
 
             // 2. Snapshot metrics
@@ -1128,7 +1148,7 @@ int main(int argc, char* argv[]) {
             double foliage_dispersion_pct = (100.0 * static_cast<double>(active_cells)) / 576.0;
 
             DetectionManager::EgoMotionStats ego_stats;
-            ego_stats.trt_suppression_active = suppression_engine.is_ready();
+            ego_stats.trt_suppression_active = enable_trt_suppression && suppression_engine.is_ready();
             ego_stats.imu_connected = imu_reader.is_connected();
             ego_stats.imu_packets = imu_reader.packet_count();
             ego_stats.gyro_wx = omega.x;
@@ -1241,10 +1261,10 @@ int main(int argc, char* argv[]) {
                 double world_x = res.patch_x * 40.0 + 20.0;
                 double world_y = res.patch_y * 40.0 + 20.0;
 
-                // Project world coordinate to current camera viewpoint
+                // Project world coordinate to current camera viewpoint (only if ego warping active)
                 double cam_x = world_x;
                 double cam_y = world_y;
-                if (t_now_cam > 0 && t_anchor > 0) {
+                if (enable_ego_warp && t_now_cam > 0 && t_anchor > 0) {
                     predator::Vector3d p_world(world_x, world_y, 1.0);
                     predator::Vector3d p_cam = H_world_to_cam * p_world;
                     if (std::abs(p_cam.z) > 1e-6) {

@@ -162,3 +162,11 @@
   - [x] Calibrated IMX636 analog biases (`bias_diff_on = 6, bias_diff_off = 6`) in `ev_flicker_detector.cpp` for enhanced photon sensitivity on sub-pixel blade sweeps at 80–115ft.
   - [x] Verified all 3 unit test suites ($26/26$ tests passed 100%) and deployed live service to Jetson Orin Nano (PID 127922).
   - [x] Verified live flight telemetry: achieved solid lock with 240+ consecutive hits ($>9.6\text{ s}$ unbroken lock), $20.0\text{ dB}$ SNR at $250.0\text{ Hz}$ BPF ($7500\text{ RPM}$) during active $5.5^\circ/\text{s}$ camera tracking.
+
+- [x] **Phase 29: Stationary Hover Lock & Ego-Motion Decoupling**
+  - [x] Identified root cause of hover vs motion disparity: TensorRT UZH ConvGRU model is an Independently Moving Object (IMO) segmenter based on translating optical flow; in hover ($\mathbf{u} = 0$), the network output $\text{mask} \approx 0.05$, purging 97% of the hovering drone's blade chops before cuFFT accumulation. Elevating the drone generated translation optical flow ($\mathbf{u} > 0$), temporarily opening the mask.
+  - [x] Identified root cause of stationary smearing: Nicla Sense ME IMU had $+0.05\text{ rad/s}$ ($2.86^\circ/\text{s}$) static pitch bias, smearing the 12px rotor across 16.5px per 128ms FFT window, and 800ms anchor resets purged events outside the old FOV bounds.
+  - [x] Implemented online zero-velocity gyro bias estimator and deadband in `ego_motion.hpp`, eliminating phantom gyro drift when camera is resting.
+  - [x] Clamped homography coordinates in `cuda_flicker_core.cu` to prevent boundary event dropping.
+  - [x] Configured clean default bypass for TRT suppression and ego-warp in `ev_flicker_detector.cpp` (`enable_trt_suppression = false`, `enable_ego_warp = false`), restoring direct native pixel ingestion (`H = Identity`) and allowing 100% of hovering blade chops into the 512-point cuFFT.
+  - [x] Verified all 3 unit test suites ($26/26$ tests passed) and deployed live binary to `predator-camera.service` on Jetson Orin Nano (PID 129214). Live telemetry confirms unbroken lock on stationary target with 124+ consecutive hits, $16\text{--}18\text{ dB}$ SNR, and $0\text{ misses}$.

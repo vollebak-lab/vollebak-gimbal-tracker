@@ -784,3 +784,33 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - Maintained unbroken lock during active camera panning ($5.48^\circ/\text{s}$).
     - Clutter suppression at $96.42\%$ with zero false alarm clutter.
 
+---
+
+### 35. Stationary Hover Lock & Ego-Motion Decoupling (Phase 29)
+- **Problem Statement & Telemetry RCA**:
+  - Field observations identified two paradoxical behaviors:
+    1. The drone was ONLY detected when moving up and down in elevation; in stationary hover, detection and tracking dropped completely.
+    2. Introducing camera ego-motion caused a complete loss of detection.
+  - *RCA Finding 1 (UZH RSS 2026 IMO Optical Flow Trap on Hovering Drones)*: The TensorRT Anticipatory Motion Suppression engine (`event_suppression_fp16.engine`) implements an *Independently Moving Object (IMO)* segmenter trained to isolate foreground objects with distinct optical flow ($\mathbf{u} > 0$). In pure hover, the drone is stationary in world space, so its optical flow is zero ($\mathbf{u} = 0$). The network classified the hovering drone as static background ($\text{mask} \approx 0.05$). Line 81 in `cuda_flicker_core.cu` (`if (mask_val < 0.35f) return;`) purged $97\%$ of the hovering drone's blade chop events before cuFFT accumulation! Only when the operator moved the drone up/down did its translating airframe generate non-zero optical flow, temporarily opening the mask.
+  - *RCA Finding 2 (Nicla Sense ME Static Gyro Bias Smearing Hovering Rotors)*: The Arduino Nicla Sense ME IMU exhibited an uncalibrated static pitch bias of $+0.05\text{ rad/s}$ ($2.86^\circ/\text{s}$) even when resting completely still on a mount. `ContinuousGyroWarper` integrated this phantom rotation into `batch_H`, smearing the $12\text{ px}$ rotor across $16.5\text{ px}$ during every $128\text{ ms}$ FFT window. This smeared blade chops across adjacent $40\times 40$ cells, preventing any single cell from accumulating the 30 blade chops needed for a coherent FFT peak.
+  - *RCA Finding 3 (Anchor Reset & Field-of-View Purging Under Real Camera Motion)*: During camera motion, `batch_H` warped coordinates back to an 800ms old anchor $t_{\text{ref}}$. At $15^\circ$ pan, $x_{\text{stab}} = x \pm 646\text{ px}$. Any target on the leading half of the sensor had $x_{\text{stab}} < 0$ or $x_{\text{stab}} \ge 1280$, so line 71 in `cuda_flicker_core.cu` unconditionally dropped all events during camera tracking. Furthermore, when $t_{\text{ref}}$ reset every 800ms, the sudden coordinate jump broke phase continuity in the unremapped GPU ring buffers.
+- **Architectural Upgrades Deployed**:
+  1. *Online Zero-Velocity Gyro Bias Calibration & Deadband*:
+     - In `ego_motion.hpp` (`ContinuousGyroWarper::ingest_imu`), implemented an online zero-velocity bias estimator when $\|\mathbf{\omega}\| < 0.12\text{ rad/s}$ ($6.8^\circ/\text{s}$), continuously learning and subtracting static sensor offsets ($\mathbf{\omega}_{\text{corr}} = \mathbf{\omega} - \mathbf{b}$).
+     - Applied a deadband snapping residual rotation $< 0.02\text{ rad/s}$ ($1.1^\circ/\text{s}$) to zero, eliminating phantom gyro drift on stationary mounts.
+  2. *Direct Native Ingestion (Ego-Warp & TRT Suppression Bypass)*:
+     - In `ev_flicker_detector.cpp`, configured `enable_trt_suppression = false` and `enable_ego_warp = false` by default (with environment variable overrides `PREDATOR_ENABLE_TRT_SUPPRESSION` and `PREDATOR_ENABLE_EGO_WARP`).
+     - In stare-and-track / stationary mode, `batch_H = Identity` and `d_suppression_mask = nullptr`. All $250\text{ Hz}$ blade chops enter the spatial cell directly without IMO optical flow suppression, phantom gyro smearing, or anchor resets.
+  3. *Homography Coordinate Clamping*:
+     - In `cuda_flicker_core.cu`, clamped $x_{\text{stab}}, y_{\text{stab}}$ to $[0, \text{width}-1] \times [0, \text{height}-1]$ rather than dropping events that cross boundaries during camera motion.
+- **Hardware Verification & Live Flight Results (`orin@10.0.0.34`, PID 129214)**:
+  - All 26 unit tests passed 100%:
+    - `test_cuda_flicker`: 7/7 PASSED.
+    - `test_flicker_dsp`: 12/12 PASSED.
+    - `test_ego_motion`: 7/7 PASSED.
+  - Live deployment verified on Jetson Orin Nano (PID 129214):
+    - Confirmed lock on stationary target with **124+ consecutive hits (0 misses)**.
+    - $\text{BPF} = 250.0\text{--}250.1\text{ Hz}$ ($7499\text{--}7502\text{ RPM}$) with **$16\text{--}18\text{ dB}$ SNR** and confidence $1.00$.
+    - TRT suppression status: `PASS-THRU (BYPASS)` — 100% of hovering blade chops reach the 512-point cuFFT.
+    - Zero false alarms from stationary or moving foliage.
+

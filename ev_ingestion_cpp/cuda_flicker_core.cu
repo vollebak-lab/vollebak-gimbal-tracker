@@ -67,10 +67,8 @@ __global__ void kernel_warp_sieve_ingest(
     float stab_x = (H[0] * x + H[1] * y + H[2]) * inv_denom;
     float stab_y = (H[3] * x + H[4] * y + H[5]) * inv_denom;
 
-    if (stab_x < 0.0f || stab_x >= static_cast<float>(width) ||
-        stab_y < 0.0f || stab_y >= static_cast<float>(height)) {
-        return;
-    }
+    stab_x = fmaxf(0.0f, fminf(static_cast<float>(width - 1), stab_x));
+    stab_y = fmaxf(0.0f, fminf(static_cast<float>(height - 1), stab_y));
 
     // 2. Direct-to-GPU TensorRT Ego-Motion Suppression Gating
     if (suppression_mask != nullptr) {
