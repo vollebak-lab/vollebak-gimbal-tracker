@@ -48,6 +48,8 @@ __global__ void kernel_warp_sieve_ingest(
     float* __restrict__ cell_total_events,
     uint32_t* __restrict__ cell_max_sieve_hits,
     size_t head_idx,
+    uint64_t head_bin_start_us,
+    uint32_t bin_duration_us,
     uint32_t min_period_us,
     uint32_t max_period_us,
     uint32_t* __restrict__ retained_counter) {
@@ -173,28 +175,47 @@ __global__ void kernel_warp_sieve_ingest(
         atomicAdd(retained_counter, 1);
     }
 
-    // 8. Accumulate into base spatial grid (32 cols x 18 rows, 40x40 px cells)
-    // Preserves all unsuppressed events so the 512-point cuFFT can perform 128ms coherent matched filtering
-    int col = sx / 40;
-    int row = sy / 40;
-    if (col < 0) col = 0; if (col >= 32) col = 31;
-    if (row < 0) row = 0; if (row >= 18) row = 17;
+    // 8. Temporal Ring Buffer Bin Calculation:
+    // Map event timestamp ev.t directly to its exact microsecond temporal slot relative to head_bin_start_us
+    uint64_t ev_t = ev.t;
+    size_t event_slot = head_idx;
+    bool in_window = true;
 
-    int cell_idx = row * 32 + col;
-    atomicAdd(&ring_buffers[cell_idx * 512 + head_idx], 1.0f);
-    atomicAdd(&cell_total_events[cell_idx], 1.0f);
-    if (cell_max_sieve_hits != nullptr && is_periodic) {
-        atomicMax(&cell_max_sieve_hits[cell_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
+    if (ev_t >= head_bin_start_us) {
+        event_slot = head_idx;
+    } else {
+        uint64_t dt_back = head_bin_start_us - ev_t;
+        uint64_t bins_back = (dt_back + bin_duration_us - 1) / bin_duration_us;
+        if (bins_back >= 512) {
+            in_window = false;
+        } else {
+            event_slot = (head_idx + 512 - (bins_back % 512)) % 512;
+        }
     }
 
-    // 9. Also accumulate into 2x2 pooled cells (576..1151)
-    for (int pr = max(0, row - 1); pr <= min(17, row); ++pr) {
-        for (int pc = max(0, col - 1); pc <= min(31, col); ++pc) {
-            int pooled_idx = 576 + (pr * 32 + pc);
-            atomicAdd(&ring_buffers[pooled_idx * 512 + head_idx], 1.0f);
-            atomicAdd(&cell_total_events[pooled_idx], 1.0f);
-            if (cell_max_sieve_hits != nullptr && is_periodic) {
-                atomicMax(&cell_max_sieve_hits[pooled_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
+    if (in_window) {
+        // Accumulate into base spatial grid (32 cols x 18 rows, 40x40 px cells)
+        int col = sx / 40;
+        int row = sy / 40;
+        if (col < 0) col = 0; if (col >= 32) col = 31;
+        if (row < 0) row = 0; if (row >= 18) row = 17;
+
+        int cell_idx = row * 32 + col;
+        atomicAdd(&ring_buffers[cell_idx * 512 + event_slot], 1.0f);
+        atomicAdd(&cell_total_events[cell_idx], 1.0f);
+        if (cell_max_sieve_hits != nullptr && is_periodic) {
+            atomicMax(&cell_max_sieve_hits[cell_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
+        }
+
+        // 9. Also accumulate into 2x2 pooled cells (576..1151)
+        for (int pr = max(0, row - 1); pr <= min(17, row); ++pr) {
+            for (int pc = max(0, col - 1); pc <= min(31, col); ++pc) {
+                int pooled_idx = 576 + (pr * 32 + pc);
+                atomicAdd(&ring_buffers[pooled_idx * 512 + event_slot], 1.0f);
+                atomicAdd(&cell_total_events[pooled_idx], 1.0f);
+                if (cell_max_sieve_hits != nullptr && is_periodic) {
+                    atomicMax(&cell_max_sieve_hits[pooled_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
+                }
             }
         }
     }
@@ -294,8 +315,9 @@ __global__ void kernel_analyze_spectral_peaks(
     }
 
     // Standoff Dynamic Activity Gate:
-    // Allow weak standoff signals (>= 5.0 events) to proceed to spectral harmonic analysis and CombNet
-    float min_activity_req = is_pooled ? 8.0f : 5.0f;
+    // Allow weak standoff signals (>= 6.0 events) to proceed if periodic micro-sieve locked (max_sieve_hits >= 2).
+    // Require higher event density (>= 15 base / 22 pooled) for aperiodic clutter/noise.
+    float min_activity_req = (max_sieve_hits >= 2) ? 6.0f : (is_pooled ? 22.0f : 15.0f);
     if (total_events < min_activity_req) return;
 
     // Peak search using Harmonic Product Spectrum (HPS) in [min_freq_hz, max_freq_hz] (bins 9 to 102 for 70..800 Hz)
@@ -629,26 +651,32 @@ void CudaFlickerCore::ingest_event_batch(const void* events, size_t count, const
     }
 
     const auto* ev_arr = static_cast<const Metavision::EventCD*>(events);
+    size_t batch_size = std::min(count, max_events_per_batch_);
 
-    // Window alignment
-    uint64_t first_t = ev_arr[0].t;
-    if (current_window_start_us_ == 0) {
-        current_window_start_us_ = first_t;
+    // Find the latest timestamp in this batch to synchronize temporal advancement
+    uint64_t max_t = ev_arr[0].t;
+    for (size_t i = 1; i < batch_size; ++i) {
+        if (ev_arr[i].t > max_t) {
+            max_t = ev_arr[i].t;
+        }
     }
 
-    if (first_t >= current_window_start_us_ + bin_duration_us_) {
-        uint64_t elapsed_us = first_t - current_window_start_us_;
+    // Window alignment: advance temporal ring buffer bins up to max_t
+    if (current_window_start_us_ == 0) {
+        current_window_start_us_ = ev_arr[0].t;
+    }
+
+    if (max_t >= current_window_start_us_ + bin_duration_us_) {
+        uint64_t elapsed_us = max_t - current_window_start_us_;
         uint64_t steps = elapsed_us / bin_duration_us_;
-        if (steps > history_samples_) {
+        if (steps >= history_samples_) {
             steps = history_samples_;
-            current_window_start_us_ = first_t;
+            current_window_start_us_ = max_t;
         } else {
             current_window_start_us_ += steps * bin_duration_us_;
         }
         advance_temporal_bins(steps);
     }
-
-    size_t batch_size = std::min(count, max_events_per_batch_);
 
     // Direct zero-copy DMA transfer (Metavision::EventCD and CudaRawEvent have identical 16-byte memory layout)
     CUDA_CHECK(cudaMemcpyAsync(d_events_, events, batch_size * sizeof(CudaRawEvent), cudaMemcpyHostToDevice, stream_));
@@ -672,7 +700,8 @@ void CudaFlickerCore::ingest_event_batch(const void* events, size_t count, const
         d_suppression_mask, suppression_threshold,
         sensor_width_, sensor_height_, tile_w_, tile_h_,
         d_sae_timestamp_us_, d_sae_last_dt_us_, d_sae_hits_,
-        d_ring_buffers_, d_cell_total_events_, d_cell_max_sieve_hits_, head_idx_,
+        d_ring_buffers_, d_cell_total_events_, d_cell_max_sieve_hits_,
+        head_idx_, current_window_start_us_, static_cast<uint32_t>(bin_duration_us_),
         min_period_us, max_period_us, d_retained_counter_);
 
     out_raw_count = batch_size;
@@ -794,10 +823,12 @@ void CudaFlickerCore::get_active_cells_with_spectra(
     CUDA_CHECK(cudaMemcpy(h_cell_totals_, d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_cell_sieve_hits_, d_cell_max_sieve_hits_, num_total_cells_ * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    // Identify active base and pooled cells with sufficient event density (>= min_events)
+    // Identify active base and pooled cells with sufficient event density
+    // Require micro-sieve periodic lock (hits >= 1 && ev >= min_events) or strong event density (ev >= 15.0f)
     for (int i = 0; i < num_total_cells_; ++i) {
         float ev = h_cell_totals_[i];
-        if (ev >= min_events) {
+        uint32_t hits = h_cell_sieve_hits_[i];
+        if ((hits >= 1 && ev >= min_events) || (ev >= 15.0f)) {
             out_cell_indices.push_back(i);
             if (out_cell_indices.size() >= 128) break; // Capped at max batch size
         }
@@ -824,7 +855,7 @@ void CudaFlickerCore::get_active_cells_with_spectra(
         auto& spec = out_spectra[b];
         std::vector<float> noise_slice(spec.begin() + 5, spec.begin() + 128);
         std::sort(noise_slice.begin(), noise_slice.end());
-        float median_noise = std::max(1e-4f, noise_slice[noise_slice.size() / 2]);
+        float median_noise = std::max(0.20f, noise_slice[noise_slice.size() / 2]);
         for (int k = 0; k < 257; ++k) {
             spec[k] = std::log10(1.0f + spec[k] / median_noise);
         }

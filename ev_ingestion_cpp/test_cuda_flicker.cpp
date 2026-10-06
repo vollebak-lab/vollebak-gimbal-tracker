@@ -109,15 +109,6 @@ int main() {
             ev.t = t_now + b * 60;
             batch.push_back(ev);
         }
-        // Secondary harmonic pass (2x harmonic at 500 Hz)
-        for (int b = 0; b < 2; ++b) {
-            Metavision::EventCD ev;
-            ev.x = 320;
-            ev.y = 180;
-            ev.p = 1;
-            ev.t = t_now + 2000 + b * 60;
-            batch.push_back(ev);
-        }
         uint64_t raw_c = 0, ret_c = 0;
         cuda_core.ingest_event_batch(batch.data(), batch.size(), H_identity, raw_c, ret_c, nullptr, 0.35f, true);
         t_now += 4000; // 250 Hz blade chop

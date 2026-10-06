@@ -997,7 +997,7 @@ private:
 
                 if (track.state == TrackState::TENTATIVE) {
                     if (track.hit_count >= M_HITS_FOR_CONFIRM || 
-                        (track.hit_count >= 2 && (track.last_detection.peak_snr_db >= 10.0f || track.last_detection.is_neural_detection))) {
+                        (track.hit_count >= 2 && track.last_detection.is_neural_detection && track.last_detection.confidence >= 0.70)) {
                         track.state = TrackState::CONFIRMED;
                     }
                 }

@@ -177,5 +177,19 @@
   - [x] Decommissioned the optical flow ConvGRU engine (`event_suppression_fp16.engine`) and 2-bin stack accumulator from `ev_flicker_detector.cpp`, removing $\sim 14\text{ ms}$ overhead and eliminating hover suppression traps entirely.
   - [x] Streamlined CUDA core: lowered standoff activity gate in `cuda_flicker_core.cu` to $\ge 5.0\text{ events}$ without requiring micro-sieve hits, allowing weak, distant rotor sweeps at 80–115ft to enter cuFFT and `SpectralCombNet` analysis.
   - [x] Enabled Nicla 200 Hz IMU ego-warp by default (`enable_ego_warp = true`).
-  - [x] Verified all 3 unit test suites ($26/26$ tests passed 100%) and deployed updated binary to `predator-camera.service` on Jetson Orin Nano (PID 130679). Telemetry confirms unbroken lock (323+ consecutive hits, 0 misses, $16.8\text{ dB}$ SNR at $250\text{ Hz}$).
+  - [x] **Phase 31: False Alarm Elimination & Microsecond Temporal Binning Synchronization**
+  - [x] Conducted Root Cause Analysis on false alarms across foliage backdrop with no drone active:
+    - Identified that OpenEB USB packet transfers flushes every $4.0\text{ ms}$ ($250\text{ Hz}$) under low event rates. Ingestion kernel previously dumped all events in a batch into a single scalar bin `head_idx`, transforming USB batch flushes into an artificial periodic impulse train at $250.0\text{ Hz}$ across every cell.
+    - Identified that Phase 30's activity gate ($5.0\text{ events}$ without micro-sieve gating) allowed constructive cosine interference of Poisson noise to pass cuFFT peak thresholds.
+    - Identified that `SpectralCombNet` was strictly additive and never pruned raw physical candidates when the model classified the cell as foliage/noise ($\text{prob} = 0.0001$).
+    - Identified that `SpatialFlickerClusterer` promoted tracks to `CONFIRMED` in only 2 hits on pure noise if `peak_snr_db >= 10.0f`.
+    - Identified that HUD rendering displayed 1-hit tentative noise blips in Amber if SNR $\ge 10.0\text{ dB}$.
+  - [x] Implemented microsecond temporal event binning in `cuda_flicker_core.cu` (`kernel_warp_sieve_ingest`): synchronized window advancement to `max_t` and mapped each event timestamp `ev.t` directly to its exact microsecond bin slot: `event_slot = (head_idx + 512 - (bins_back % 512)) % 512`.
+  - [x] Restored micro-sieve periodic lock gate in `kernel_analyze_spectral_peaks`: required `max_sieve_hits >= 2` for weak standoff signals ($\ge 6.0\text{ events}$), while requiring $\ge 15.0\text{ events}$ for non-periodic noise/clutter.
+  - [x] Implemented deep neural clutter pruning in `ev_flicker_detector.cpp`: evaluated all active cells with `SpectralCombNet` (`min_prob = 0.0f`) and pruned candidates where $\text{drone\_prob} < 0.35$.
+  - [x] Clamped noise floor in `get_active_cells_with_spectra` to $\ge 0.20\text{f}$ and required `(hits >= 1 && ev >= min_events) || (ev >= 15.0f)` to match DGX Spark training distribution.
+  - [x] Hardened track confirmation in `flicker_dsp.hpp`: fast 2-hit confirmation strictly requires `is_neural_detection && confidence >= 0.70`; non-neural candidates require $M \ge 3$ hits.
+  - [x] Restricted visual HUD rendering to `CONFIRMED` tracks only (Green for active lock, Amber for coasting), completely hiding 1-hit tentative noise blips.
+  - [x] Verified all 3 unit test suites ($25/25$ tests passed 100%) and deployed updated binary to `predator-camera.service` on Jetson Orin Nano (PID 139273).
+  - [x] Verified live deployment: 0 false alarms on static foliage scene (`num_targets: 0`, `num_tracks: 0`, `suppressed_events_pct: 98.6%`) with full 200 Hz IMU ego-motion compensation actively running.
 

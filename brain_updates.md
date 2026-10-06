@@ -848,4 +848,39 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - Memory reduced to $98.5\text{ MB}$.
     - Pipeline compute latency reduced to $<2.5\text{ ms}$ total per frame.
 
-
+### 37. False Alarm Elimination & Microsecond Temporal Binning Synchronization (Phase 31)
+- **Problem Statement**:
+  - With no drone active in the scene, the system exhibited false positives across the live event camera feed against foliage backdrops.
+- **Root Cause Analysis (RCA)**:
+  1. *Synthetic 250 Hz USB Batching Impulse Train*: In `cuda_flicker_core.cu`, `kernel_warp_sieve_ingest` was passed a single scalar `head_idx` per callback batch, and all events in the batch were dumped into `ring_buffers[cell_idx * 512 + head_idx]`. Under low event rates, OpenEB's USB buffer flushes every $4.0\text{ ms}$ ($250\text{ Hz}$). Dumping all events into `head_idx` every 4ms created a synthetic periodic impulse train with period $T = 4.0\text{ ms}$ (every 16 bins at 4000 Hz sample rate). The 512-point cuFFT transformed this impulse train into a sharp artificial peak at **$250.00\text{ Hz}$** across every cell receiving even 1 event.
+  2. *Overly Loose 5-Event Activity Gate*: In Phase 30, `min_activity_req` was changed to `is_pooled ? 8.0f : 5.0f` without requiring `max_sieve_hits >= 2`. In an empty cell with 5 Poisson noise events, constructive cosine interference produced calculated SNR of $11\text{--}15\text{ dB}$, passing the FFT peak filter.
+  3. *Lack of Neural Pruning for cuFFT Candidates*: In `ev_flicker_detector.cpp`, `raw_detections` from `execute_batched_spectral_analysis` were never pruned if `SpectralCombNet` classified the cell as clutter/foliage ($\text{prob} = 0.0001$). The neural network was only used additively, allowing raw noise candidates to pass straight to the tracker.
+  4. *Premature 2-Hit Confirmation on Noise*: In `flicker_dsp.hpp` line 1000, tracks were promoted to `CONFIRMED` in only 2 hits if `peak_snr_db >= 10.0f`, even if they were non-neural noise blips.
+  5. *HUD Rendering Single-Frame Tentatives*: In `ev_flicker_detector.cpp`, `display_encoder_thread_func` drew Amber boxes for any tentative track if `peak_snr_db >= 10.0f`, causing 1-hit transient noise blips to clutter the screen.
+- **Architectural Fixes Deployed**:
+  1. *Microsecond Temporal Event Binning (`cuda_flicker_core.cu`)*:
+     - Scanned event batches for `max_t`, synchronized `current_window_start_us_` advancement, and mapped each event timestamp `ev.t` directly to its exact microsecond bin slot: `event_slot = (head_idx + 512 - (bins_back % 512)) % 512`.
+     - Uniformly dispersed Poisson background noise across all 16 bins per USB packet, permanently destroying the artificial 250 Hz periodic impulse train.
+  2. *Restored Micro-Sieve Periodic Lock Gate (`cuda_flicker_core.cu`)*:
+     - Gated weak standoff activity ($\ge 6.0\text{ events}$) to cells with `max_sieve_hits >= 2`.
+     - Non-periodic clutter requires $\ge 15.0\text{ events}$ (base) / $\ge 22.0\text{ events}$ (pooled), rejecting Poisson shot noise blips.
+  3. *Deep Neural Clutter Pruning Filter (`ev_flicker_detector.cpp`)*:
+     - Evaluated all active cells with `SpectralCombNet` (`min_prob = 0.0f`).
+     - Pruned any raw candidate matching cells where `SpectralCombNet` classified $\text{drone\_prob} < 0.35$.
+  4. *Clamped Median Noise Floor (`cuda_flicker_core.cu`)*:
+     - Clamped `median_noise = std::max(0.20f, ...)` in `get_active_cells_with_spectra`, matching the DGX Spark training distribution and preventing numerical scale explosions on empty cells.
+     - Required micro-sieve periodic lock (`hits >= 1 && ev >= min_events`) or strong event density (`ev >= 15.0f`) to query cells for neural evaluation.
+  5. *Hardened Tracker Confirmation (`flicker_dsp.hpp`)*:
+     - Fast 2-hit confirmation now strictly requires neural confirmation (`is_neural_detection && confidence >= 0.70`). Non-neural tracks require $M \ge 3$ hits.
+  6. *Tactical HUD Display Gating (`ev_flicker_detector.cpp`)*:
+     - Restricted bounding box rendering to `CONFIRMED` tracks only (Green for active lock, Amber for coasting). Single-frame tentative hypotheses are hidden from the visual display.
+- **Hardware Verification & Live Results (`orin@10.0.0.34`, PID 139273)**:
+  - All 3 unit test suites passed 100% on Jetson Orin Nano hardware:
+    - `test_cuda_flicker`: 6/6 PASSED (0.84 ms cuFFT latency, CombNet prob=0.9604, foliage=0.0001, standoff 250 Hz recovered).
+    - `test_flicker_dsp`: 12/12 PASSED.
+    - `test_ego_motion`: 7/7 PASSED.
+  - Live deployment verified on Jetson Orin Nano (`predator-camera.service` PID 139273):
+    - Live logs: `[PIPELINE] Raw: ~600 ev | Retained: ~15 ev (98% supp) | CombNet: eval=128 det=0 | Cands: 0 | Confirmed: 0 | Tracks: 0`.
+    - Live `/flicker_stats`: `"num_targets": 0`, `"num_tracks": 0`, `"tracks": []`, `"targets": []`.
+    - Live video HUD: 0 false positive boxes displayed across the foliage scene.
+    - Full IMU ego-motion compensation actively running at 200 Hz.

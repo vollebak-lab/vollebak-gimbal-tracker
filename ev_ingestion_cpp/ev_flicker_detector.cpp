@@ -471,11 +471,11 @@ void display_encoder_thread_func(int width, int height) {
             auto ego_stats = g_detection_mgr.get_ego_stats();
 
             // Draw detection bounding boxes and HUD on frame
-            // Render CONFIRMED drone targets in bright green, and ACQUIRING targets (hit >= 2 or SNR >= 10.0 dB) in Amber
+            // Only render CONFIRMED drone targets (Green for active lock, Amber for coasting)
             for (const auto& trk : all_tracks) {
                 bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
-                if (!is_confirmed && trk.hit_count < 2 && trk.last_detection.peak_snr_db < 10.0f) {
-                    continue; // Suppress single-frame 1-hit noise blips
+                if (!is_confirmed) {
+                    continue; // Suppress unconfirmed tentative tracks from HUD
                 }
                 const auto& d = trk.last_detection;
                 int bx = d.centroid_px_x - 40;
@@ -484,17 +484,18 @@ void display_encoder_thread_func(int width, int height) {
                                      std::min(80, width - std::max(0, bx)), 
                                      std::min(80, height - std::max(0, by)));
                 
-                cv::Scalar box_color = is_confirmed ? cv::Scalar(0, 255, 128) : cv::Scalar(0, 215, 255); // Green vs Amber
-                cv::rectangle(frame, target_rect, box_color, is_confirmed ? 2 : 1);
+                bool is_coasting = (trk.miss_count > 0);
+                cv::Scalar box_color = is_coasting ? cv::Scalar(0, 215, 255) : cv::Scalar(0, 255, 128); // Amber coasting vs Green locked
+                cv::rectangle(frame, target_rect, box_color, 2);
                 
                 char label[128];
                 const char* net_tag = d.is_neural_detection ? " [NET]" : "";
-                if (is_confirmed) {
+                if (is_coasting) {
+                    snprintf(label, sizeof(label), "DRONE #%d [COAST %d] %.0fHz [%.1fdB]%s", 
+                             trk.track_id, trk.miss_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
+                } else {
                     snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
                              trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
-                } else {
-                    snprintf(label, sizeof(label), "[ACQUIRING #%d %d/3] %.0fHz [%.1fdB]%s", 
-                             trk.track_id, trk.hit_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
                 }
                 cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
                             cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
@@ -1173,7 +1174,7 @@ int main(int argc, char* argv[]) {
                         ptrs[i] = active_spectra[i].data();
                     }
                     std::vector<predator::SpectralPrediction> neural_preds;
-                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.55f);
+                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.0f);
 
                     for (const auto& np : neural_preds) {
                         top_neural_prob = std::max(top_neural_prob, np.drone_prob);
@@ -1181,6 +1182,19 @@ int main(int argc, char* argv[]) {
                         int base_cell = is_pooled ? (np.cell_idx - 576) : np.cell_idx;
                         int patch_col = base_cell % 32;
                         int patch_row = base_cell / 32;
+
+                        if (np.drone_prob < 0.35f) {
+                            // Neural Clutter Rejection:
+                            // Cell evaluated by SpectralCombNet is classified as foliage/wind/noise.
+                            // Prune any raw physical candidate matching this cell to eliminate false alarms!
+                            raw_detections.erase(
+                                std::remove_if(raw_detections.begin(), raw_detections.end(),
+                                    [&](const predator::FlickerDetectionResult& rd) {
+                                        return rd.patch_x == patch_col && rd.patch_y == patch_row;
+                                    }),
+                                raw_detections.end());
+                            continue;
+                        }
 
                         bool already_detected = false;
                         for (auto& rd : raw_detections) {
