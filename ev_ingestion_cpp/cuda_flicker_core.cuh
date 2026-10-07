@@ -2,23 +2,17 @@
 #define PREDATOR_CUDA_FLICKER_CORE_CUH
 
 #include <vector>
+#include <atomic>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include "flicker_dsp.hpp"
+#include "gpu_event.hpp"
+#include "spectral_gate.hpp"
 
 namespace predator {
 
-/**
- * @brief Raw event struct compatible with CUDA memory layout
- */
-struct alignas(16) CudaRawEvent {
-    uint16_t x;
-    uint16_t y;
-    int16_t p;
-    int16_t pad;
-    uint64_t t;
-};
+// CudaRawEvent (16 B GPU event record) is defined in gpu_event.hpp, shared with the EVT2.1 GPU decoder.
 
 /**
  * @brief Detection candidate record returned by GPU spectral analysis kernel
@@ -68,12 +62,14 @@ public:
     CudaFlickerCore& operator=(const CudaFlickerCore&) = delete;
 
     /**
-     * @brief Ingests a batch of events onto GPU, performs homography unwarping, SAE periodicity sieving, and ring buffer accumulation
-     * @param events Host pointer to Metavision EventCD events
+     * @brief Ingests a batch of events: CPU periodicity sieve (timestamp order), then GPU homography
+     *        unwarping and ring buffer accumulation. Batches larger than the pinned staging buffer are
+     *        processed in chunks; no event is dropped. Must be called from a single thread (camera callback).
+     * @param events Host pointer to Metavision EventCD events (non-decreasing timestamps)
      * @param count Number of events in batch
      * @param H 3x3 Homography matrix mapping current camera frame to stabilized world frame
      * @param[out] out_raw_count Total raw events processed
-     * @param[out] out_retained_count Number of events passing the periodicity sieve
+     * @param[out] out_retained_count Number of events passing the periodicity sieve (this batch)
      */
     void ingest_event_batch(const void* events, size_t count, const Matrix3x3& H,
                             uint64_t& out_raw_count, uint64_t& out_retained_count,
@@ -93,17 +89,20 @@ public:
     void advance_temporal_bins(size_t steps);
 
     /**
-     * @brief Executes batched 1152-channel cuFFT and parallel peak spectral detection on GPU
-     * @param min_freq_hz Minimum search frequency (e.g., 70 Hz)
-     * @param max_freq_hz Maximum search frequency (e.g., 800 Hz)
-     * @param min_energy Minimum peak power threshold
-     * @param min_snr_db Minimum SNR in dB threshold
-     * @param gyro_speed_deg_s Current angular speed of camera from IMU
-     * @param[out] out_candidates List of detected drone propeller candidates
+     * @brief Validates a gate configuration and derives its CFAR threshold (spectral_gate.hpp).
+     * @throws std::invalid_argument on an inconsistent configuration (previous config is kept).
+     */
+    void set_spectral_gate_config(const SpectralGateConfig& cfg);
+
+    /// Active (derived) gate configuration, including the CFAR threshold in use.
+    const SpectralGateConfig& spectral_gate_config() const { return gate_cfg_; }
+
+    /**
+     * @brief Executes batched 1152-channel cuFFT and the shared CFAR gate chain on GPU
+     * @param gyro_speed_deg_s Current angular speed of camera from IMU (texture-scan filter)
+     * @param[out] out_candidates Cells passing every gate (each meets the false-alarm budget)
      */
     void execute_batched_spectral_analysis(
-        double min_freq_hz, double max_freq_hz,
-        double min_energy, double min_snr_db,
         double gyro_speed_deg_s,
         std::vector<FlickerDetectionResult>& out_candidates);
 
@@ -133,6 +132,11 @@ public:
                                       float min_events = 6.0f);
 
     /**
+     * @brief Resets per-frame periodic micro-sieve hit accumulators in GPU memory
+     */
+    void reset_sieve_hit_accumulators();
+
+    /**
      * @brief Resets all GPU state, SAE surfaces, and ring buffers
      */
     void reset();
@@ -148,17 +152,22 @@ private:
     double sample_rate_hz_{4000.0};
     size_t history_samples_{512};
     uint64_t bin_duration_us_{250};
-    uint64_t current_window_start_us_{0};
+    uint64_t current_window_start_us_{0};   ///< Head bin start, snapped to a multiple of bin_duration_us_
+    bool window_anchored_{false};           ///< False until the first chunk establishes the bin grid
     size_t head_idx_{0};
+    SpectralGateConfig gate_cfg_{};         ///< Derived CFAR gate (set_spectral_gate_config)
 
-    // Micro-tile SAE dimensions (2x2 pixel micro-neighborhood)
-    int tile_w_{640};
-    int tile_h_{360};
-    int num_tiles_{640 * 360};
+    // Order-correct periodicity sieve on 2x2 micro-tiles (Phase 33.4). Runs on the CPU in the
+    // camera callback thread, in timestamp order; 75-1200 Hz (833-13333 us periods).
+    MicroNeighborhoodPeriodicitySieve sieve_;
+
+    // Events that passed the sieve since the last get_and_reset_retained_count() (telemetry).
+    std::atomic<uint64_t> retained_count_{0};
 
     // CUDA Streams & cuFFT Plan
     cudaStream_t stream_{nullptr};
     cufftHandle cufft_plan_{0};
+    cudaEvent_t upload_done_{nullptr}; ///< Signals h_event_buffer_ may be overwritten (async H2D finished)
 
     // Host Pinned Memory Buffers
     CudaRawEvent* h_event_buffer_{nullptr};
@@ -170,13 +179,7 @@ private:
 
     // Device GPU Buffers
     CudaRawEvent* d_events_{nullptr};
-    uint32_t* d_retained_counter_{nullptr};
     float* d_homography_matrix_{nullptr};
-
-    // Surface of Active Events (SAE) in GPU memory
-    uint32_t* d_sae_timestamp_us_{nullptr};
-    uint32_t* d_sae_last_dt_us_{nullptr};
-    uint8_t* d_sae_hits_{nullptr};
 
     // Spatial Ring Buffers (1152 cells x 512 samples)
     float* d_ring_buffers_{nullptr};
@@ -191,6 +194,10 @@ private:
     // Output Candidate Buffers
     CudaDetectionCandidate* d_candidates_{nullptr};
     uint32_t* d_num_candidates_{nullptr};
+
+    /// Uploads one pre-sieved chunk (<= max_events_per_batch_) and launches the ingest kernel.
+    void ingest_chunk(size_t chunk_size, uint64_t chunk_max_t, const float* d_suppression_mask,
+                      float suppression_threshold);
 };
 
 } // namespace predator

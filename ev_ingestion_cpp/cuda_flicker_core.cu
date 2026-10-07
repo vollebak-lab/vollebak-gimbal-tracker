@@ -29,9 +29,14 @@ namespace predator {
 __constant__ float c_hanning_window[512];
 
 /**
- * @brief CUDA Kernel: Unwarp events via Homography H, evaluate TensorRT ego-motion suppression mask,
- * evaluate Surface of Active Events (SAE) Periodicity Sieve with atomic timestamp sequencing,
- * and atomically accumulate into spatial temporal ring buffers.
+ * @brief CUDA Kernel: Unwarp events via Homography H, apply the optional TensorRT suppression mask,
+ * and atomically accumulate every in-window event into the spatial temporal ring buffers.
+ *
+ * Phase 33.4 (data integrity): ring-buffer accumulation is UNCONDITIONAL for every event that
+ * lands inside the stabilized sensor area. The periodicity sieve no longer runs here: it is
+ * evaluated on the CPU in timestamp order (MicroNeighborhoodPeriodicitySieve) and its per-event
+ * hit count arrives in CudaRawEvent::pad. Previously a parallel SAE evaluation saw per-tile
+ * events out of order and `return`ed before accumulation, silently dropping FFT samples.
  */
 __global__ void kernel_warp_sieve_ingest(
     const CudaRawEvent* __restrict__ events,
@@ -40,19 +45,12 @@ __global__ void kernel_warp_sieve_ingest(
     const float* __restrict__ suppression_mask,
     float suppression_threshold,
     int width, int height,
-    int tile_w, int tile_h,
-    uint32_t* __restrict__ sae_timestamp_us,
-    uint32_t* __restrict__ sae_last_dt_us,
-    uint8_t* __restrict__ sae_hits,
     float* __restrict__ ring_buffers,
     float* __restrict__ cell_total_events,
     uint32_t* __restrict__ cell_max_sieve_hits,
     size_t head_idx,
     uint64_t head_bin_start_us,
-    uint32_t bin_duration_us,
-    uint32_t min_period_us,
-    uint32_t max_period_us,
-    uint32_t* __restrict__ retained_counter) {
+    uint32_t bin_duration_us) {
 
     size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= count) return;
@@ -69,8 +67,12 @@ __global__ void kernel_warp_sieve_ingest(
     float stab_x = (H[0] * x + H[1] * y + H[2]) * inv_denom;
     float stab_y = (H[3] * x + H[4] * y + H[5]) * inv_denom;
 
-    stab_x = fmaxf(0.0f, fminf(static_cast<float>(width - 1), stab_x));
-    stab_y = fmaxf(0.0f, fminf(static_cast<float>(height - 1), stab_y));
+    // Events warped outside the stabilized field are discarded. (Clamping them, as before,
+    // piled them onto border cells and produced persistent border false tracks.)
+    if (stab_x < -0.5f || stab_x > static_cast<float>(width) - 0.5f ||
+        stab_y < -0.5f || stab_y > static_cast<float>(height) - 0.5f) {
+        return;
+    }
 
     // 2. Direct-to-GPU TensorRT Ego-Motion Suppression Gating
     if (suppression_mask != nullptr) {
@@ -85,98 +87,15 @@ __global__ void kernel_warp_sieve_ingest(
         }
     }
 
-    int sx = __float2int_rn(stab_x);
-    int sy = __float2int_rn(stab_y);
+    int sx = min(width - 1, max(0, __float2int_rn(stab_x)));
+    int sy = min(height - 1, max(0, __float2int_rn(stab_y)));
 
-    int tx = sx >> 1;
-    int ty = sy >> 1;
-    if (tx < 0 || tx >= tile_w || ty < 0 || ty >= tile_h) return;
+    // 3. Periodicity sieve verdict computed on the CPU (0 = not periodic, else consecutive hits)
+    const uint32_t sieve_hits = static_cast<uint32_t>(static_cast<uint16_t>(ev.pad));
+    const bool is_periodic = (sieve_hits > 0);
 
-    int tile_idx = ty * tile_w + tx;
-    uint32_t t_cur = static_cast<uint32_t>(ev.t);
-
-    // 3. Atomic timestamp exchange to serialize concurrent micro-tile events
-    uint32_t t_last = atomicExch(&sae_timestamp_us[tile_idx], t_cur);
-
-    bool is_periodic = false;
-    if (t_last == 0) {
-        sae_hits[tile_idx] = 0;
-        sae_last_dt_us[tile_idx] = 0;
-    } else if (t_cur < t_last) {
-        return; // Reject out-of-order bus packets
-    } else {
-        uint32_t dt = t_cur - t_last;
-
-        // 4. Intra-burst event (< min_period_us): Event belongs to the SAME active blade sweep!
-        if (dt < min_period_us) {
-            if (sae_hits[tile_idx] >= 2) {
-                is_periodic = true;
-            }
-        }
-        // 5. Inter-blade period match [min_period, max_period] (75 Hz to 1200 Hz => 833 us to 13333 us)
-        else if (dt <= max_period_us) {
-            uint32_t prev_dt = sae_last_dt_us[tile_idx];
-            bool period_consistent = (prev_dt > 0) &&
-                (((dt > prev_dt) ? (dt - prev_dt) : (prev_dt - dt)) * 100 <= prev_dt * 45); // 45% jitter tolerance
-
-            if (period_consistent) {
-                uint8_t h = sae_hits[tile_idx];
-                if (h < 255) h++;
-                sae_hits[tile_idx] = h;
-                if (h >= 2) {
-                    is_periodic = true;
-                }
-            } else {
-                sae_hits[tile_idx] = 1;
-            }
-            sae_last_dt_us[tile_idx] = dt;
-        }
-
-        // 6. Cross-tile neighbor boundary check (for small rotors at 30-100ft drifting across 2x2 micro-tiles)
-        if (!is_periodic) {
-            const int n_offsets[4][2] = { {1, 0}, {-1, 0}, {0, 1}, {0, -1} };
-            #pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                int nx = tx + n_offsets[k][0];
-                int ny = ty + n_offsets[k][1];
-                if (nx >= 0 && nx < tile_w && ny >= 0 && ny < tile_h) {
-                    int n_idx = ny * tile_w + nx;
-                    uint32_t nt_last = sae_timestamp_us[n_idx];
-                    if (nt_last > 0 && t_cur > nt_last) {
-                        uint32_t ndt = t_cur - nt_last;
-                        if (ndt >= min_period_us && ndt <= max_period_us) {
-                            uint32_t nprev_dt = sae_last_dt_us[n_idx];
-                            bool n_consistent = (nprev_dt > 0) &&
-                                (((ndt > nprev_dt) ? (ndt - nprev_dt) : (nprev_dt - ndt)) * 100 <= nprev_dt * 45);
-                            if (n_consistent) {
-                                uint8_t nh = sae_hits[n_idx];
-                                uint8_t h = (nh < 255) ? (nh + 1) : 255;
-                                sae_hits[tile_idx] = h;
-                                sae_last_dt_us[tile_idx] = ndt;
-                                if (h >= 2) {
-                                    is_periodic = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 7. Time gap > max_period_us: Reset tracking
-        if (dt > max_period_us && !is_periodic) {
-            sae_hits[tile_idx] = 0;
-            sae_last_dt_us[tile_idx] = 0;
-        }
-    }
-
-    if (is_periodic) {
-        atomicAdd(retained_counter, 1);
-    }
-
-    // 8. Temporal Ring Buffer Bin Calculation:
-    // Map event timestamp ev.t directly to its exact microsecond temporal slot relative to head_bin_start_us
+    // 4. Temporal Ring Buffer Bin Calculation:
+    // Map event timestamp ev.t directly to its exact temporal slot relative to head_bin_start_us
     uint64_t ev_t = ev.t;
     size_t event_slot = head_idx;
     bool in_window = true;
@@ -204,17 +123,17 @@ __global__ void kernel_warp_sieve_ingest(
         atomicAdd(&ring_buffers[cell_idx * 512 + event_slot], 1.0f);
         atomicAdd(&cell_total_events[cell_idx], 1.0f);
         if (cell_max_sieve_hits != nullptr && is_periodic) {
-            atomicMax(&cell_max_sieve_hits[cell_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
+            atomicMax(&cell_max_sieve_hits[cell_idx], sieve_hits);
         }
 
-        // 9. Also accumulate into 2x2 pooled cells (576..1151)
+        // 5. Also accumulate into 2x2 pooled cells (576..1151)
         for (int pr = max(0, row - 1); pr <= min(17, row); ++pr) {
             for (int pc = max(0, col - 1); pc <= min(31, col); ++pc) {
                 int pooled_idx = 576 + (pr * 32 + pc);
                 atomicAdd(&ring_buffers[pooled_idx * 512 + event_slot], 1.0f);
                 atomicAdd(&cell_total_events[pooled_idx], 1.0f);
                 if (cell_max_sieve_hits != nullptr && is_periodic) {
-                    atomicMax(&cell_max_sieve_hits[pooled_idx], static_cast<uint32_t>(sae_hits[tile_idx]));
+                    atomicMax(&cell_max_sieve_hits[pooled_idx], sieve_hits);
                 }
             }
         }
@@ -271,18 +190,17 @@ __global__ void kernel_prepare_fft_window(
 }
 
 /**
- * @brief CUDA Kernel: Fast Parallel Spectral Peak, SNR, and Harmonic Comb Detector for 1152 cells
+ * @brief CUDA Kernel: per-cell spectral detection for all 1152 cells (576 base + 576 pooled).
+ *
+ * Computes |X_k|^2, optionally exports it for diagnostics / SpectralCombNet, then runs the shared
+ * CFAR gate chain (spectral_gate.hpp) so the GPU detector and host diagnostics are identical.
  */
 __global__ void kernel_analyze_spectral_peaks(
     const cufftComplex* __restrict__ fft_output,
     float* __restrict__ power_spectrum_out,
     const float* __restrict__ cell_total_events,
     const uint32_t* __restrict__ cell_max_sieve_hits,
-    float min_freq_hz,
-    float max_freq_hz,
-    float sample_rate_hz,
-    float min_energy,
-    float min_snr_db,
+    SpectralGateConfig cfg,
     float gyro_speed_deg_s,
     CudaDetectionCandidate* __restrict__ candidates,
     uint32_t* __restrict__ num_candidates,
@@ -293,215 +211,44 @@ __global__ void kernel_analyze_spectral_peaks(
 
     bool is_pooled = (cell_idx >= 576);
     int base_cell = is_pooled ? (cell_idx - 576) : cell_idx;
-    int patch_col = base_cell % 32;
-    int patch_row = base_cell / 32;
 
     float total_events = cell_total_events[cell_idx];
     uint32_t max_sieve_hits = (cell_max_sieve_hits != nullptr) ? cell_max_sieve_hits[cell_idx] : 0;
 
-    const cufftComplex* cell_fft = &fft_output[cell_idx * 257];
+    const cufftComplex* cell_fft = &fft_output[cell_idx * kSpectrumBins];
 
-    // Compute power spectrum in registers / local memory
-    float power[257];
+    // Power spectrum in local memory (always exported: ROI diagnostics and CombNet read it).
+    float power[kSpectrumBins];
     #pragma unroll 4
-    for (int k = 0; k < 257; ++k) {
+    for (int k = 0; k < kSpectrumBins; ++k) {
         float re = cell_fft[k].x;
         float im = cell_fft[k].y;
         float p = (re * re + im * im);
         power[k] = p;
         if (power_spectrum_out != nullptr) {
-            power_spectrum_out[cell_idx * 257 + k] = p;
+            power_spectrum_out[cell_idx * kSpectrumBins + k] = p;
         }
     }
 
-    // Standoff Dynamic Activity Gate:
-    // Allow weak standoff signals (>= 6.0 events) to proceed if periodic micro-sieve locked (max_sieve_hits >= 2).
-    // Require higher event density (>= 15 base / 22 pooled) for aperiodic clutter/noise.
-    float min_activity_req = (max_sieve_hits >= 2) ? 6.0f : (is_pooled ? 22.0f : 15.0f);
-    if (total_events < min_activity_req) return;
+    const SpectralGateResult g = evaluate_spectral_gate(power, total_events, max_sieve_hits,
+                                                        gyro_speed_deg_s, cfg);
+    if (g.verdict != GateVerdict::Pass) return;
 
-    // Peak search using Harmonic Product Spectrum (HPS) in [min_freq_hz, max_freq_hz] (bins 9 to 102 for 70..800 Hz)
-    float df = sample_rate_hz / 512.0f; // 7.8125 Hz
-    int min_bin = max(1, __float2int_rd(min_freq_hz / df));
-    int max_bin = min(255, __float2int_ru(max_freq_hz / df));
-
-    // DDHF Spectral Flatness Calculation (scale-invariant harmonic comb metric):
-    // gamma = exp((1/N) * sum(ln(P_k + eps))) / ((1/N) * sum(P_k))
-    float sum_log = 0.0f;
-    float sum_p = 0.0f;
-    int search_band_bins = 0;
-    for (int k = min_bin; k <= max_bin; ++k) {
-        sum_log += logf(power[k] + 1e-9f);
-        sum_p += power[k];
-        search_band_bins++;
-    }
-    float geom_mean = (search_band_bins > 0) ? expf(sum_log / static_cast<float>(search_band_bins)) : 1.0f;
-    float arith_mean = (search_band_bins > 0) ? (sum_p / static_cast<float>(search_band_bins)) : 1.0f;
-    float spectral_flatness = (arith_mean > 1e-9f) ? (geom_mean / arith_mean) : 1.0f;
-
-    // DDHF Flatness Gate: reject broad diffuse noise / uniform spectrum
-    if (spectral_flatness > 0.35f) return;
-
-    int best_bin = -1;
-    float max_hps = 0.0f;
-
-    // Minimum energy threshold: scale down if high-purity micro-sieve hit
-    float effective_min_energy = (max_sieve_hits >= 2) ? (0.5f * min_energy) : min_energy;
-
-    for (int k = min_bin; k <= max_bin; ++k) {
-        float p1 = power[k];
-        if (p1 < effective_min_energy || p1 <= power[k - 1] || p1 <= power[k + 1]) continue;
-
-        float p2 = (2 * k < 257) ? power[2 * k] : 0.0f;
-        float p3 = (3 * k < 257) ? power[3 * k] : 0.0f;
-
-        float hps_score = p1 + 0.6f * p2 + 0.4f * p3;
-        if (hps_score > max_hps) {
-            max_hps = hps_score;
-            best_bin = k;
-        }
-    }
-
-    if (best_bin < 0 || power[best_bin] < effective_min_energy) return;
-
-    // Subharmonic Fundamental Disambiguation:
-    // If a higher harmonic (e.g. 2x or 3x) was selected, check if subharmonic f0 is also an active peak
-    #pragma unroll
-    for (int sub = 3; sub >= 2; --sub) {
-        int center_sub = __float2int_rn(static_cast<float>(best_bin) / static_cast<float>(sub));
-        int found_sub = -1;
-        float max_sub_p = 0.0f;
-        for (int k = max(min_bin, center_sub - 1); k <= min(max_bin, center_sub + 1); ++k) {
-            if (power[k] >= effective_min_energy && power[k] > power[k - 1] && power[k] > power[k + 1]) {
-                if (power[k] > max_sub_p) {
-                    max_sub_p = power[k];
-                    found_sub = k;
-                }
-            }
-        }
-        if (found_sub >= 0 && max_sub_p >= 0.35f * power[best_bin]) {
-            best_bin = found_sub; // Demote to true fundamental blade passage frequency
-        }
-    }
-
-    // Wideband noise floor estimation: Median CFAR across bins 5 to 128 (40 Hz to 1000 Hz) excluding signal peaks
-    float noise_bins[128];
-    int noise_count = 0;
-    for (int k = 5; k <= 128; ++k) {
-        bool is_signal = (abs(k - best_bin) <= 2) ||
-                         (abs(k - 2 * best_bin) <= 2) ||
-                         (abs(k - 3 * best_bin) <= 2);
-        if (!is_signal && noise_count < 128) {
-            noise_bins[noise_count++] = power[k];
-        }
-    }
-
-    // Fast in-place QuickSelect for median noise computation
-    float median_val = 1e-9f;
-    if (noise_count > 0) {
-        int left = 0, right = noise_count - 1;
-        int target_k = noise_count / 2;
-        while (left < right) {
-            float pivot = noise_bins[target_k];
-            int i = left, j = right;
-            while (i <= j) {
-                while (noise_bins[i] < pivot) i++;
-                while (noise_bins[j] > pivot) j--;
-                if (i <= j) {
-                    float tmp = noise_bins[i];
-                    noise_bins[i] = noise_bins[j];
-                    noise_bins[j] = tmp;
-                    i++;
-                    j--;
-                }
-            }
-            if (target_k <= j) {
-                right = j;
-            } else if (target_k >= i) {
-                left = i;
-            } else {
-                break;
-            }
-        }
-        median_val = noise_bins[target_k];
-    }
-    // Unbiased exponential noise power estimator scale: 1 / ln(2) = 1.442695
-    float mean_noise = median_val * 1.442695f;
-    if (mean_noise < 1e-9f) mean_noise = 1e-9f;
-
-    // Parabolic sub-bin interpolation
-    float p_left = power[best_bin - 1];
-    float p_mid  = power[best_bin];
-    float p_right = power[best_bin + 1];
-    float delta_bin = 0.0f;
-    float denom = 2.0f * (2.0f * p_mid - p_left - p_right);
-    if (fabsf(denom) > 1e-9f) {
-        delta_bin = (p_right - p_left) / denom;
-    }
-    float peak_freq_hz = (static_cast<float>(best_bin) + delta_bin) * df;
-
-    // Spectral Sharpness (Q-Factor): blade spike vs broad wind/foliage turbulence
-    float neighbor_p = 1e-9f;
-    if (best_bin >= 2 && best_bin + 2 < 257) {
-        neighbor_p = 0.5f * (power[best_bin - 2] + power[best_bin + 2]);
-    }
-    float sharpness = (neighbor_p > 1e-9f) ? (p_mid / neighbor_p) : 10.0f;
-    if (sharpness < 1.5f) return;
-
-    // Motion-induced background texture scanning frequency filter:
-    // v_scan = fx * omega (px/s). Apparent texture frequency band: [0.22 v_scan, 0.70 v_scan]
-    // ONLY reject broad foliage texture scan clutter; NEVER reject high-Q, low-flatness mechanical blade harmonics!
-    if (gyro_speed_deg_s > 4.0f) {
-        float omega_rad_s = gyro_speed_deg_s * (3.14159265f / 180.0f);
-        float v_scan = 1646.0f * omega_rad_s;
-        float f_texture_min = 0.22f * v_scan;
-        float f_texture_max = 0.70f * v_scan;
-        if (peak_freq_hz >= f_texture_min && peak_freq_hz <= f_texture_max) {
-            if (sharpness < 2.5f && spectral_flatness > 0.20f && max_sieve_hits < 2) {
-                // Background moving foliage scan artifact: reject broad diffuse clutter
-                return;
-            }
-        }
-    }
-
-    // SNR Calculation
-    float snr_linear = p_mid / mean_noise;
-    float snr_db = 10.0f * log10f(max(1.0f, snr_linear));
-
-    // Dynamic SNR Threshold: Standoff low-SNR tolerance if confirmed by DDHF flatness and micro-sieve
-    float effective_min_snr = (max_sieve_hits >= 2 && spectral_flatness < 0.18f) ? (min_snr_db - 3.0f) : min_snr_db;
-    if (snr_db < effective_min_snr) return;
-
-    // Harmonic Bonus (2nd and 3rd harmonics)
-    float h2_ratio = (2 * best_bin < 257) ? (power[2 * best_bin] / mean_noise) : 0.0f;
-    float h3_ratio = (3 * best_bin < 257) ? (power[3 * best_bin] / mean_noise) : 0.0f;
-    float harmonic_bonus = (h2_ratio > 1.5f ? 0.20f : 0.0f) + (h3_ratio > 1.2f ? 0.15f : 0.0f);
-
-    // Standoff DDHF Flatness Bonus & Micro-Sieve Bonus
-    float flatness_bonus = (spectral_flatness < 0.18f) ? (0.25f * (0.18f - spectral_flatness) / 0.18f) : 0.0f;
-    float sieve_bonus = (max_sieve_hits >= 2) ? 0.15f : 0.0f;
-
-    float fund_score = min(1.0f, max(0.20f, (snr_db - 6.0f) / 10.0f));
-    float confidence = min(1.0f, fund_score + harmonic_bonus + flatness_bonus + sieve_bonus);
-
-    if (confidence < 0.30f) return;
-
-    // Atomically write valid candidate
     uint32_t slot = atomicAdd(num_candidates, 1);
     if (slot < max_candidates) {
         CudaDetectionCandidate c;
         c.cell_idx = cell_idx;
         c.is_pooled = is_pooled ? 1 : 0;
-        c.patch_col = patch_col;
-        c.patch_row = patch_row;
-        c.fundamental_bpf_hz = peak_freq_hz;
-        c.peak_snr_db = snr_db;
-        c.spectral_q_factor = sharpness;
-        c.peak_power = p_mid;
-        c.noise_floor = mean_noise;
-        c.confidence = confidence;
+        c.patch_col = base_cell % 32;
+        c.patch_row = base_cell / 32;
+        c.fundamental_bpf_hz = g.fundamental_hz;
+        c.peak_snr_db = g.snr_db;
+        c.spectral_q_factor = g.sharpness;
+        c.peak_power = g.peak_power;
+        c.noise_floor = g.mean_noise;
+        c.confidence = g.confidence;
         c.total_events = total_events;
-        c.spectral_flatness = spectral_flatness;
+        c.spectral_flatness = g.flatness;
         c.max_sieve_hits = max_sieve_hits;
         candidates[slot] = c;
     }
@@ -514,17 +261,20 @@ CudaFlickerCore::CudaFlickerCore(int sensor_width, int sensor_height,
     : sensor_width_(sensor_width), sensor_height_(sensor_height),
       grid_cols_(grid_cols), grid_rows_(grid_rows),
       sample_rate_hz_(sample_rate_hz), history_samples_(history_samples),
-      bin_duration_us_(static_cast<uint64_t>(1000000.0 / sample_rate_hz)) {
+      bin_duration_us_(static_cast<uint64_t>(1000000.0 / sample_rate_hz)),
+      sieve_(sensor_width, sensor_height, 75.0, 1200.0, 2) {
 
     num_base_cells_ = grid_cols_ * grid_rows_;
     num_total_cells_ = num_base_cells_ * 2; // 576 base + 576 pooled = 1152
-    tile_w_ = (sensor_width_ + 1) / 2;
-    tile_h_ = (sensor_height_ + 1) / 2;
-    num_tiles_ = tile_w_ * tile_h_;
+
+    // Default CFAR gate (Phase 33.5). Derived before any allocation: it throws
+    // std::invalid_argument on an inconsistent geometry, and nothing must leak if it does.
+    set_spectral_gate_config(SpectralGateConfig{});
 
     CUDA_CHECK(cudaStreamCreate(&stream_));
+    CUDA_CHECK(cudaEventCreateWithFlags(&upload_done_, cudaEventDisableTiming));
 
-    // Allocate Host Pinned Memory for Zero-Copy DMA transfers
+    // Allocate Host Pinned Memory (staging for truly asynchronous H2D event uploads)
     CUDA_CHECK(cudaMallocHost(&h_event_buffer_, max_events_per_batch_ * sizeof(CudaRawEvent)));
     CUDA_CHECK(cudaMallocHost(&h_candidate_buffer_, max_candidates_ * sizeof(CudaDetectionCandidate)));
     CUDA_CHECK(cudaMallocHost(&h_cell_totals_, num_total_cells_ * sizeof(float)));
@@ -532,13 +282,7 @@ CudaFlickerCore::CudaFlickerCore(int sensor_width, int sensor_height,
 
     // Allocate Device GPU Memory
     CUDA_CHECK(cudaMalloc(&d_events_, max_events_per_batch_ * sizeof(CudaRawEvent)));
-    CUDA_CHECK(cudaMalloc(&d_retained_counter_, sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_homography_matrix_, 9 * sizeof(float)));
-
-    // Allocate Surface of Active Events (SAE) in GPU memory
-    CUDA_CHECK(cudaMalloc(&d_sae_timestamp_us_, num_tiles_ * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_sae_last_dt_us_, num_tiles_ * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_sae_hits_, num_tiles_ * sizeof(uint8_t)));
 
     // Allocate Spatial Ring Buffers (1152 cells x 512 samples)
     CUDA_CHECK(cudaMalloc(&d_ring_buffers_, num_total_cells_ * history_samples_ * sizeof(float)));
@@ -572,12 +316,19 @@ CudaFlickerCore::CudaFlickerCore(int sensor_width, int sensor_height,
     reset();
     initialized_ = true;
     std::cout << "[CUDA] CudaFlickerCore initialized on Jetson Orin Nano ("
-              << num_total_cells_ << " cuFFT channels, " << num_tiles_ << " SAE micro-tiles).\n";
+              << num_total_cells_ << " cuFFT channels, CPU-ordered 2x2 periodicity sieve "
+              << sieve_.tile_width() << "x" << sieve_.tile_height() << " tiles).\n";
 }
 
 CudaFlickerCore::~CudaFlickerCore() {
+    if (stream_ != nullptr) {
+        cudaStreamSynchronize(stream_);
+    }
     if (cufft_plan_ != 0) {
         cufftDestroy(cufft_plan_);
+    }
+    if (upload_done_ != nullptr) {
+        cudaEventDestroy(upload_done_);
     }
     if (stream_ != nullptr) {
         cudaStreamDestroy(stream_);
@@ -589,11 +340,7 @@ CudaFlickerCore::~CudaFlickerCore() {
     if (h_cell_sieve_hits_) cudaFreeHost(h_cell_sieve_hits_);
 
     if (d_events_) cudaFree(d_events_);
-    if (d_retained_counter_) cudaFree(d_retained_counter_);
     if (d_homography_matrix_) cudaFree(d_homography_matrix_);
-    if (d_sae_timestamp_us_) cudaFree(d_sae_timestamp_us_);
-    if (d_sae_last_dt_us_) cudaFree(d_sae_last_dt_us_);
-    if (d_sae_hits_) cudaFree(d_sae_hits_);
     if (d_ring_buffers_) cudaFree(d_ring_buffers_);
     if (d_cell_total_events_) cudaFree(d_cell_total_events_);
     if (d_cell_max_sieve_hits_) cudaFree(d_cell_max_sieve_hits_);
@@ -605,24 +352,27 @@ CudaFlickerCore::~CudaFlickerCore() {
 }
 
 void CudaFlickerCore::reset() {
-    CUDA_CHECK(cudaMemsetAsync(d_sae_timestamp_us_, 0, num_tiles_ * sizeof(uint32_t), stream_));
-    CUDA_CHECK(cudaMemsetAsync(d_sae_last_dt_us_, 0, num_tiles_ * sizeof(uint32_t), stream_));
-    CUDA_CHECK(cudaMemsetAsync(d_sae_hits_, 0, num_tiles_ * sizeof(uint8_t), stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    sieve_.reset();
+    retained_count_.store(0);
     CUDA_CHECK(cudaMemsetAsync(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float), stream_));
     CUDA_CHECK(cudaMemsetAsync(d_cell_total_events_, 0, num_total_cells_ * sizeof(float), stream_));
     CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), stream_));
-    CUDA_CHECK(cudaMemsetAsync(d_retained_counter_, 0, sizeof(uint32_t), stream_));
     current_window_start_us_ = 0;
+    window_anchored_ = false;
     head_idx_ = 0;
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
+void CudaFlickerCore::reset_sieve_hit_accumulators() {
+    // Only the per-cell accumulator is reset here. The CPU tile sieve state is owned by the
+    // camera-callback thread and self-resets on period gaps/inconsistency, so touching it from
+    // the analysis thread would be a data race.
+    CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), stream_));
+}
+
 uint64_t CudaFlickerCore::get_and_reset_retained_count() {
-    uint32_t h_retained = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&h_retained, d_retained_counter_, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_));
-    CUDA_CHECK(cudaMemsetAsync(d_retained_counter_, 0, sizeof(uint32_t), stream_));
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
-    return static_cast<uint64_t>(h_retained);
+    return retained_count_.exchange(0, std::memory_order_relaxed);
 }
 
 void CudaFlickerCore::advance_temporal_bins(size_t steps) {
@@ -639,86 +389,104 @@ void CudaFlickerCore::advance_temporal_bins(size_t steps) {
     head_idx_ = (head_idx_ + steps) % history_samples_;
 }
 
-void CudaFlickerCore::ingest_event_batch(const void* events, size_t count, const Matrix3x3& H,
-                                         uint64_t& out_raw_count, uint64_t& out_retained_count,
-                                         const float* d_suppression_mask,
-                                         float suppression_threshold,
-                                         bool sync) {
-    if (count == 0) {
-        out_raw_count = 0;
-        out_retained_count = 0;
-        return;
+void CudaFlickerCore::ingest_chunk(size_t chunk_size, uint64_t chunk_max_t,
+                                   const float* d_suppression_mask, float suppression_threshold) {
+    // Window alignment: advance temporal ring buffer bins up to the newest event of this chunk.
+    // The head bin start is always snapped to an absolute grid (multiple of bin_duration_us_) so
+    // bin boundaries do not depend on which event arrived first or on the stream start offset.
+    if (!window_anchored_) {
+        uint64_t chunk_min_t = h_event_buffer_[0].t;
+        for (size_t i = 1; i < chunk_size; ++i) chunk_min_t = std::min(chunk_min_t, h_event_buffer_[i].t);
+        current_window_start_us_ = (chunk_min_t / bin_duration_us_) * bin_duration_us_;
+        window_anchored_ = true;
     }
-
-    const auto* ev_arr = static_cast<const Metavision::EventCD*>(events);
-    size_t batch_size = std::min(count, max_events_per_batch_);
-
-    // Find the latest timestamp in this batch to synchronize temporal advancement
-    uint64_t max_t = ev_arr[0].t;
-    for (size_t i = 1; i < batch_size; ++i) {
-        if (ev_arr[i].t > max_t) {
-            max_t = ev_arr[i].t;
-        }
-    }
-
-    // Window alignment: advance temporal ring buffer bins up to max_t
-    if (current_window_start_us_ == 0) {
-        current_window_start_us_ = ev_arr[0].t;
-    }
-
-    if (max_t >= current_window_start_us_ + bin_duration_us_) {
-        uint64_t elapsed_us = max_t - current_window_start_us_;
+    if (chunk_max_t >= current_window_start_us_ + bin_duration_us_) {
+        uint64_t elapsed_us = chunk_max_t - current_window_start_us_;
         uint64_t steps = elapsed_us / bin_duration_us_;
         if (steps >= history_samples_) {
             steps = history_samples_;
-            current_window_start_us_ = max_t;
+            current_window_start_us_ = (chunk_max_t / bin_duration_us_) * bin_duration_us_;
         } else {
             current_window_start_us_ += steps * bin_duration_us_;
         }
         advance_temporal_bins(steps);
     }
 
-    // Direct zero-copy DMA transfer (Metavision::EventCD and CudaRawEvent have identical 16-byte memory layout)
-    CUDA_CHECK(cudaMemcpyAsync(d_events_, events, batch_size * sizeof(CudaRawEvent), cudaMemcpyHostToDevice, stream_));
+    // Asynchronous DMA from pinned staging; upload_done_ guards the staging buffer's reuse.
+    CUDA_CHECK(cudaMemcpyAsync(d_events_, h_event_buffer_, chunk_size * sizeof(CudaRawEvent),
+                               cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaEventRecord(upload_done_, stream_));
 
+    int threads = 256;
+    int blocks = (static_cast<int>(chunk_size) + threads - 1) / threads;
+    kernel_warp_sieve_ingest<<<blocks, threads, 0, stream_>>>(
+        d_events_, chunk_size, d_homography_matrix_,
+        d_suppression_mask, suppression_threshold,
+        sensor_width_, sensor_height_,
+        d_ring_buffers_, d_cell_total_events_, d_cell_max_sieve_hits_,
+        head_idx_, current_window_start_us_, static_cast<uint32_t>(bin_duration_us_));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void CudaFlickerCore::ingest_event_batch(const void* events, size_t count, const Matrix3x3& H,
+                                         uint64_t& out_raw_count, uint64_t& out_retained_count,
+                                         const float* d_suppression_mask,
+                                         float suppression_threshold,
+                                         bool sync) {
+    out_raw_count = 0;
+    out_retained_count = 0;
+    if (count == 0 || events == nullptr) return;
+
+    const auto* ev_arr = static_cast<const Metavision::EventCD*>(events);
+
+    // Homography for this batch (pageable source: copied before cudaMemcpyAsync returns).
     float h_mat[9];
     for (int i = 0; i < 9; ++i) h_mat[i] = static_cast<float>(H.m[i]);
     CUDA_CHECK(cudaMemcpyAsync(d_homography_matrix_, h_mat, 9 * sizeof(float), cudaMemcpyHostToDevice, stream_));
 
-    if (sync) {
-        CUDA_CHECK(cudaMemsetAsync(d_retained_counter_, 0, sizeof(uint32_t), stream_));
+    uint64_t batch_retained = 0;
+    size_t offset = 0;
+    while (offset < count) {
+        const size_t chunk = std::min(count - offset, max_events_per_batch_);
+
+        // The previous async upload must finish before the pinned staging buffer is rewritten.
+        CUDA_CHECK(cudaEventSynchronize(upload_done_));
+
+        // CPU stage (timestamp order): periodicity sieve on raw sensor pixels + staging copy.
+        // The sieve runs on raw (unwarped) coordinates: blade periodicity is a per-photoreceptor
+        // property over <= 2 periods (~27 ms), where stabilization is irrelevant.
+        uint64_t chunk_max_t = ev_arr[offset].t;
+        for (size_t i = 0; i < chunk; ++i) {
+            const Metavision::EventCD& src = ev_arr[offset + i];
+            CudaRawEvent& dst = h_event_buffer_[i];
+            dst.x = src.x;
+            dst.y = src.y;
+            dst.p = src.p;
+            const uint8_t hits = sieve_.periodic_hits(src.x, src.y, static_cast<uint64_t>(src.t));
+            dst.pad = static_cast<int16_t>(hits);
+            dst.t = static_cast<uint64_t>(src.t);
+            if (hits > 0) ++batch_retained;
+            if (dst.t > chunk_max_t) chunk_max_t = dst.t;
+        }
+
+        ingest_chunk(chunk, chunk_max_t, d_suppression_mask, suppression_threshold);
+        offset += chunk;
     }
 
-    uint32_t min_period_us = 833;   // 1200 Hz (extreme high-speed throttle / FPV sprint)
-    uint32_t max_period_us = 13333; // 75 Hz (ground idle / heavy lift)
-
-    int threads = 256;
-    int blocks = (static_cast<int>(batch_size) + threads - 1) / threads;
-
-    kernel_warp_sieve_ingest<<<blocks, threads, 0, stream_>>>(
-        d_events_, batch_size, d_homography_matrix_,
-        d_suppression_mask, suppression_threshold,
-        sensor_width_, sensor_height_, tile_w_, tile_h_,
-        d_sae_timestamp_us_, d_sae_last_dt_us_, d_sae_hits_,
-        d_ring_buffers_, d_cell_total_events_, d_cell_max_sieve_hits_,
-        head_idx_, current_window_start_us_, static_cast<uint32_t>(bin_duration_us_),
-        min_period_us, max_period_us, d_retained_counter_);
-
-    out_raw_count = batch_size;
+    retained_count_.fetch_add(batch_retained, std::memory_order_relaxed);
+    out_raw_count = count;
+    out_retained_count = batch_retained;
 
     if (sync) {
-        uint32_t h_retained = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&h_retained, d_retained_counter_, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_));
         CUDA_CHECK(cudaStreamSynchronize(stream_));
-        out_retained_count = h_retained;
-    } else {
-        out_retained_count = 0;
     }
 }
 
+void CudaFlickerCore::set_spectral_gate_config(const SpectralGateConfig& cfg) {
+    gate_cfg_ = derive_spectral_gate(cfg, sample_rate_hz_, static_cast<int>(history_samples_), num_total_cells_);
+}
+
 void CudaFlickerCore::execute_batched_spectral_analysis(
-    double min_freq_hz, double max_freq_hz,
-    double min_energy, double min_snr_db,
     double gyro_speed_deg_s,
     std::vector<FlickerDetectionResult>& out_candidates) {
 
@@ -734,17 +502,15 @@ void CudaFlickerCore::execute_batched_spectral_analysis(
     // 3. Reset Candidate Counter
     CUDA_CHECK(cudaMemsetAsync(d_num_candidates_, 0, sizeof(uint32_t), stream_));
 
-    // 4. Parallel Spectral Peak, Q-factor, SNR, and Harmonic Comb Analysis across all 1152 cells
+    // 4. Shared CFAR gate chain (spectral_gate.hpp) across all 1152 cells
     int threads = 256;
     int blocks = (1152 + threads - 1) / threads;
 
     kernel_analyze_spectral_peaks<<<blocks, threads, 0, stream_>>>(
         d_fft_output_, d_power_spectrum_, d_cell_total_events_, d_cell_max_sieve_hits_,
-        static_cast<float>(min_freq_hz), static_cast<float>(max_freq_hz),
-        static_cast<float>(sample_rate_hz_),
-        static_cast<float>(min_energy), static_cast<float>(min_snr_db),
-        static_cast<float>(gyro_speed_deg_s),
+        gate_cfg_, static_cast<float>(gyro_speed_deg_s),
         d_candidates_, d_num_candidates_, static_cast<uint32_t>(max_candidates_));
+    CUDA_CHECK(cudaGetLastError());
 
     // 5. Read back candidate count and candidate records
     uint32_t num_cands = 0;
@@ -770,6 +536,7 @@ void CudaFlickerCore::execute_batched_spectral_analysis(
             res.total_events = c.total_events;
             res.patch_x = c.patch_col;
             res.patch_y = c.patch_row;
+            res.max_sieve_hits = c.max_sieve_hits;
             out_candidates.push_back(res);
         }
     }
@@ -796,17 +563,48 @@ RoiDiagnostics CudaFlickerCore::get_roi_diagnostics(int col_min, int col_max, in
     row_min = std::max(0, std::min(row_min, grid_rows_ - 1));
     row_max = std::max(0, std::min(row_max, grid_rows_ - 1));
 
+    int best_cell_idx = -1;
     for (int r = row_min; r <= row_max; ++r) {
         for (int c = col_min; c <= col_max; ++c) {
             int cell_idx = r * grid_cols_ + c;
             float ev = h_cell_totals_[cell_idx];
             uint32_t hits = h_cell_sieve_hits_[cell_idx];
             diag.total_events += ev;
-            diag.max_cell_events = std::max(diag.max_cell_events, ev);
+            if (ev > diag.max_cell_events) {
+                diag.max_cell_events = ev;
+                best_cell_idx = cell_idx;
+            }
             diag.max_sieve_hits = std::max(diag.max_sieve_hits, hits);
             if (ev >= 6.0f) {
                 diag.active_cells++;
             }
+        }
+    }
+
+    if (best_cell_idx >= 0 && diag.max_cell_events >= 20.0f) {
+        float power[kSpectrumBins];
+        CUDA_CHECK(cudaMemcpy(power, &d_power_spectrum_[best_cell_idx * kSpectrumBins],
+                              kSpectrumBins * sizeof(float), cudaMemcpyDeviceToHost));
+        const int c = best_cell_idx % grid_cols_;
+        const int r = best_cell_idx / grid_cols_;
+        const uint32_t hits = h_cell_sieve_hits_[best_cell_idx];
+        const float ev = h_cell_totals_[best_cell_idx];
+
+        // Identical gate chain to the GPU detector (gyro texture filter not applied: diagnostic view).
+        const SpectralGateResult g = evaluate_spectral_gate(power, ev, hits, 0.0f, gate_cfg_);
+        diag.best_snr_db = g.snr_db;
+        diag.best_bpf_hz = g.fundamental_hz;
+        diag.best_flatness = g.flatness;
+
+        static int diag_throttle = 0;
+        if (++diag_throttle % 10 == 0) {
+            std::cout << "[ROI-TOP] Cell=(" << c << "," << r << ") Ev=" << ev << " Sieve=" << hits
+                      << " | Flatness=" << g.flatness
+                      << " | PeakBin=" << g.peak_bin << " FundBin=" << g.fund_bin
+                      << " (" << g.fundamental_hz << "Hz) P=" << g.peak_power
+                      << " Sharp=" << g.sharpness
+                      << " SNR=" << g.snr_db << "dB (CFAR " << gate_cfg_.cfar_threshold_db << "dB) -> "
+                      << gate_verdict_name(g.verdict) << "\n";
         }
     }
     return diag;
@@ -825,18 +623,37 @@ void CudaFlickerCore::get_active_cells_with_spectra(
 
     // Identify active base and pooled cells with sufficient event density
     // Require micro-sieve periodic lock (hits >= 1 && ev >= min_events) or strong event density (ev >= 15.0f)
+    struct CellPriority {
+        int index;
+        uint32_t hits;
+        float events;
+    };
+    std::vector<CellPriority> cell_cands;
+    cell_cands.reserve(num_total_cells_);
+
     for (int i = 0; i < num_total_cells_; ++i) {
         float ev = h_cell_totals_[i];
         uint32_t hits = h_cell_sieve_hits_[i];
         if ((hits >= 1 && ev >= min_events) || (ev >= 15.0f)) {
-            out_cell_indices.push_back(i);
-            if (out_cell_indices.size() >= 128) break; // Capped at max batch size
+            cell_cands.push_back({i, hits, ev});
         }
     }
 
-    if (out_cell_indices.empty()) return;
+    if (cell_cands.empty()) return;
 
-    size_t batch = out_cell_indices.size();
+    // Prioritize cells with periodic micro-sieve hits first, then highest event counts
+    std::sort(cell_cands.begin(), cell_cands.end(), [](const CellPriority& a, const CellPriority& b) {
+        if (a.hits != b.hits) {
+            return a.hits > b.hits; // Periodic rotor hits first!
+        }
+        return a.events > b.events; // Higher event count second!
+    });
+
+    size_t batch = std::min(cell_cands.size(), static_cast<size_t>(128));
+    for (size_t i = 0; i < batch; ++i) {
+        out_cell_indices.push_back(cell_cands[i].index);
+    }
+
     out_spectra.resize(batch, std::vector<float>(257, 0.0f));
 
     for (size_t b = 0; b < batch; ++b) {
@@ -855,7 +672,7 @@ void CudaFlickerCore::get_active_cells_with_spectra(
         auto& spec = out_spectra[b];
         std::vector<float> noise_slice(spec.begin() + 5, spec.begin() + 128);
         std::sort(noise_slice.begin(), noise_slice.end());
-        float median_noise = std::max(0.20f, noise_slice[noise_slice.size() / 2]);
+        float median_noise = std::max(1e-4f, noise_slice[noise_slice.size() / 2]);
         for (int k = 0; k < 257; ++k) {
             spec[k] = std::log10(1.0f + spec[k] / median_noise);
         }

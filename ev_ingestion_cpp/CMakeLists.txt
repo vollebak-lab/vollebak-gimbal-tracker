@@ -64,6 +64,12 @@ target_link_libraries(test_cuda_flicker PRIVATE
     pthread
 )
 
+# Test suites rely on assert(). Release adds -DNDEBUG globally, which silently compiled every
+# assertion away (Phase 33.5 finding); keep -O3 but re-enable assertions for the test targets.
+foreach(test_target test_flicker_dsp test_ego_motion test_cuda_flicker)
+    target_compile_options(${test_target} PRIVATE -UNDEBUG)
+endforeach()
+
 # 7. Build Real-Time Propeller Flicker Detector Engine (with Ego-Motion Suppression & TensorRT FP16)
 add_executable(ev_flicker_detector ev_flicker_detector.cpp cuda_flicker_core.cu)
 target_link_libraries(ev_flicker_detector PRIVATE 
@@ -76,6 +82,42 @@ target_link_libraries(ev_flicker_detector PRIVATE
     cudart
     pthread
 )
+# Build provenance: deploy script passes -DPREDATOR_BUILD_ID=<git>-<src sha256 prefix>
+set(PREDATOR_BUILD_ID "unstamped" CACHE STRING "Build provenance stamp (git rev + source hash)")
+target_compile_definitions(ev_flicker_detector PRIVATE PREDATOR_BUILD_ID="${PREDATOR_BUILD_ID}")
+
+# 7b. Phase 33.4b ingest microbenchmark (opt-in: `cmake --build . --target bench_ingest`).
+# Times OpenEB EVT3 decode, frame generation and ingest_event_batch per event, after verifying the
+# reference EVT3 encoder round-trips bit-exactly through OpenEB's decoder.
+find_package(MetavisionHAL REQUIRED)
+add_executable(bench_ingest EXCLUDE_FROM_ALL bench_ingest.cpp cuda_flicker_core.cu)
+target_link_libraries(bench_ingest PRIVATE
+    Metavision::HAL
+    MetavisionSDK::core
+    ${OpenCV_LIBS}
+    cufft
+    cudart
+    pthread
+)
+
+# 7c. Phase 33.4b EVT2.1 live capture + layout verification (opt-in). Writes raw + OpenEB-decoded
+# fixtures used by the GPU decoder parity test. Requires exclusive camera access (stop the service).
+add_executable(evt21_capture EXCLUDE_FROM_ALL evt21_capture.cpp)
+target_link_libraries(evt21_capture PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core pthread)
+
+# 7d. Phase 33.4b.b GPU EVT2.1 decoder parity test against OpenEB's EVT21LegacyDecoder. The synthetic suite
+# runs in the deploy script; `--fixture <prefix>` replays an evt21_capture recording and reports timing.
+add_executable(test_evt21_decoder test_evt21_decoder.cpp evt21_gpu_decoder.cu)
+target_link_libraries(test_evt21_decoder PRIVATE Metavision::HAL MetavisionSDK::core cudart pthread)
+target_compile_options(test_evt21_decoder PRIVATE -UNDEBUG)
+
+# 7e. Phase 33.7a Hot pixel mask unit tests and survey tool (IMX636 I_DigitalEventMask)
+add_executable(test_hot_pixel_mask test_hot_pixel_mask.cpp)
+target_link_libraries(test_hot_pixel_mask PRIVATE Metavision::HAL MetavisionSDK::core pthread)
+target_compile_options(test_hot_pixel_mask PRIVATE -UNDEBUG)
+
+add_executable(hot_pixel_survey EXCLUDE_FROM_ALL hot_pixel_survey.cpp)
+target_link_libraries(hot_pixel_survey PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core pthread)
 
 # 8. Optional ONNX Runtime Ingestion Binary
 find_package(onnxruntime QUIET)

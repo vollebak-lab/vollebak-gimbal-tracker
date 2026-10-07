@@ -13,6 +13,8 @@
 #include <condition_variable>
 #include <algorithm>
 #include <iomanip>
+#include <cstdlib>
+#include <cmath>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -34,10 +36,54 @@
 #include "ego_motion.hpp"
 #include "spectral_combnet_trt.hpp"
 #include "cuda_flicker_core.cuh"
+#include "hot_pixel_mask.hpp"
 #include <omp.h>
 
 // Global shutdown flag
 static std::atomic<bool> g_running{true};
+
+// Hardware pixel masking telemetry state (Phase 33.7a)
+static bool g_hardware_mask_applied = false;
+static std::string g_hardware_mask_facility = "none";
+static std::vector<predator::HotPixel> g_masked_hot_pixels;
+
+// Build provenance stamp injected by CMake (-DPREDATOR_BUILD_ID=...). Lets the
+// running binary be matched to the exact source tree (prevents deploy drift).
+#ifndef PREDATOR_BUILD_ID
+#define PREDATOR_BUILD_ID "unstamped"
+#endif
+
+/// Reads a boolean feature flag from the environment.
+/// Accepts "1"/"0"; any other value or an unset variable yields `default_value`.
+static bool env_flag(const char* name, bool default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    const std::string s(v);
+    if (s == "1") return true;
+    if (s == "0") return false;
+    std::cerr << "[WARN] Ignoring invalid value for " << name << "='" << s << "' (expected 0 or 1)\n";
+    return default_value;
+}
+
+/// Reads a strictly positive finite float from the environment; invalid values are rejected
+/// with a warning and `default_value` is used.
+static float env_positive_float(const char* name, float default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    char* end = nullptr;
+    const float f = std::strtof(v, &end);
+    if (end == v || *end != '\0' || !std::isfinite(f) || f <= 0.0f) {
+        std::cerr << "[WARN] Ignoring invalid value for " << name << "='" << v << "' (expected a positive number)\n";
+        return default_value;
+    }
+    return f;
+}
+
+// Runtime feature flags (resolved once in main(), read by telemetry).
+static bool g_ego_warp_enabled = false;     // PREDATOR_ENABLE_EGO_WARP (default OFF, Phase 33)
+static bool g_combnet_prune_enabled = false; // PREDATOR_COMBNET_PRUNE (default OFF until CombNet v3 gate)
+static float g_cfar_fa_per_hour = 0.0f;      // PREDATOR_CFAR_FA_PER_HOUR (Phase 33.5 false-alarm budget)
+static float g_cfar_threshold_db = 0.0f;     // Derived CFAR threshold in use
 
 struct DiagnosticsLogRecord {
     uint64_t timestamp_us{0};
@@ -385,7 +431,23 @@ public:
         ss << std::fixed << std::setprecision(2);
         ss << "{\n"
            << "  \"timestamp_ms\": " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\n"
-           << "  \"lens\": {\"model\": \"12mm f/2.0 M12 (1/2.5\\\" format)\", \"fl_mm\": 12.0, \"hfov_deg\": 29.1, \"vfov_deg\": 16.6},\n"
+           << "  \"build_id\": \"" << PREDATOR_BUILD_ID << "\",\n"
+           << "  \"flags\": {\"ego_warp\": " << (g_ego_warp_enabled ? "true" : "false")
+           << ", \"combnet_prune\": " << (g_combnet_prune_enabled ? "true" : "false") << "},\n"
+           << "  \"cfar\": {\"fa_per_hour\": " << g_cfar_fa_per_hour << ", \"threshold_db\": " << g_cfar_threshold_db << "},\n"
+           << "  \"lens\": {\"model\": \"12mm f/2.5 M12 (1/2.5\\\" format)\", \"fl_mm\": 12.0, \"hfov_deg\": 29.1, \"vfov_deg\": 16.6},\n"
+           << "  \"hot_pixel_mask\": {\n"
+           << "    \"applied\": " << (g_hardware_mask_applied ? "true" : "false") << ",\n"
+           << "    \"facility\": \"" << g_hardware_mask_facility << "\",\n"
+           << "    \"count\": " << g_masked_hot_pixels.size() << ",\n"
+           << "    \"pixels\": [\n";
+        for (size_t i = 0; i < g_masked_hot_pixels.size(); ++i) {
+            const auto& p = g_masked_hot_pixels[i];
+            ss << "      {\"x\": " << p.x << ", \"y\": " << p.y << ", \"rate_ev_s\": " << p.rate << "}"
+               << (i + 1 < g_masked_hot_pixels.size() ? ",\n" : "\n");
+        }
+        ss << "    ]\n"
+           << "  },\n"
            << "  \"ego_motion\": {\n"
            << "    \"imu_connected\": " << (ego_stats_.imu_connected ? "true" : "false") << ",\n"
            << "    \"imu_packets\": " << ego_stats_.imu_packets << ",\n"
@@ -502,7 +564,7 @@ void display_encoder_thread_func(int width, int height) {
             }
 
             // Top HUD
-            std::string hud_top = "PREDATOR-01 | 12mm f/2.0 M12 | DDHF + Ego-Motion Core";
+            std::string hud_top = "PREDATOR-01 | 12mm f/2.5 M12 | DDHF + Ego-Motion Core";
             cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
 
             // Ego-Motion & Frequency-Domain Core HUD Badge
@@ -717,7 +779,7 @@ static const char* HTML_DASHBOARD = R"html(
                 <div class="metric-grid">
                     <div class="metric-box">
                         <div class="metric-label">Optics / GPU</div>
-                        <div class="metric-value" style="font-size:13px;">12mm f/2.0 | cuFFT</div>
+                        <div class="metric-value" style="font-size:13px;">12mm f/2.5 | cuFFT</div>
                     </div>
                     <div class="metric-box">
                         <div class="metric-label">Sample Rate</div>
@@ -972,10 +1034,15 @@ int main(int argc, char* argv[]) {
         port = std::stoi(argv[1]);
     }
 
+    // Resolve runtime feature flags once (Phase 33 defaults: both OFF).
+    g_ego_warp_enabled = env_flag("PREDATOR_ENABLE_EGO_WARP", false);
+    g_combnet_prune_enabled = env_flag("PREDATOR_COMBNET_PRUNE", false);
+
     std::cout << "========================================================\n";
     std::cout << "  Predator — Real-Time Propeller Flicker Detector Engine\n";
     std::cout << "  Ego-Motion Compensation + TensorRT Suppression Core   \n";
-    std::cout << "  Lens: 12mm f/2.0 M12 1/2.5\" (5MP)                      \n";
+    std::cout << "  Lens: 12mm f/2.5 M12 1/2.5\" (5MP)                      \n";
+    std::cout << "  Build: " << PREDATOR_BUILD_ID << "\n";
     std::cout << "========================================================\n";
 
     try {
@@ -986,7 +1053,7 @@ int main(int argc, char* argv[]) {
         int height = camera.geometry().get_height();
         std::cout << "[INFO] Camera initialized! Resolution: " << width << " x " << height << "\n";
 
-        // Configure IMX636 Sensor Biases for 12mm f/2.0 Optics (Adaptive Shade & Solar Flux Tuning)
+        // Configure IMX636 Sensor Biases for 12mm f/2.5 Optics (Adaptive Shade & Solar Flux Tuning)
         try {
             auto *biases = camera.get_device().get_facility<Metavision::I_LL_Biases>();
             if (biases) {
@@ -1008,6 +1075,47 @@ int main(int argc, char* argv[]) {
             std::cout << "[WARN] Could not set analog biases: " << e.what() << "\n";
         }
 
+        // Phase 33.7a: Configure IMX636 Hardware Pixel Mask (I_DigitalEventMask)
+        try {
+            const char* mask_file_env = std::getenv("PREDATOR_HOT_PIXELS_FILE");
+            std::string mask_filepath = mask_file_env ? mask_file_env : "hot_pixels.txt";
+
+            // If default file doesn't exist in current working directory, check /home/orin/ev_deploy/hot_pixels.txt
+            if (!mask_file_env && !std::ifstream(mask_filepath).good()) {
+                if (std::ifstream("/home/orin/ev_deploy/hot_pixels.txt").good()) {
+                    mask_filepath = "/home/orin/ev_deploy/hot_pixels.txt";
+                }
+            }
+
+            predator::HotPixelMaskConfig mask_cfg;
+            mask_cfg.sensor_width = static_cast<uint16_t>(width);
+            mask_cfg.sensor_height = static_cast<uint16_t>(height);
+
+            auto parse_res = predator::parse_hot_pixels_file(mask_filepath, mask_cfg);
+            if (parse_res.success) {
+                for (const auto& w : parse_res.warnings) {
+                    std::cout << "[WARN] Hot pixel mask: " << w << "\n";
+                }
+                auto mask_status = predator::apply_hardware_pixel_mask(camera.get_device(), parse_res.pixels);
+                std::cout << "[INFO] " << mask_status.message << "\n";
+                if (mask_status.applied) {
+                    g_hardware_mask_applied = true;
+                    g_hardware_mask_facility = mask_status.facility_name;
+                    g_masked_hot_pixels = parse_res.pixels;
+                    for (const auto& p : g_masked_hot_pixels) {
+                        std::cout << "  -> Masked hot pixel (" << p.x << ", " << p.y
+                                  << ") with baseline rate " << p.rate << " ev/s\n";
+                    }
+                }
+            } else if (mask_file_env) {
+                std::cout << "[WARN] Hot pixel mask file requested but could not be parsed: " << parse_res.error << "\n";
+            } else {
+                std::cout << "[INFO] No hot_pixels.txt found; running with all hardware pixel masks clear.\n";
+            }
+        } catch (const std::exception &e) {
+            std::cout << "[WARN] Could not apply hardware pixel mask: " << e.what() << "\n";
+        }
+
         predator::LensParameters lens_params;
         lens_params.focal_length_mm = 12.0;
         lens_params.pixel_pitch_um = 4.86;
@@ -1016,6 +1124,20 @@ int main(int argc, char* argv[]) {
 
         // High-Performance GPU Flicker & cuFFT Core (1152 parallel channels on Jetson Orin Nano)
         predator::CudaFlickerCore cuda_core(width, height, 32, 18, 4000.0, 512);
+
+        // Phase 33.5 CFAR gate: the only detector knob is the field-wide false-alarm budget.
+        {
+            predator::SpectralGateConfig gate_cfg;
+            gate_cfg.false_alarms_per_hour = env_positive_float("PREDATOR_CFAR_FA_PER_HOUR", gate_cfg.false_alarms_per_hour);
+            cuda_core.set_spectral_gate_config(gate_cfg);
+            const auto& g = cuda_core.spectral_gate_config();
+            g_cfar_fa_per_hour = g.false_alarms_per_hour;
+            g_cfar_threshold_db = g.cfar_threshold_db;
+            std::cout << "[INFO] CFAR gate: band " << g.min_freq_hz << "-" << g.max_freq_hz << " Hz (bins "
+                      << g.min_bin << "-" << g.max_bin << "), FA budget " << g.false_alarms_per_hour
+                      << "/h -> Pfa/window " << g.pfa_per_window << ", threshold " << g.cfar_threshold
+                      << " (" << g.cfar_threshold_db << " dB), min_sharpness " << g.min_sharpness << "\n";
+        }
 
         // Continuous Gyroscope Warper & Stabilization Engine
         predator::ContinuousGyroWarper gyro_warper(lens_params);
@@ -1038,12 +1160,12 @@ int main(int argc, char* argv[]) {
             std::cout << "[WARN] SpectralCombNet TRT Engine not loaded, continuing with cuFFT peak detector.\n";
         }
 
-        // Configurable Ego-Motion Stabilization
-        // Default to active 200 Hz IMU homography de-rotation with calibrated rad/s scaling
-        bool enable_ego_warp = true;
-        const char* env_warp = std::getenv("PREDATOR_ENABLE_EGO_WARP");
-        if (env_warp && std::string(env_warp) == "0") enable_ego_warp = false;
+        // Configurable Ego-Motion Stabilization (Phase 33: default OFF, opt in with PREDATOR_ENABLE_EGO_WARP=1).
+        // Rationale: re-anchoring has no GPU ring-buffer remap, so any warp jump corrupts per-cell
+        // FFT histories. Ego-motion is out of scope until that remap exists (see Phase 34 plan).
+        const bool enable_ego_warp = g_ego_warp_enabled;
         std::cout << "[INFO] Pipeline Ingestion Mode: Ego-Warp=" << (enable_ego_warp ? "ACTIVE (Nicla 200Hz)" : "BYPASS (Identity)")
+                  << ", CombNet-Prune=" << (g_combnet_prune_enabled ? "ON" : "OFF")
                   << ", Pure Frequency-Domain Harmonic Pipeline Active.\n";
 
         std::atomic<uint64_t> total_raw_counter{0};
@@ -1154,7 +1276,7 @@ int main(int argc, char* argv[]) {
 
             // 3. Batched cuFFT and GPU Spectral Harmonic Analysis across all 1152 cells in parallel (<0.4 ms)
             std::vector<predator::FlickerDetectionResult> raw_detections;
-            cuda_core.execute_batched_spectral_analysis(75.0, 1000.0, 2.5, 7.0, gyro_speed_deg_s, raw_detections);
+            cuda_core.execute_batched_spectral_analysis(gyro_speed_deg_s, raw_detections);
 
             // 3b. TensorRT SpectralCombNet Neural Classification on Active Cells (Shade & Weak Signal Boost)
             int spectral_eval_cells = 0;
@@ -1184,15 +1306,22 @@ int main(int argc, char* argv[]) {
                         int patch_row = base_cell / 32;
 
                         if (np.drone_prob < 0.35f) {
-                            // Neural Clutter Rejection:
-                            // Cell evaluated by SpectralCombNet is classified as foliage/wind/noise.
-                            // Prune any raw physical candidate matching this cell to eliminate false alarms!
-                            raw_detections.erase(
-                                std::remove_if(raw_detections.begin(), raw_detections.end(),
-                                    [&](const predator::FlickerDetectionResult& rd) {
-                                        return rd.patch_x == patch_col && rd.patch_y == patch_row;
-                                    }),
-                                raw_detections.end());
+                            // Neural Clutter Rejection (Phase 33: opt-in via PREDATOR_COMBNET_PRUNE=1).
+                            // Disabled by default: the deployed v2 engine outputs ~0 on every real
+                            // spectrum (training/runtime preprocessing mismatch), so pruning would
+                            // erase weak distant candidates. Re-enable only after CombNet v3 passes its gate.
+                            // Prune ONLY weak/ambiguous physical candidates (SNR < 10 dB AND no micro-sieve periodic lock AND not a sharp physical blade spike).
+                            // NEVER prune high-SNR, micro-sieve-locked, or sharp high-Q physical blade harmonics!
+                            if (g_combnet_prune_enabled) {
+                                raw_detections.erase(
+                                    std::remove_if(raw_detections.begin(), raw_detections.end(),
+                                        [&](const predator::FlickerDetectionResult& rd) {
+                                            bool is_sharp_blade = (rd.spectral_q_factor >= 4.0 && rd.peak_power >= 60.0);
+                                            return rd.patch_x == patch_col && rd.patch_y == patch_row &&
+                                                   rd.peak_snr_db < 10.0f && rd.max_sieve_hits < 2 && !is_sharp_blade;
+                                        }),
+                                    raw_detections.end());
+                            }
                             continue;
                         }
 
@@ -1383,6 +1512,12 @@ int main(int argc, char* argv[]) {
                                   << trk.last_detection.centroid_px_x << "," << trk.last_detection.centroid_px_y << ")\n";
                     }
                 }
+            }
+
+            // Reset sieve hit accumulators every 3 analysis cycles (~120ms) so slow hover blade chops (75-120 Hz)
+            // have sufficient window to accumulate periodic micro-sieve hits
+            if (s_frame_idx % 3 == 0) {
+                cuda_core.reset_sieve_hit_accumulators();
             }
         }
 

@@ -884,3 +884,175 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - Live `/flicker_stats`: `"num_targets": 0`, `"num_tracks": 0`, `"tracks": []`, `"targets": []`.
     - Live video HUD: 0 false positive boxes displayed across the foliage scene.
     - Full IMU ego-motion compensation actively running at 200 Hz.
+
+### 38. Hover Drone Detection Restoration & Standoff Micro-Sieve Calibration (Phase 32)
+- **Problem Statement**:
+  - Drone hovering at approximately 15ft away from the event camera produced zero detections against a foliage backdrop.
+- **Root Cause Analysis (RCA)**:
+  1. *CombNet Priority Starvation*: `get_active_cells_with_spectra` ingested the first 128 cells in row-major order. Dense daylight foliage in rows 0–3 consumed all 128 batch slots, completely starving the drone target in rows 5–12 from neural evaluation.
+  2. *Elevated Hover Spectral Flatness ($0.50\text{--}0.67$)*: Multi-rotor downwash and blade chord harmonics elevated Wiener spectral flatness at close range (15ft). The pre-peak gate of $\le 0.38$ unconditionally discarded high-power physical peaks ($P = 160\text{--}508$).
+  3. *Uncopied Micro-Sieve Hits to Host Candidate*: `CudaDetectionCandidate` calculated `max_sieve_hits`, but `CudaFlickerCore::execute_batched_spectral_analysis` omitted `res.max_sieve_hits = c.max_sieve_hits`, leaving `max_sieve_hits == 0` on host CPU.
+  4. *Aggressive Neural Clutter Erasure*: In `ev_flicker_detector.cpp`, candidates with $\text{SNR} < 10.0\text{ dB}$ were unconditionally erased if $\text{drone\_prob} < 0.35$ without checking for mechanical blade sharpness ($Q \ge 4.0, P \ge 60.0$), destroying hover candidates.
+  5. *Unbounded Micro-Sieve Latching in SAE*: `reset_sieve_hit_accumulators()` cleared `d_cell_max_sieve_hits_` but left `d_sae_hits_` uncleared, allowing periodic hits to latch across foliage rows.
+  6. *Missing Low-Frequency Cutoff*: In `kernel_spectral_harmonic_analysis`, subharmonic demotion and parabolic interpolation produced frequencies at 67–70 Hz below `min_freq_hz = 75.0\text{ Hz}`.
+- **Architectural Fixes Deployed**:
+  1. *Micro-Sieve Priority Sorting (`cuda_flicker_core.cu`)*: Priority sorted cells for CombNet evaluation: periodic sieve hits first, then event density.
+  2. *Post-Peak Flatness Gating with High-Power Exemption*: Allowed flatness up to $0.78$ for peaks with $P \ge 15.0$ or micro-sieve lock.
+  3. *Host Micro-Sieve Propagation*: Copied `res.max_sieve_hits = c.max_sieve_hits` into `FlickerDetectionResult`.
+  4. *Rotor Spike Exemption in Neural Clutter Filter*: Never prune candidates with $Q \ge 4.0$ and $P \ge 60.0$.
+  5. *Symmetric Neighbor Sharpness & Calibrated Standoff Discount*: Enforced $Q = P / [0.5 \times (P_{-2} + P_{+2})]$ and granted the $5.5\text{ dB}$ discount only to micro-sieve locked cells or high-power blade spikes.
+  6. *Synchronized SAE Tile & Cell Accumulator Reset*: Reset both `d_cell_max_sieve_hits_` and `d_sae_hits_` every 3 frames ($120\text{ ms}$).
+  7. *Harmonic Octave & Cross-Harmonic Association*: Added $2:3$ and $3:2$ ratio matching in `SpatialFlickerClusterer`.
+- **Hardware Verification & Live Deployment (`orin@10.0.0.34`, PID 196910)**:
+  - All 26 unit tests passed 100% on Jetson Orin Nano hardware (0.65 ms cuFFT latency).
+  - Target lock achieved on hovering drone: **101+ consecutive hits (0 misses)**.
+  - Telemetry: $\text{BPF} = 111\text{--}130\text{ Hz}$ ($3330\text{--}3900\text{ RPM}$) with **$10.0\text{--}11.2\text{ dB}$ SNR** and confidence $1.00$.
+
+
+### 39. Pipeline RCA & Phase 33 Correctness Rebuild (2026-10-06)
+
+**Root causes of 30–40 ft collapse (12 mm f/2.5):**
+- D1: deployed `~/ev_deploy/ego_motion.hpp` had a 16.384x gyro scale + axis swap (phantom rotation); re-anchor had no ring-buffer remap; warped events were border-clamped (border false tracks).
+- D2: SpectralCombNet outputs ~0 on real spectra — trained on spectral-domain synthetic positives without DC, so it learned "DC => clutter". Removing DC is NOT a fix; retrain on runtime representation (33.6).
+- D3: effective SNR threshold 9 - 3.5 = 5.5 dB, below the noise maximum over ~120 Exp(1) bins (~7.3 dB): 83% of pure-noise spectra passed (measured 3325/4000) => 241–330 candidates/frame.
+- GPU SAE sieve was race-dependent and dropped events BEFORE ring-buffer accumulation.
+- Throughput is not the bottleneck.
+
+**Phase 33 changes (repo `ev_ingestion_cpp/`, HEAD 2f428d7 + uncommitted):**
+- 33.1 `deploy/deploy.ps1 [-NoRestart]` -> `~/ev_deploy/src` -> `orin_build_install.sh` (build, 3 test suites, install w/ `.old` rollback, restart, verify `/pipeline_stats` build_id). Exit: 2 args, 3 build, 4 tests, 5 restart. Orin sudo needs password => restart is manual (`sudo systemctl restart predator-camera.service`) unless a narrow sudoers rule is added.
+- 33.2/33.3 `PREDATOR_ENABLE_EGO_WARP` and `PREDATOR_COMBNET_PRUNE` (both default OFF); telemetry `build_id`, `flags`, `cfar`.
+- 33.4 CPU time-ordered 2x2 sieve (`periodic_hits`) writes hits into `CudaRawEvent::pad`; GPU accumulation unconditional; >131072-event batches chunked; ring bin grid snapped to absolute multiples of 250 us (`window_anchored_` flag; 0 is a valid anchor).
+- 33.5 `spectral_gate.hpp`: single `__host__ __device__` gate used by kernel AND ROI diagnostics. Threshold from FA budget (`false_alarms_per_hour`=6, env `PREDATOR_CFAR_FA_PER_HOUR`), budget is per 128 ms WINDOW (25 Hz frames overlap 69%). Order-statistic CFAR (Rohling 1983) with N_eff from Hann bin correlation => eta = 14.74 dB. Detection statistic = strongest in-band comb line (+-1 bin harmonic search). Subharmonic demotion: power >= 0.04x peak AND >= 10 dB above noise. API: `set_spectral_gate_config()`, `execute_batched_spectral_analysis(gyro, out)`.
+- Tracker (`flicker_dsp.hpp`): removed `peak_snr_db >= 10` / absolute-power "drone signature" exemption and the 2-hit SNR>=10 fast-confirm (both vacuous once every candidate >= 14.7 dB).
+- CMake: `-UNDEBUG` on test targets.
+
+**Verified (Orin, build 2f428d7-dirty):** all 13 DSP tests, ego tests, CUDA tests. Noise FA (loose budget) 0.0325 <= 0.05 bound; default 0/4000; 200 Hz @19 dB 50/50; 7 dB case 0/50 (single-window limit); harmonic-dominant 49/50. GPU E2E: 0 candidates over 5 windows x 1152 cells @1 Mev/s; 210 Hz rotor in noise detected @20.8 dB. Shuffled == ordered ring buffers.
+
+**Failure states (do NOT repeat):**
+- Release builds define NDEBUG: all `assert()` tests were no-ops ("12 PASSED" was meaningless). Test targets must use `-UNDEBUG`.
+- Known-noise CFAR `eta = ln(N/Pfa)` ignores median-estimator variance: under-counts FA ~50x at production threshold. Use OS-CFAR.
+- Fixed-ratio subharmonic demotion (0.35 power) fails under Poisson fluctuation; exact-integer harmonic index misses lines at h*k+-1.
+- Test signals must be sized from computed expected SNR (A=0.25 on bg 0.5 is ~7 dB — undetectable single-window).
+- `std::cout` diagnostics are lost on `assert` abort; use `std::cerr`.
+- CombNet as pruner/veto; "just remove DC"; spectral-domain synthetic training data; per-phase threshold retuning; GPU parallel SAE sieve; 300 m on a 12 mm lens; 25 mm on a helmet (FOV); learned suppression ahead of the detector.
+- PowerShell: pipes/double quotes inside `ssh '...'` break; use scp'd scripts or `grep -e` args. PowerShell numeric loops for derivations can hang — compute in C++ on target.
+
+**Open:** service restart + dark-room live check (<= 1 confirmed FA / 10 min); CombNet rescue path still accepts 5 dB (bypasses CFAR) — close in 33.6 fusion; weak targets need multi-window integration (TBD, Phase 34); 33.6 CombNet v3 on DGX `vollebak@100.114.14.56:~/predator_spectral` (Hann symmetric N-1=511, preprocessing log10(1+P/median(P[5:128]))).
+
+
+## 40. Phase 33.4b: GPU-resident ingest, measured baseline (2026-10-07 UTC)
+
+**Topology facts (measured on Orin via scratch `mem_topology.cu`):** `integrated=1`; CUDA total memory 7619 MB == Linux MemTotal 7619 MB. There is NO dedicated VRAM; the 8 GB 128-bit LPDDR5 (68 GB/s) is shared. `canMapHostMemory=1`, `pageableMemoryAccess=0` (GPU cannot read malloc/SDK buffers unless pinned/registered), `concurrentManagedAccess=0` (no cudaMallocManaged for streaming rings). Direct-to-GPU on Orin == mapped pinned buffers read in place; there is no PCIe copy to avoid, only CPU work.
+**Camera:** `metavision_platform_info` -> Current Data Encoding Format EVT3 (EVT21 available), IDS integrator, IMX636, serial 4110044079. OpenEB 5.2.0 source at `~/openeb` (tag 5.2.0); HAL CMake target `Metavision::HAL` (`/usr/local/share/cmake/MetavisionHAL`). HAL raw API present: `I_EventsStream::wait_next_buffer()/get_latest_raw_data()`; SDK `RawData::add_callback(const uint8_t*, size_t)`.
+**Sudo:** `/etc/sudoers.d/predator-deploy` (visudo-validated) grants `orin` NOPASSWD ONLY for exact `systemctl start|stop|restart|status predator-camera.service` (no extra args). Installed once via `sudo -S` over stdin; password not stored. User advised to rotate the Orin password.
+**Deploy:** build `2f428d7-dirty-src9b7556ab2503` live since 01:37 UTC (PID changes after bench runs). Live dark room: ROI noise peaks 0.8-7.5 dB, all FAIL_CFAR, 0 candidates (old gate: 241-330/frame).
+
+**New code:** `ev_ingestion_cpp/evt3_encoder.hpp` (reference EVT3 encoder: TIME_HIGH every 4096 us like the sensor, TIME_LOW after any high change, ADDR_Y on change, vectors only for >=3 consecutive same-(t,y,p) increasing-x events with base+32 <= width, since OpenEB BasicCheckValidator rejects base+32 > width; first t must be < 2^24). `ev_ingestion_cpp/bench_ingest.cpp` + CMake target `bench_ingest` (EXCLUDE_FROM_ALL; build: `cmake -S ~/ev_deploy/src -B ~/ev_deploy/build && cmake --build ~/ev_deploy/build --target bench_ingest`). Runner `~/run_bench.sh` stops the service and restarts it via trap.
+
+**Measured (service stopped, schedutil 1.344 GHz, 1 s scenes: noise + row segments + 4 rotors, B/ev 2.4-2.9):**
+| Mev/s | SDK EVT3 decode | frame_gen | ingest @native ~300 ev/callback | ingest @4096 | ingest @65536 | callback thread total |
+|---|---|---|---|---|---|---|
+| 1 | 14.4 ns/ev | 50.3 | 110.5 | 41.8 | 36.9 | 17.5% of 1 core |
+| 3 | 14.7 | 24.2 | 100.9 | 41.8 | 36.1 | 41.9% |
+| 10 | 12.0 | 15.1 | 104.5 | 51.7 | 45.9 | 131.6% (cannot keep up) |
+OpenEB `I_EventDecoder<EventCD>` flushes ~300-320 events per callback; each `ingest_event_batch` call pays ~20 us fixed CUDA API cost (pageable 36 B homography memcpy, cudaEventSynchronize on the previous upload, upload + kernel launch).
+
+**Failure states (do NOT repeat):**
+- "Orin has VRAM / load straight into VRAM": wrong for Jetson (integrated GPU, shared LPDDR5). The SpaceCamp weights-to-VRAM pattern does not map directly.
+- My prior estimate "SDK EVT3 decode is the largest CPU cost; sieve 5-50 ns/ev" was WRONG: decode is the smallest (12-15 ns/ev); the dominant cost is per-callback CUDA API overhead on ~300-event batches, then the CPU sieve/copy pass (36-46 ns/ev).
+- Per-SDK-callback GPU submission (any design issuing CUDA calls per Camera::cd() callback) cannot sustain 10 Mev/s.
+- sudoers rules match arguments exactly; `systemctl status ... --no-pager` is refused (use `SYSTEMD_PAGER= sudo -n systemctl status predator-camera.service`).
+- Windows-authored bash scripts need `sed -i 's/\r$//'` before running.
+
+**33.5 live acceptance (2026-10-07 01:47-01:57 UTC, dark room, `~/monitor_fa.sh 600`):** 600/600 samples, 0 confirmed targets, tentative tracks in 2 samples (never confirmed) -> PASS. 33.1/33.2/33.3 closed (stale sources already in `~/ev_deploy/attic_phase33_20261006`).
+**Open observation:** service uses ~44% of one core in the dark room (~20k ev/s, so ingest is ~0.2%); one thread alone is ~28% and rate-independent. Not yet identified (candidates: UI JPEG encode / frame path, 25 Hz analysis + journal ROI logging). Identify before 33.4b.e.
+**Decision pending (user):** GPU decoder format. EVT3 (current, 2.4-2.9 B/ev) needs a stateful parallel parse (multiword skip automaton scan + index max-scans + vector-base/sticky-validity prefix sums) to be OpenEB-exact. EVT2.1 (available on this camera, `evt21_event_types.h`): every 64-bit word self-contained (type=polarity, 6-bit ts LSB, x, y, 32-bit mask; TIME_HIGH = 28-bit ts[33:6]) -> one time-high scan + popcount scan; ~8 B per isolated event. OpenEB has a legacy EVT2.1 word order (32-bit halves swapped): must verify which one the IDS camera emits before relying on it.
+
+## 41. Phase 33.4b.b: EVT2.1 GPU decoder, bit-exact vs OpenEB (2026-10-07 UTC)
+
+**Decision:** the user approved switching the camera to EVT2.1 for the GPU path (every 64-bit word is self-contained, so decoding is a scan instead of a stateful parse). Select it with `Metavision::DeviceConfig cfg; cfg.set_format("EVT21"); DeviceDiscovery::open("", cfg)`. The IMX636 reports `EVT21;height=720;width=1280;endianness=legacy` and is decoded by `EVT21LegacyDecoder`.
+
+**Legacy word layout (verified on live data with `evt21_capture`):**
+
+| Bits | CD words | TIME_HIGH words |
+|---|---|---|
+| 0..10 | y | ts[33:6] (bits 0..27) |
+| 11..21 | x base | |
+| 22..27 | ts[5:0] | |
+| 28..31 | type | type |
+| 32..63 | validity mask | |
+
+Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUED.
+
+**OpenEB 5.2 semantics (`hal/cpp/include/metavision/hal/decoders/evt21/evt21_decoder.h`):**
+- When the base time is not set, a buffer with no TIME_HIGH is dropped whole. This is equivalent to dropping every word before the first TIME_HIGH of the stream.
+- `set_last_high_timestamp`: if the new high is lower and `old - new >= 2^28-1`, the loop counter increments. Any other backward jump logs "Error TimeHigh discrepancy" and the new value is still applied.
+- CD timestamp = (loop<<34) | (high<<6) | ts6. Events are emitted in ascending bit order with x = base + bit; there is no width check.
+- Every word is single (OTHERS never consumes the next word).
+
+**New code:**
+- `evt21_format.hpp`
+- `evt21_encoder.hpp`: emits a TIME_HIGH for every 64 us step and builds 32-aligned vectors.
+- `gpu_event.hpp`: `CudaRawEvent` moved here.
+- `evt21_gpu_decoder.cu/.cuh`: `GpuEvt21Decoder`. Stages: TIME_HIGH index, then CUB max-scan, then a packed (wrap<<32 | popcount) count, then a CUB sum-scan, then emit, then a one-thread finalize. Decoder state lives on the device, so any batch split decodes as one stream. Batch limit is 2^26 words.
+- `synthetic_scene.hpp`
+- `evt21_capture.cpp`: opt-in target.
+- `test_evt21_decoder.cpp`: runs in the deploy gate. Use `--fixture <prefix> [--batch N]` to replay a capture.
+
+**Results:**
+
+| Check | Result |
+|---|---|
+| Synthetic suite | 35/35 pass in about 3 s |
+| Live fixture (dark room, default biases, 95,825,638 words) | 95,101,288 events bit-exact at 16384-word batches |
+| Host enqueue per batch | 48 us p50, 61 us p99 (7 launches/CUB dispatches) |
+| GPU time per batch | 70 us p50 |
+| GPU throughput | 7.1 ns/event, about 141 Mev/s |
+
+- The `deploy.ps1 -NoRestart` gate passes with all 4 suites.
+- Implication for 33.4b.c: coalesce raw buffers so there is one decode per ~2 ms or per N words. At ~1.7 ms USB buffer intervals, about 50 us per launch set is roughly 3% of one core. If that matters, a CUDA Graph capture of the fixed launch sequence is the next lever.
+
+**Capture findings:**
+- Default biases give 9.5 Mev/s, 8.06 B/event, 99.997% OFF events. Raw buffers are mostly 131072 B, about 1.7 ms apart.
+- **Two hot pixels at about 4.6 Mev/s each account for 97% of events**: one in row 677 and one in column 279. The rest of the array has a median of 0.3 ev/s.
+- The service's biases (refr=+20 etc.) give about 20k ev/s live.
+- Candidate fix: the IMX636 hardware pixel mask (`i_roi_pixel_mask.h`). Not acted on; to raise with the user and fold into 33.7.
+
+**Capture segfault, root cause:** `EVT21GenericDecoder` dereferences `monitoring_event_forwarder_` unconditionally. Construct the decoder with all four sinks (CD, ExtTrigger, ERCCounter, Monitoring), as `make_decoder.cpp` does. The EVT3 decoder follows the same pattern.
+
+**Failure states (do NOT repeat):**
+- Never construct an OpenEB EVT21 or EVT3 decoder without the Monitoring sink.
+- `/usr/bin/time` is not installed on the Orin; use the bash builtin `time`.
+- In PowerShell ssh one-liners `$?` expands locally (it prints `rc=True`). Put exit-code logic inside scp'd scripts.
+
+## 42. Phase 33.7a: IMX636 Hot-Pixel Hardware Mask Integration (2026-10-07 UTC)
+
+**Hardware & API Discovery:**
+- The Sony IMX636 (Gen4.1 architecture) does NOT implement `Metavision::I_RoiPixelMask` (which is exclusive to GenX320).
+- The correct IMX636 facility is `Metavision::I_DigitalEventMask` (`#include <metavision/hal/facilities/i_digital_event_mask.h>`), providing 64 hardware mask registers (`NUM_MASK_REGISTERS_ = 64`).
+- Each mask register controls `["x"]`, `["y"]`, and `["valid"]` via `I_PixelMask::set_mask(x, y, enabled)`.
+
+**Hot Pixel Identification:**
+- From `darkroom_evt21.cd` and confirmed live via `hot_pixel_survey`:
+  - Pixel 1: `(448, 33)` firing at 4,547,900.2 ev/s (47.930% of total array output)
+  - Pixel 2: `(279, 677)` firing at 4,547,900.2 ev/s (47.930% of total array output)
+  - Together, these 2 pixels account for 95.88% of all events emitted at factory default biases.
+  - The 3rd highest pixel emits only 30.1 ev/s; median active pixel rate across the remaining array is 0.40 ev/s.
+
+**RCA & Resolution: LibUSB Transfer Error in Two-Pass Survey:**
+- *Root Cause:* In OpenEB 5.2, `I_EventsStream::stop()` invokes `PseeLibUSBDataTransfer::stop_impl()`, which cancels all outstanding asynchronous URBs and leaves the endpoint transfer queue halted. Calling `start()` on the same stream object without resetting the USB transfer context causes `LIBUSB_TRANSFER_ERROR`.
+- *Fix:* Architected `hot_pixel_survey.cpp` into two clean, independent device sessions (`device.reset()` followed by fresh `DeviceDiscovery::open()`), allowing the USB bus to settle between baseline discovery and masked verification.
+
+**New Infrastructure & Modules:**
+- `ev_ingestion_cpp/hot_pixel_mask.hpp`: Modular parsing, validation (bounds checking `[0, W) x [0, H)`, duplicate rejection, 64-mask capacity clamping), and hardware programming via `apply_hardware_pixel_mask()` with graceful degradation.
+- `ev_ingestion_cpp/test_hot_pixel_mask.cpp`: 7 unit tests covering non-existent files, valid formats, coordinate out-of-bounds rejection, deduplication, malformed line handling, capacity clamping, and read/write round-trip accuracy. Integrated into deploy gate (`orin_build_install.sh`) with `-UNDEBUG`.
+- `ev_ingestion_cpp/hot_pixel_survey.cpp`: Automated 2-pass discovery & verification tool with configurable rate thresholds and bias modes (`--default-biases`, `--seconds`, `--output`).
+- `ev_ingestion_cpp/tools/orin_scripts/run_survey.sh`: Safe runner stopping `predator-camera.service` and trapping EXIT to guarantee service restart.
+- `ev_ingestion_cpp/ev_flicker_detector.cpp`: Startup loading of `hot_pixels.txt`, programming IMX636 hardware mask registers, and exposing `hot_pixel_mask` telemetry block in `/pipeline_stats` JSON.
+
+**Live Acceptance Measurements (Dark Room, IDS IMX636 #4110044079):**
+- *Masked Pixel Emission:* Exactly 0.0 ev/s on (448, 33) and (279, 677) (100.00% suppression).
+- *Array-Wide Rate Reduction at Default Biases:* Dropped from 9,488,623.4 ev/s down to 390,984.6 ev/s (95.88% reduction, passing >=90% target).
+- *Service Rate at Tuned Biases:* Maintained low noise baseline (~20 kev/s, 99.9% suppression, 0 false alarms, all noise peaks failing CFAR 14.74 dB gate).
+- *Telemetry Visibility:* Live verified via `curl http://127.0.0.1:8080/pipeline_stats` showing `applied: true`, `facility: "I_DigitalEventMask"`, `count: 2`, and pixel coordinates with baseline rates.
+- *Deploy Gate:* 5/5 unit test suites passing (`test_flicker_dsp`, `test_ego_motion`, `test_cuda_flicker`, `test_evt21_decoder`, `test_hot_pixel_mask`). Build ID `2f428d7-dirty-src283f3e70e240`.
