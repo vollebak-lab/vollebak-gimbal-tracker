@@ -1228,3 +1228,56 @@ Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUE
 - *Gate 4 (Clutter & Lighting Discrimination):* **PASS** (True Negative Rate = **96.90%**, exceeding the $\ge 95.0\%$ target).
 - *Gate 5 (Jetson Native C++ Test Suite):* **PASS** (`test_cuda_flicker` TEST 6 executed on live Orin Nano: drone recognized at $P = 0.9980$, BPF = 200.03 Hz, SNR = 17.07 dB; foliage rejected at $P = 0.0003$).
 
+
+## 47. Phase 33.7: Ambient Clutter Suppression, Neural Gating Hardening & Real-Time Focus Assist (2026-10-07 UTC)
+
+### 1. Root Cause Analysis (RCA) — The 100 Phantom Drone Storm
+- **Observed Failure:** When pointing the camera into an illuminated indoor/ambient environment (without any drone in the FOV), the pipeline flooded with 74–113 raw candidates and locked 22–27 confirmed tracks (~100 active detections total), rendering optical focusing of the 12mm f/2.5 lens impossible.
+- **Empirical Diagnostics (`flicker_diagnostics.csv`):**
+  - `neural_eval_cells: 128`, `neural_detections: 78 to 106`, `top_neural_prob: 0.999`.
+  - 25 of 27 confirmed tracks were tightly clustered at **80–88 Hz** and **120–128 Hz** (with 240–252 Hz harmonics), spanning the entire sensor from $x = 75\dots 1228, y = 100\dots 700$.
+- **Upstream Defect 1 ("Neural Weak-Signal Rescue" Floodgate):** In `ev_flicker_detector.cpp`, cells evaluated by SpectralCombNet with `np.drone_prob >= 0.55f` and `physical_snr_db >= 5.0f` were unconditionally injected into `raw_detections` with `is_neural_detection = true`. Because CombNet was trained on dark-room noise and idealized signals, ambient AC lighting (120 Hz, 85 Hz) triggered $0.99+$ probability across 70–106 cells per frame, bypassing the 14.74 dB CFAR gate and flooding the tracker.
+- **Upstream Defect 2 (Spatial Filter Veto Bypass):** In `flicker_dsp.hpp`, `is_drone_signature` checked `if (c.is_neural_detection)`. Because all 106 rescued candidates had `is_neural_detection = true`, `is_drone_signature` was true for every cluster, completely bypassing both AC powerline suppression (`is_ac_carrier`) and diffuse flutter suppression (`diffuse_flutter`).
+- **Upstream Defect 3 (AC Tolerance Window vs cuFFT Binning):** In a 512-pt FFT at 4 kHz ($\Delta f = 7.8125\text{ Hz}$), bin 16 is 125.0 Hz. Parabolic interpolation on 120 Hz AC flicker produces peaks at 123.5–127.5 Hz. The legacy check `std::abs(freq_hz - 120.0) < 3.0` missed 124–128 Hz entirely.
+- **Upstream Defect 4 (Tracker 2-Hit Fast-Confirm):** In `flicker_dsp.hpp`, tracks with `is_neural_detection` confirmed after only 2 frames (80 ms), locking ambient noise into confirmed green HUD boxes.
+
+### 2. Architectural Principles & Fixes Implemented
+1. **Spatial Physics Overrules 1D Neural Predictions:**
+   - A 1D convolutional network evaluating 257 cuFFT bins from an isolated $40\times 40$ cell has zero spatial context. It cannot distinguish between a single drone rotor at 120 Hz and an entire room illuminated by 120 Hz AC lighting.
+   - Enforced unconditional sensor-wide diffuse carrier suppression: computes spatial bounding box (`span_x`, `span_y`) of all candidates in each frequency group. If `clusters.size() >= 3 || span_x > 240 || span_y > 240`, the entire frequency bin is dropped (physically impossible for a localized drone airframe).
+2. **Expanded AC Powerline Carrier Bands:**
+   - Expanded AC rejection bands to encompass FFT bin leakage and parabolic peak shift:
+     - $[94, 106]\text{ Hz}$ (50 Hz grid $2\times$)
+     - $[114, 130]\text{ Hz}$ (60 Hz grid $2\times$)
+     - $[234, 256]\text{ Hz}$ (60 Hz grid $4\times$ / 120 Hz $2\times$)
+3. **CFAR Gatekeeper Preservation:**
+   - Gated Neural Weak-Signal Rescue behind `PREDATOR_COMBNET_RESCUE` (default `false`).
+   - When enabled, rescue strictly requires `np.physical_snr_db >= 8.0f` and `np.drone_prob >= 0.80f`.
+   - CombNet v3 primarily functions as a scorer and booster of CFAR-passing candidates.
+4. **M-of-N Gating & Spatial Clustering Support:**
+   - Enforced robust $M = 3$ consecutive hits for track confirmation in `update_tracker` (stripped the 2-hit neural shortcut).
+   - Upgraded spatial clustering in `flicker_dsp.hpp` with coordinate adapter supporting both patch grid coordinates ($40\times 40\text{ px}$) and continuous centroid coordinates.
+
+### 3. Integrated Real-Time Focus Assist Engine
+- **Algorithm:** Computes Tenengrad / Laplacian variance sharpness on the central $640 \times 360$ ROI ($230,400\text{ pixels}$) using `cv::Laplacian(..., CV_16S)` and `cv::meanStdDev`:
+  $$\text{Focus Score} = \sigma^2(\nabla^2 I_{\text{ROI}})$$
+- **Performance:** Sub-millisecond compute overhead ($<0.2\text{ ms}$) on Jetson Orin Nano Cortex-A78AE.
+- **HUD Focus Mode:**
+  - When `g_focus_mode_enabled` is active, suppresses target bounding boxes, renders a prominent yellow center reticle with crosshairs on the central $640\times 360$ ROI, and displays a dynamic sharpness progress bar (`FOCUS SHARPNESS: curr / peak (% of peak)`) at the bottom of the stream.
+  - Top HUD dynamically reports `FOCUS: score [PEAK: peak]`.
+- **HTTP Endpoints & Web UI Controls:**
+  - `GET /toggle_focus`: dynamically toggles focus reticle HUD mode.
+  - `GET /reset_focus`: resets peak focus score to zero (re-baselining for fine-tuning).
+  - Updated web dashboard (`http://10.0.0.34:8080/`) with dedicated Focus Assist Engine card and live metrics.
+
+### 4. Verification & Live Hardware Results
+- **Clean Deployment:** Commit `315434f` compiled and verified via `deploy.ps1` -> PID 12898 running build `315434f-src9a140c7589fd`.
+- **Test Suite Execution:** All 7 unit test suites passed cleanly (13 DSP tests, ego-motion, CUDA flicker, EVT21 decoder, hot pixel mask, GPU sieve, raw pipeline).
+- **Live Ambient Telemetry (`/pipeline_stats`):**
+  - `num_targets: 0`
+  - `num_tracks: 0`
+  - `tracks: []`, `targets: []`
+  - `cands`: dropped from 113 down to 0–1.
+  - `neural_detections`: dropped from 106 down to 0.
+  - `focus`: live score ~77,896, peak ~130,075.
+  - False alarm rate under diffuse ambient indoor lighting: **0.00 false alarms**.
