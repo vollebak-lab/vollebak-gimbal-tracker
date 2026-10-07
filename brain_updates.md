@@ -1183,3 +1183,48 @@ Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUE
 - *Total Service CPU:* Dropped from ~44-50% down to **~23-26%** of one core.
 - *Ring Overruns & Dropped Buffers:* Exactly **0 dropped buffers, 0 ring overruns** across >22,000 USB buffers and 9.3M raw words.
 - *Dark Room Target Suppression:* 0 confirmed targets, 0 tracks. All 7 test suites pass in the deploy gate.
+
+## 46. Phase 33.6: SpectralCombNet v3 Retraining, Platt/Guo Calibration & TensorRT FP16 Deployment (2026-10-07 UTC)
+
+**1. Algorithmic Root Cause Analysis & The Sim-to-Real Gap:**
+- *Distributional Shift in Early CombNet:* Earlier iterations (Phases 26–31) trained on idealized synthetic single-frequency tones with artificial log-power clamping, resulting in elevated false alarm rates (~2.06%) when exposed to real IMX636 unilluminated Poisson noise clusters, and severe attenuation of real high-harmonic drone combs.
+- *Hanning Window Precision Flaw:* In PyTorch, generating the Hanning window directly in `torch.float32` created a $1.07 \times 10^{-3}$ parity divergence from C++ cuFFT because C++ uses double precision `cos(2*pi*i / 511.0)`. Generating in `float64` before casting to `float32` brought PyTorch CUDA cuFFT parity to $\mathbf{1.19 \times 10^{-7}}$ (and worst-case across all 8 test vectors to $\mathbf{6.91 \times 10^{-6}}$, $144\times$ tighter than the $\le 10^{-3}$ gate).
+- *Dynamic Range & Noise Floor Clamping:* In pure DC or single-frequency signals, dynamic range exceeds $110\text{ dB}$ ($4 \times 10^7$ down to $1.66 \times 10^{-4}$). PocketFFT (CPU) and cuFFT (GPU) differ by $2.3 \times 10^{-6}$ in absolute power, but dividing by clamped noise floor ($10^{-4}$) magnified relative log error. Using PyTorch with CUDA cuFFT on DGX Spark matched Orin cuFFT bit-accurately.
+
+**2. Physical Synthetic Generator (`synthetic_event_generator.py`):**
+- Event-level, platform-agnostic pulse train modeling real aerodynamics:
+  - Fundamental Blade Pass Frequency ($f_{\text{BPF}}$): 70 to 800 Hz.
+  - Blade count: 2, 3, 4, 5 blades.
+  - Rotor count: 1 to 8 rotors.
+  - Trim RPM jitter ($\pm 1\text{--}3\%$) and differential rotor mixing.
+  - Aerodynamic pulse duty cycle: $3\%\text{ to }16\%$ per blade passage.
+  - Stochastic Poisson event arrival modulation and low-contrast optical cycle dropouts ($5\%\text{ to }25\%$).
+  - Negative clutter generation: 1/f wind turbulence, tree canopy sway, 100/120 Hz AC floodlight flicker, isolated mechanical vibrations, moving step edges, and thermal Poisson noise.
+
+**3. Real Hardware Dark-Room Spectra Extraction (`extract_real_spectra.cpp`):**
+- Ingested 20,000,000 real events from the Orin Nano dark-room fixture (`darkroom_evt21.cd`) through `CudaFlickerCore::compute_normalized_spectrum`.
+- Extracted 5,000 physical 257-bin IMX636 dark-room noise spectra saved to `real_darkroom_spectra.bin`.
+- Built `real_spectra_dataset.py` with multi-modal mixing: 45% positive drone combs, 30% real hardware dark-room spectra, and 25% synthetic clutter.
+
+**4. Training, Temperature Calibration & TRT FP16 Compilation (`train_spectral_combnet_v3.py`):**
+- Architecture: 1D Dilated Residual Harmonic Network with 4 dilation octaves (dilations 1, 2, 3, 4) mapping 257 bins ($0\text{--}2000\text{ Hz}$, $\Delta f = 7.8125\text{ Hz}$).
+- Loss: BCE with hard-negative focal weighting ($3.0\times$ penalty on negative false alarms) + octave-aware harmonic regression loss.
+- Trained 20 epochs on DGX Spark GB10 GPU (`vollebak@100.114.14.56`):
+  - Accuracy: **94.10%**
+  - Precision: **0.990**
+  - Recall: **0.880**
+  - F1-Score: **0.9315**
+  - Platt/Guo Temperature Calibration: Calibrated temperature $T = \mathbf{1.1595}$ (ECE minimized on held-out validation set).
+- Exported self-contained ONNX opset 17 model (`spectral_combnet.onnx`, 225,836 bytes, dynamic batch $B \in [1, 128]$).
+- Compiled TensorRT FP16 engine on Jetson Orin Nano via `trtexec`:
+  - Output: `/home/orin/ev_deploy/models/spectral_combnet_fp16.engine` (503,012 bytes).
+  - Throughput: **862.65 QPS**
+  - Latency: **0.97 ms** median GPU compute latency, **1.15 ms** mean latency.
+
+**5. 5-Gate Validation Suite Results (`validate_spectral_combnet_v3.py`):**
+- *Gate 1 (ONNX vs PyTorch Numerical Parity):* **PASS** (Max probability difference $= 0.00\times 10^0$, max frequency difference $= 1.37 \times 10^{-4}\text{ Hz}$).
+- *Gate 2 (Real Sensor Dark-Room Replay False Alarm Gate):* **PASS** (5,000 real IMX636 dark-room spectra evaluated: **1 false alarm = 0.020%**, exceeding the $\le 0.10\%$ gate by $5\times$; max false positive probability never exceeded 0.58).
+- *Gate 3 (Held-Out Platform Generalization):* **PASS** (Recall at $P \ge 0.35$ candidate gate = **91.00%**, Mean Octave cuFFT Peak Error = **16.40 Hz** vs $\le 25.0\text{ Hz}$ target).
+- *Gate 4 (Clutter & Lighting Discrimination):* **PASS** (True Negative Rate = **96.90%**, exceeding the $\ge 95.0\%$ target).
+- *Gate 5 (Jetson Native C++ Test Suite):* **PASS** (`test_cuda_flicker` TEST 6 executed on live Orin Nano: drone recognized at $P = 0.9980$, BPF = 200.03 Hz, SNR = 17.07 dB; foliage rejected at $P = 0.0003$).
+

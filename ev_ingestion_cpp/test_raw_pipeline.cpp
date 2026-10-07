@@ -253,10 +253,20 @@ void test_fixture_parity(const std::string& evt21raw_path, const std::string& cd
               << ", CPU Events: " << actual_cd << "\n";
     std::cout << "  -> Cell Parity: " << (parity ? "PERFECT" : "MISMATCH")
               << " (" << mismatch_cells << "/1152 cells differing)\n";
+    if (!parity) {
+        for (size_t i = 0; i < 1152; ++i) {
+            if (std::abs(gpu_cell_totals[i] - cpu_cell_totals[i]) > 1.0f) {
+                std::cout << "    Cell " << i << ": GPU=" << gpu_cell_totals[i] << ", CPU=" << cpu_cell_totals[i] << "\n";
+                break;
+            }
+        }
+    }
+    std::cout << std::flush;
 
     run_test("Fixture Ring Buffer Parity (GPU Raw vs CPU CD)", parity,
              "words=" + std::to_string(actual_words) + ", events=" + std::to_string(gpu_decoded));
     assert(parity);
+
 }
 
 // ---------------------------------------------------------------------------------------------------------------

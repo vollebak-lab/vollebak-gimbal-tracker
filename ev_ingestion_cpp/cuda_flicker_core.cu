@@ -731,4 +731,40 @@ void CudaFlickerCore::get_cell_total_events(std::vector<float>& out_totals) {
     CUDA_CHECK(cudaMemcpy(out_totals.data(), d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
+void CudaFlickerCore::compute_normalized_spectrum(const float* time_series_512, float* out_spectrum_257, float* out_median_noise) {
+    if (!time_series_512 || !out_spectrum_257) return;
+
+    // Copy time series into cell 0 ring buffer with chronological alignment (head_idx = 511)
+    CUDA_CHECK(cudaMemcpyAsync(&d_ring_buffers_[0], time_series_512, 512 * sizeof(float), cudaMemcpyHostToDevice, stream_));
+    head_idx_ = 511;
+
+    // Apply Hanning window
+    kernel_prepare_fft_window<<<1, 512, 0, stream_>>>(d_ring_buffers_, head_idx_, d_fft_input_);
+
+    // Execute cuFFT R2C
+    CUFFT_CHECK(cufftExecR2C(cufft_plan_, d_fft_input_, d_fft_output_));
+
+    // Read back complex bins for cell 0
+    cufftComplex h_cell_fft[257];
+    CUDA_CHECK(cudaMemcpyAsync(h_cell_fft, &d_fft_output_[0], 257 * sizeof(cufftComplex), cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+    std::vector<float> power(257);
+    for (int k = 0; k < 257; ++k) {
+        float re = h_cell_fft[k].x;
+        float im = h_cell_fft[k].y;
+        power[k] = re * re + im * im;
+    }
+
+    // Median noise in bins 5..127 (123 elements)
+    std::vector<float> noise_slice(power.begin() + 5, power.begin() + 128);
+    std::sort(noise_slice.begin(), noise_slice.end());
+    float median_noise = std::max(1e-4f, noise_slice[noise_slice.size() / 2]);
+    if (out_median_noise) *out_median_noise = median_noise;
+
+    for (int k = 0; k < 257; ++k) {
+        out_spectrum_257[k] = std::log10(1.0f + power[k] / median_noise);
+    }
+}
+
 } // namespace predator

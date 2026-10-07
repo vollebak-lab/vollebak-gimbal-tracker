@@ -131,6 +131,16 @@ add_executable(test_raw_pipeline test_raw_pipeline.cpp raw_pipeline.cu evt21_gpu
 target_link_libraries(test_raw_pipeline PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core cufft cudart pthread)
 target_compile_options(test_raw_pipeline PRIVATE -UNDEBUG)
 
+# 7h. Phase 33.6a Preprocessing Parity Spectrum Dump Tool
+add_executable(dump_spectrum dump_spectrum.cpp cuda_flicker_core.cu)
+target_link_libraries(dump_spectrum PRIVATE MetavisionSDK::core cufft cudart pthread)
+
+# 7i. Phase 33.6c Real Orin Spectra Extractor
+add_executable(extract_real_spectra extract_real_spectra.cpp cuda_flicker_core.cu)
+target_link_libraries(extract_real_spectra PRIVATE MetavisionSDK::core cufft cudart pthread)
+
+
+
 # 8. Optional ONNX Runtime Ingestion Binary
 find_package(onnxruntime QUIET)
 if (onnxruntime_FOUND OR EXISTS "/usr/include/onnxruntime" OR EXISTS "/usr/local/include/onnxruntime")

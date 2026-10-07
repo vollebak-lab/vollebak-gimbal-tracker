@@ -164,6 +164,16 @@ public:
                                       float min_events = 6.0f);
 
     /**
+     * @brief Computes normalized 257-bin spectrum directly from a 512-sample time series on GPU (Phase 33.6a).
+     * Applies Hanning window, executes 512-point cuFFT R2C, computes power |X_k|^2, evaluates median noise floor
+     * from bins 5..127, and log10-normalizes matching SpectralCombNet runtime preprocessing.
+     * @param time_series_512 Pointer to 512 chronological temporal float samples
+     * @param out_spectrum_257 Pointer to output buffer for 257 normalized float bins
+     * @param out_median_noise Optional output pointer for the computed median noise floor
+     */
+    void compute_normalized_spectrum(const float* time_series_512, float* out_spectrum_257, float* out_median_noise = nullptr);
+
+    /**
      * @brief Resets per-frame periodic micro-sieve hit accumulators in GPU memory
      */
     void reset_sieve_hit_accumulators();

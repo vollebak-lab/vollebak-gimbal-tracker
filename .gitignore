@@ -43,6 +43,9 @@ event_camera/
 *.tar.gz
 *.deb
 *.zip
+*.bin
+*.cd
+*.raw
 
 # Logs
 *.log
