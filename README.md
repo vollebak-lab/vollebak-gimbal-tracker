@@ -22,7 +22,7 @@ For the prepared Windows laptop and Raspberry Pi pair, daily operation is now:
 3. Confirm camera health in the browser, clear the gimbal area, and press **START TRACKING**.
 4. Double-click `STOP_SYSTEM.cmd` when finished.
 
-The launcher restores the Logitech bridge, WSL IMX636 detector, USB/IP attachment, both SSH tunnels, Pi dashboard, and browser automatically. It always starts tracking paused and homes the gimbal. Run `SETUP_HANDOFF.cmd` once when provisioning another operator or laptop. See [system handoff](docs/HANDOFF.md) for prerequisites and troubleshooting.
+The launcher restores the Logitech bridge, WSL IMX636 detector, USB/IP attachment, both SSH tunnels, Pi dashboard, and browser automatically. A background hot-plug watchdog scans for the IMX636 every three seconds, attaches it to WSL, and starts or restarts Bart's detector, so the event camera may be connected after the launcher is already running. It always starts tracking paused and homes the gimbal. Run `SETUP_HANDOFF.cmd` once as Administrator when provisioning another operator or laptop; Windows must share the USB device once before automatic attachment can work. See [system handoff](docs/HANDOFF.md) for prerequisites and troubleshooting.
 
 ## Run it now
 

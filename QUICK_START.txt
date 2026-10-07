@@ -8,7 +8,8 @@ NORMAL START
 4. Double-click "Vollebak Gimbal Dashboard" on the Windows desktop.
    If the shortcut is not installed yet, double-click INSTALL_DASHBOARD_SHORTCUT.cmd once.
 5. Wait for http://192.168.0.3:8080 to open.
-6. Confirm LOGITECH and IMX636 show ONLINE.
+6. Confirm LOGITECH and IMX636 show ONLINE. The IMX636 can be plugged in later;
+   its watchdog scans every three seconds and starts Bart's detector automatically.
 7. Clear people and cables, then click START TRACKING.
 
 NORMAL STOP

@@ -20,7 +20,7 @@ try {
     Write-Warning "Could not reach the Pi dashboard; use the physical servo-power switch if needed."
 }
 
-foreach ($name in @("rgb-tunnel", "event-tunnel", "rgb-bridge", "event-detector", "wsl-keepalive")) {
+foreach ($name in @("rgb-tunnel", "event-tunnel", "rgb-bridge", "event-watchdog", "event-detector", "wsl-keepalive")) {
     $pidPath = Join-Path $RuntimeDir "$name.pid"
     if (-not (Test-Path $pidPath)) { continue }
     $savedPid = Get-Content $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1

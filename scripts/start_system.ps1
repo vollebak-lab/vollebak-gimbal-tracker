@@ -69,27 +69,6 @@ function Start-TrackedProcess(
     return $process
 }
 
-function Convert-ToWslPath([string]$WindowsPath) {
-    $resolved = (Resolve-Path $WindowsPath).Path
-    if ($resolved -notmatch '^([A-Za-z]):\\(.*)$') {
-        throw "Cannot convert path to WSL format: $resolved"
-    }
-    $drive = $Matches[1].ToLowerInvariant()
-    $tail = $Matches[2] -replace '\\', '/'
-    return "/mnt/$drive/$tail"
-}
-
-function Invoke-Usbipd([string[]]$Arguments, [int]$TimeoutSeconds = 10) {
-    $process = Start-Process -FilePath "usbipd.exe" -ArgumentList $Arguments `
-        -WindowStyle Hidden -PassThru
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        Write-Warning "usbipd $($Arguments -join ' ') timed out after ${TimeoutSeconds}s."
-        return $false
-    }
-    return ($process.ExitCode -eq 0)
-}
-
 $SshArgs = @(
     "-i", $KeyPath,
     "-o", "BatchMode=yes",
@@ -162,56 +141,34 @@ if (-not (Test-JsonEndpoint "http://127.0.0.1:8082/health")) {
     Write-Step "Logitech bridge already online"
 }
 
-$eventAvailable = $false
-if (-not (Test-JsonEndpoint "http://127.0.0.1:8081/stats")) {
-    Write-Step "Preparing WSL event-camera service"
-    $null = Start-TrackedProcess "wsl-keepalive" "wsl.exe" @(
-        "-d", $WslDistro, "--", "sleep", "infinity"
-    )
-    Start-Sleep -Seconds 1
+$eventAvailable = Test-JsonEndpoint "http://127.0.0.1:8081/stats"
+Write-Step "Starting continuous IMX636 hot-plug watchdog"
+$null = Start-TrackedProcess "wsl-keepalive" "wsl.exe" @(
+    "-d", $WslDistro, "--", "sleep", "infinity"
+)
+$null = Start-TrackedProcess "event-watchdog" "powershell.exe" @(
+    "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+    "-File", (Join-Path $PSScriptRoot "event_camera_watchdog.ps1"),
+    "-WslDistro", $WslDistro,
+    "-EventCameraVidPid", $EventCameraVidPid
+)
 
-    $usbLines = @(& usbipd list)
-    $cameraLine = $usbLines | Where-Object { $_ -match [regex]::Escape($EventCameraVidPid) } | Select-Object -First 1
-    if ($cameraLine) {
-        $busId = (($cameraLine -split '\s+')[0]).Trim()
-        if ($cameraLine -match 'Not shared') {
-            Write-Warning "IMX636 is not shared with usbipd. Run SETUP_HANDOFF.cmd as Administrator once."
-        } else {
-            # USB/IP may say Attached after the camera endpoint has timed out.
-            # Reset an offline device before launching OpenEB.
-            if ($cameraLine -match '\bAttached\b') {
-                Write-Step "Resetting stale/offline IMX636 USB attachment"
-                $null = Invoke-Usbipd -Arguments @("detach", "--busid", $busId)
-                Start-Sleep -Seconds 1
-            }
-            Write-Step "Attaching IMX636 USB device $busId to WSL"
-            $null = Invoke-Usbipd -Arguments @("attach", "--wsl", "--busid", $busId)
-            Start-Sleep -Seconds 1
-
-            $refreshedLine = @(& usbipd list) |
-                Where-Object { $_ -match [regex]::Escape($EventCameraVidPid) } |
-                Select-Object -First 1
-            if ($refreshedLine -match '\bAttached\b') {
-                $wslRepo = Convert-ToWslPath $RepoRoot
-                $null = Start-TrackedProcess "event-detector" "wsl.exe" @(
-                    "-d", $WslDistro, "--", "bash", "$wslRepo/scripts/run_event_detector_wsl.sh"
-                )
-                try {
-                    Wait-For "IMX636 detector" { Test-JsonEndpoint "http://127.0.0.1:8081/stats" } 20
-                    $eventAvailable = $true
-                } catch {
-                    Write-Warning "IMX636 detector did not start. RGB tracking will still work. $($_.Exception.Message)"
-                }
-            } else {
-                Write-Warning "IMX636 did not attach to WSL. Continuing with MX Brio tracking."
-            }
+if (-not $eventAvailable) {
+    $cameraConnected = @(& usbipd.exe list) |
+        Where-Object { $_ -match [regex]::Escape($EventCameraVidPid) } |
+        Select-Object -First 1
+    if ($cameraConnected) {
+        try {
+            Wait-For "automatic IMX636 attachment and detector" {
+                Test-JsonEndpoint "http://127.0.0.1:8081/stats"
+            } 30
+            $eventAvailable = $true
+        } catch {
+            Write-Warning "IMX636 is not online yet. The watchdog will keep retrying in the background."
         }
     } else {
-        Write-Warning "IMX636 ($EventCameraVidPid) is not connected. RGB tracking will still work."
+        Write-Warning "IMX636 is unplugged. Connect it at any time; the watchdog will detect it automatically."
     }
-} else {
-    Write-Step "IMX636 detector already online"
-    $eventAvailable = $true
 }
 
 # Resetting/attaching the SuperSpeed event camera can disturb another camera
@@ -249,12 +206,12 @@ if (-not (Test-PiEndpoint 8082 "/health")) {
     Write-Step "Logitech tunnel already online"
 }
 
+Start-ReverseTunnel "event-tunnel" 8081
 if ($eventAvailable) {
-    if (-not (Test-PiEndpoint 8081 "/stats")) {
-        Start-ReverseTunnel "event-tunnel" 8081
+    try {
         Wait-For "Pi-to-event-camera tunnel" { Test-PiEndpoint 8081 "/stats" } 15
-    } else {
-        Write-Step "Event-camera tunnel already online"
+    } catch {
+        Write-Warning "The event-camera tunnel is starting; the Pi will reconnect automatically."
     }
 }
 

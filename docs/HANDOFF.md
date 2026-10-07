@@ -14,7 +14,7 @@ Tracking always starts **paused**. Starting the software cannot immediately move
 ## Daily operation
 
 1. Place the gimbal where it has clearance to move. Connect its external 12 V supply.
-2. Connect the Pi Ethernet cable, Logitech camera, and IDS event camera to the laptop.
+2. Connect the Pi Ethernet cable and Logitech camera to the laptop. The IDS event camera may be connected now or hot-plugged later.
 3. Power on the Raspberry Pi and wait about 30 seconds.
 4. Double-click `RUN_SYSTEM.cmd`.
 5. Wait for the browser to open at `http://192.168.0.3:8080`.
@@ -30,14 +30,14 @@ At the end of a session, double-click `STOP_SYSTEM.cmd`. It pauses tracking, ret
 1. Verifies passwordless SSH access to the Pi.
 2. Selects the Windows DirectShow device named `MX Brio` (independent of USB index) and starts or verifies its MJPEG bridge on laptop port `8082`.
 3. Keeps Ubuntu WSL running.
-4. Finds USB VID/PID `1409:8e00` and attaches the IMX636 through `usbipd`.
-5. Starts or verifies Bart's OpenEB CPU detector on laptop/WSL port `8081`.
+4. Starts a watchdog that scans every three seconds for USB VID/PID `1409:8e00` and attaches the IMX636 through `usbipd` whenever it appears.
+5. Starts, verifies, and automatically restarts Bart's OpenEB CPU detector on laptop/WSL port `8081`.
 6. Creates reverse SSH tunnels so the Pi sees both laptop services on its own loopback interface.
 7. Starts the Pi dashboard if it is not already running.
 8. pauses tracking and commands the gimbal to its home position.
 9. Prints live health and opens the dashboard.
 
-If the event camera is absent, the launcher warns but continues with Logitech tracking. A failure of the Logitech bridge, Pi SSH connection, or dashboard is treated as a startup failure.
+If the event camera is absent, the launcher warns but continues with Logitech tracking. Its reverse tunnel and watchdog remain active, so connecting the camera later makes the Event tab available without rerunning the launcher. A failure of the Logitech bridge, Pi SSH connection, or dashboard is treated as a startup failure.
 
 ### Low-latency dashboard path
 
@@ -78,7 +78,7 @@ usbipd list
 usbipd bind --busid <BUSID shown for 1409:8e00>
 ```
 
-The daily launcher attaches it to WSL automatically after that one-time share.
+The daily launcher attaches it to WSL automatically after that one-time share. It also monitors disconnects and detector failures for the rest of the session. Current watchdog state is written to `.runtime/event-camera-status.json`, with transition history in `.runtime/event-camera-watchdog.log`.
 
 ## Configuration
 
@@ -124,7 +124,8 @@ Stop and detach the IMX636 from WSL:
 - **Pi unavailable:** verify the direct Ethernet adapter is up and has `192.168.0.2/24`, then ping `192.168.0.3`.
 - **Logitech says demo:** rerun `RUN_SYSTEM.cmd`; it recreates the port-8082 tunnel.
 - **Wrong/slow RGB camera:** rerun `RUN_SYSTEM.cmd`; it validates the friendly name and rebuilds the bridge on `MX Brio` instead of relying on a USB index.
-- **Event tab disabled:** ensure the IMX636 appears in `usbipd list`, then rerun the launcher.
-- **Event camera times out:** unplug/reconnect the IMX636 or run `usbipd detach --busid <BUSID>` before rerunning the launcher.
+- **Event tab disabled:** ensure `RUN_SYSTEM.cmd` is still running and the IMX636 appears in `usbipd list`. The watchdog normally attaches it and enables the tab within 20–30 seconds. Check `.runtime/event-camera-status.json` for the exact state.
+- **Event camera says setup required:** run `SETUP_HANDOFF.cmd` once with the camera connected and approve the Windows Administrator prompt. USB sharing is a one-time machine authorization.
+- **Event camera times out:** unplug/reconnect the IMX636. The watchdog automatically reattaches it and restarts Bart's detector; no launcher restart is required.
 - **Gimbal unavailable:** verify external 12 V power, `/dev/ttyUSB0`, and membership of the Pi user in the `dialout` group.
 - **Emergency stop:** use the physical power switch/disconnect for the servo supply. Software is not a substitute for a physical stop.
