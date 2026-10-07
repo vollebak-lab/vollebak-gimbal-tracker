@@ -1281,3 +1281,45 @@ Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUE
   - `neural_detections`: dropped from 106 down to 0.
   - `focus`: live score ~77,896, peak ~130,075.
   - False alarm rate under diffuse ambient indoor lighting: **0.00 false alarms**.
+
+## 48. Phase 33.7b: Sensor Bias Optimization, Real-Time Control & Automated Sweep Engine (2026-10-07 UTC)
+
+### 1. Dynamic Hardware Bias Control Integration
+- **Live Device Interface:** Integrated `Metavision::I_LL_Biases` facility into `ev_flicker_detector.cpp` with thread-safe pointer caching (`g_ll_biases`, `g_bias_mutex`).
+- **Telemetry Exposure:** Added `"biases"` block to `/pipeline_stats` JSON, serializing live hardware register states (`bias_diff_on`, `bias_diff_off`, `bias_fo`, `bias_refr`, `bias_hpf`, `bias_diff`).
+- **Runtime REST API:**
+  - `GET /get_biases`: Returns active analog bias register states as JSON.
+  - `GET /set_bias?diff_on=X&diff_off=Y&fo=Z&refr=W`: Sets single or multiple bias registers dynamically in real-time without stopping or restarting the systemd camera service.
+- **Web UI Dashboard:** Added dedicated "IMX636 Sensor Biases" card to `http://10.0.0.34:8080/` with live status polling.
+
+### 2. Automated C++ Bias Sweep Engine (`bias_sweep`)
+- **Binary:** Built and installed `/home/orin/ev_deploy/bin/bias_sweep` (C++17, socket-based zero-dependency HTTP client).
+- **Measurement Methodology:** Sweeps the multidimensional bias parameter space against the live GPU detector pipeline:
+  - Dispatches bias configuration via `/set_bias`.
+  - Enforces a programmable settlement delay (`settle_ms = 400`).
+  - Samples `/pipeline_stats` at 10 Hz over a measurement duration (`sample_ms = 1500`).
+  - Computes raw event throughput, retained event rate, suppression ratio (%), active analysis cells, micro-sieve hit locks, confirmed targets, and track counts.
+  - Automatically restores nominal baseline biases upon completion or SIGINT.
+  - Logs structured results to CSV (`/home/orin/ev_deploy/logs/bias_sweep_ambient.csv`, `bias_sweep_fo.csv`, `bias_sweep_refr.csv`).
+
+### 3. Empirical Bias Response Characterization
+1. **Differential Contrast Thresholds (`diff_on`, `diff_off`):**
+   - At `diff_off = 4`: Over-sensitive; ambient light ripple triggers tentative tracks.
+   - At `diff_off >= 6` and `diff_on >= 6`: Clean array-wide background; suppression reaches 98.5%–98.9%.
+   - At `diff_on = 7, diff_off = 8`: Optimal standoff sensitivity; raw ambient event rate drops to 10–30 ev/s with exactly 0 false targets and 0 tracks.
+2. **Source Follower Analog Bandwidth (`fo`):**
+   - At `fo = -16`: Lower analog cutoff; suppression 99.2%, 0 targets, 0 tracks.
+   - At `fo = -10` to `-8`: Balanced rotor blade edge rise-time versus thermal Poisson noise.
+   - At `fo >= 0`: Bandwidth expands excessively, increasing ambient high-frequency ripple throughput.
+3. **Pixel Refractory Dead-Time (`refr`):**
+   - At `refr = 10`: Dead-time too short; pixels re-trigger rapidly on optical flicker (suppression drops to 73.7%).
+   - At `refr = 20` to `25`: Stable refractory reset; suppression 95.7%–98.0%, 0 false targets.
+
+### 4. Verified Optimal Operating Point
+- **Tuned Biases:** `bias_diff_on = 7`, `bias_diff_off = 8`, `bias_fo = -10`, `bias_refr = 25`.
+- **Live Verification on Orin Nano:**
+  - Raw idle event rate: **< 1 kev/s** (down from 86 kev/s).
+  - Active analysis cells: **6** (down from 336).
+  - Retained IMO events: **158** (79.3% clutter suppression).
+  - Confirmed Drone Targets: **0**.
+  - Confirmed Drone Tracks: **0**.
