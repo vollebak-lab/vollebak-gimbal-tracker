@@ -119,6 +119,11 @@ target_compile_options(test_hot_pixel_mask PRIVATE -UNDEBUG)
 add_executable(hot_pixel_survey EXCLUDE_FROM_ALL hot_pixel_survey.cpp)
 target_link_libraries(hot_pixel_survey PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core pthread)
 
+# 7f. Phase 33.4b.d GPU Micro-Neighborhood Periodicity Sieve parity test & benchmark
+add_executable(test_gpu_sieve test_gpu_sieve.cpp gpu_sieve.cu)
+target_link_libraries(test_gpu_sieve PRIVATE cudart pthread)
+target_compile_options(test_gpu_sieve PRIVATE -UNDEBUG)
+
 # 8. Optional ONNX Runtime Ingestion Binary
 find_package(onnxruntime QUIET)
 if (onnxruntime_FOUND OR EXISTS "/usr/include/onnxruntime" OR EXISTS "/usr/local/include/onnxruntime")

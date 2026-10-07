@@ -48,10 +48,10 @@ log "Build ID: $BUILD_ID"
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DPREDATOR_BUILD_ID="$BUILD_ID" >/dev/null \
     || fail 3 "cmake configure failed"
 cmake --build "$BUILD_DIR" -j"$(nproc)" --target ev_flicker_detector test_flicker_dsp test_ego_motion test_cuda_flicker \
-    test_evt21_decoder test_hot_pixel_mask || fail 3 "build failed"
+    test_evt21_decoder test_hot_pixel_mask test_gpu_sieve || fail 3 "build failed"
 
-# ---- Unit tests (CPU DSP, ego-motion math, CUDA core, GPU EVT2.1 decoder, hot pixel mask). Must all pass. ----
-for t in test_flicker_dsp test_ego_motion test_cuda_flicker test_evt21_decoder test_hot_pixel_mask; do
+# ---- Unit tests (CPU DSP, ego-motion math, CUDA core, GPU EVT2.1 decoder, hot pixel mask, GPU sieve). Must all pass. ----
+for t in test_flicker_dsp test_ego_motion test_cuda_flicker test_evt21_decoder test_hot_pixel_mask test_gpu_sieve; do
     log "Running $t"
     if ! "$BUILD_DIR/$t" > "$BUILD_DIR/$t.log" 2>&1; then
         tail -n 40 "$BUILD_DIR/$t.log"

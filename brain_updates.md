@@ -1108,7 +1108,52 @@ Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUE
   4. This loop runs unconditionally in the background even when 0 HTTP clients are connected to `/stream.mjpg` or requesting `/frame.jpg`. JPEG encoding accounts for 87.7% of this thread's execution time.
 
 **Resolution Plan for Step 5 (Phase 33.4b.e):**
-- When executing Phase 33.4b.e (UI frame from GPU accumulators):
-  1. Construct UI display frames directly from GPU accumulation tensors on-device, bypassing CPU per-event `PeriodicFrameGenerationAlgorithm`.
-  2. Gate JPEG encoding to demand-driven execution (only compress when an active client is connected to `/stream.mjpg` or rate-limit when idle/unpolled), immediately recovering ~27% CPU overhead.
 
+## 44. Phase 33.4b.d Order-Correct GPU Micro-Neighborhood Periodicity Sieve (2026-10-07 UTC)
+
+**Objective & Algorithmic Design:**
+- Port the CPU `MicroNeighborhoodPeriodicitySieve` semantics to device memory with 100% bit-exact parity, zero CPU involvement, and order-independence across batch boundaries.
+- **Architectural Implementation (`gpu_sieve.cuh`, `gpu_sieve.cu`):**
+  1. *Compact 8-Byte Persistent Tile State (`MicroTileState`):*
+     - `uint32_t last_timestamp_us`: Microsecond timestamp of last qualifying event.
+     - `uint16_t last_dt_us`: Last valid inter-sweep period (clamped to 65535 us).
+     - `uint8_t consecutive_hits`: Consecutive periodic recurrence counter.
+     - `uint8_t pad`: Alignment padding.
+     - Exact 8-byte layout guarantees atomic 64-bit transactions.
+  2. *Tile Key Mapping:*
+     - 1280x720 sensor maps to a 640x360 2x2 micro-tile grid (230,400 tiles).
+     - Key extraction kernel: $tx = x \gg 1$, $ty = y \gg 1$, $\text{key} = ty \cdot \text{tile\_w} + tx$ (18 bits covering $0 \dots 262,143$).
+  3. *CUB Stable Radix Sort (`cub::DeviceRadixSort::SortPairs`):*
+     - Sorts pairs with key = `tile_id`, value = original event index.
+     - Radix sort stability guarantees that events belonging to the same micro-tile remain in strictly increasing timestamp order.
+  4. *Sequential Per-Tile Run Scan (`k_sieve_scan`):*
+     - Only threads at the boundary of a tile run (`i == 0 || keys[i] != keys[i-1]`) execute the sequential while-loop for that tile in registers and write back `tile_state[tile_id]`, eliminating inter-thread race conditions on self-tile states.
+     - Replicates full 4-neighbor cross-boundary check ($\Delta tx \in \{\pm 1, 0\}, \Delta ty \in \{0, \pm 1\}$) and intra-burst retention.
+     - Writes consecutive hit count directly into `events[orig_idx].pad` in device memory.
+
+**Verification & Test Gate (`test_gpu_sieve.cpp`):**
+- Added `test_gpu_sieve` to CMakeLists.txt and deploy gate in `orin_build_install.sh` (6 test suites mandatory).
+- Verified 12/12 unit and parity tests passing 100% on Jetson Orin Nano hardware:
+  1. `140 Hz Blade Chops: Parity vs CPU Sieve`: PASSED (CPU retained=48, GPU retained=48)
+  2. `200 Hz Drone Blade Chops Parity`: PASSED
+  3. `250 Hz Drone Blade Chops Parity`: PASSED
+  4. `400 Hz Drone Blade Chops Parity`: PASSED
+  5. `Aperiodic Moving Edge 100% Rejection`: PASSED (retained=0)
+  6. `Foliage Sway (30 ms period) 100% Rejection`: PASSED (retained=0)
+  7. `Random Poisson Noise Stream Parity`: PASSED (retained=0/10000 (0.000000%))
+  8. `Dense Same-Cell 20k Event Batch Parity`: PASSED
+  9. `Multi-Rotor Interleaved Stream Parity`: PASSED (total_events=2301, retained=380)
+  10. `Arbitrary Batch Splits Parity (Single Batch == CPU)`: PASSED
+  11. `Arbitrary Batch Splits Parity (Chunked Batches == CPU)`: PASSED
+  12. `Dark-Room Recorded Fixture Parity (200,000 events from darkroom_evt21.cd)`: PASSED (`mismatch_idx=none`, 100.0% bit-exact match vs CPU sieve)
+
+**Microbenchmark Measurements (Jetson Orin Nano 8GB, 100 Iterations @ 16,384 Events/Batch):**
+- *Min Latency:* 125.95 us
+- *Median Latency (p50):* **135.20 us** (target: < 150 us)
+- *p99 Latency:* 483.68 us
+- *Max Latency:* 494.30 us
+- *Throughput (p50):* **121.18 MEv/s** (**8.25 ns/event**)
+- *CPU Utilization:* **0.0%** (fully offloaded to GPU stream)
+
+**Deploy Status:**
+- `predator-camera.service` live on Orin with build ID `3a3d9cc-dirty-srcaa041552bd6e` (PID 49916).
