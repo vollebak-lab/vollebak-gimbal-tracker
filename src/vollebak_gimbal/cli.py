@@ -20,11 +20,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gimbal-tracker")
     parser.add_argument("--verbose", action="store_true", help="enable debug logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("doctor", "manual", "calibrate", "run", "ui"):
+    for name in ("doctor", "manual", "calibrate", "run", "auto-track", "ui"):
         command = subparsers.add_parser(name)
         command.add_argument("-c", "--config", default="config/dev.yaml")
     subparsers.choices["run"].add_argument("--preview", action="store_true")
     subparsers.choices["run"].add_argument("--max-frames", type=int)
+    subparsers.choices["auto-track"].add_argument("--preview", action="store_true")
+    subparsers.choices["auto-track"].add_argument("--max-frames", type=int)
     subparsers.choices["calibrate"].add_argument("--output")
     subparsers.choices["ui"].add_argument("--host", default="127.0.0.1")
     subparsers.choices["ui"].add_argument("--port", type=int, default=8080)
@@ -57,6 +59,11 @@ def main(argv: list[str] | None = None) -> int:
             from .tracker import run_tracker
 
             run_tracker(config, args.preview, args.max_frames)
+            return 0
+        if args.command == "auto-track":
+            from .tracker import run_autonomous_tracker
+
+            run_autonomous_tracker(config, args.preview, args.max_frames)
             return 0
         if args.command == "ui":
             from .web import serve_dashboard

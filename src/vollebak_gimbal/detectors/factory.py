@@ -23,4 +23,8 @@ def build_detector(config: dict[str, Any]) -> Detector:
         from .person import PersonDetector
 
         return PersonDetector(config)
+    if detector_type in ("person_model", "person_nn", "yolo", "onnx"):
+        from .person_model import PersonModelDetector
+
+        return PersonModelDetector(config)
     raise ValueError(f"Unknown detector type: {detector_type}")

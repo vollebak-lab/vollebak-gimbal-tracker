@@ -179,3 +179,19 @@
   - [x] Enabled Nicla 200 Hz IMU ego-warp by default (`enable_ego_warp = true`).
   - [x] Verified all 3 unit test suites ($26/26$ tests passed 100%) and deployed updated binary to `predator-camera.service` on Jetson Orin Nano (PID 130679). Telemetry confirms unbroken lock (323+ consecutive hits, 0 misses, $16.8\text{ dB}$ SNR at $250\text{ Hz}$).
 
+- [x] **Phase 31: Autonomous Person Detection, Center-of-Mass Tracking & Laser Targeting (Raspberry Pi 5)**
+  - [x] **Phase 31.1: Core Person Center-of-Mass Vision Engine**:
+    - [x] Implement `PersonModelDetector` supporting ONNX Runtime and OpenCV DNN (`cv2.dnn`) backends with YOLOv8/v11 tensor decoding.
+    - [x] Implement exact anatomical Center-of-Mass (CoM) calculation: keypoint midpoint for pose models and thorax/sternum centroid offset ($x_{min} + 0.5w, y_{min} + 0.38h$) for object detection bounding boxes.
+    - [x] Implement confidence filtering, multi-scale NMS, and target selection.
+  - [x] **Phase 31.2: Autonomous Closed-Loop Gimbal Follower & Laser Director**:
+    - [x] Implement `AutonomousLaserTracker` with state machine: `SEARCHING`, `ACQUIRING`, `LOCKED_ENGAGED`, `COASTING`, `LOST`.
+    - [x] Implement visual servoing with rate-limited exponential smoothing and homography calibration mapping.
+    - [x] Implement autonomous laser engagement on GPIO 17 with deadband lock confirmation and immediate fail-safe shutoff on tracking error or target loss.
+  - [x] **Phase 31.3: Automated Test Verification**:
+    - [x] Implement `tests/test_person_model.py` and `tests/test_autonomous_tracker.py` covering model output parsing, CoM calculation, state transitions, and fail-safe safety interlocks.
+  - [x] **Phase 31.4: Factory Registration & Configuration Deployment**:
+    - [x] Register detector in `src/vollebak_gimbal/detectors/factory.py`.
+    - [x] Create configuration `config/pi.person_tracking.yaml` with optimized Pi 5 settings.
+    - [x] Integrate `run_autonomous_tracker` and `auto-track` CLI command into `tracker.py` and `cli.py`.
+

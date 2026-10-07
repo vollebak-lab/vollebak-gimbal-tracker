@@ -11,9 +11,12 @@ class Detection:
     height: float
     confidence: float = 1.0
     label: str = "target"
+    custom_center: tuple[float, float] | None = None
 
     @property
     def center(self) -> tuple[float, float]:
+        if self.custom_center is not None:
+            return self.custom_center
         return self.x + self.width / 2.0, self.y + self.height / 2.0
 
     @property

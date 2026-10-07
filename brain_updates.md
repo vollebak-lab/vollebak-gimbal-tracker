@@ -848,4 +848,39 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - Memory reduced to $98.5\text{ MB}$.
     - Pipeline compute latency reduced to $<2.5\text{ ms}$ total per frame.
 
+---
+
+### 37. Raspberry Pi 5 Autonomous Person Detection, Center-of-Mass Tracking & Laser Targeting (Phase 31)
+- **Objective & Architectural Review**:
+  - Implemented real-time autonomous person detection and gimbal laser targeting running on Raspberry Pi 5, matching the operational capability of autonomous motion tracking airsoft/laser platforms.
+  - Upon identification of a person, computes true anatomical center-of-mass (sternum/thorax or hip/shoulder centroid), drives the Waveshare two-axis gimbal via 3x3 projective calibration, and autonomously engages the Adafruit 5mW red laser (GPIO 17) upon target alignment lock.
+- **Components Developed & Deployed**:
+  1. *Core Person Vision Engine (`src/vollebak_gimbal/detectors/person_model.py`)*:
+     - `PersonModelDetector` supporting ONNX Runtime (ARM NEON execution provider) and OpenCV DNN (`cv2.dnn`) backends.
+     - Decodes standard YOLOv8/v11 detection tensors `(1, 84, N)` and pose tensors `(1, 56, N)` with sub-pixel float precision and NMS box filtering.
+     - Biomechanical center-of-mass (CoM) extraction:
+       - 2D Bounding Box: Anthropometric sternum/thorax centroid offset ($x_{com} = x_1 + 0.5w$, $y_{com} = y_1 + 0.38h$).
+       - 17-Keypoint Pose: Quadrilateral centroid of left/right shoulders (indices 5, 6) and hips (indices 11, 12).
+  2. *Autonomous Visual Servoing & Laser Director (`src/vollebak_gimbal/autonomous_tracker.py`)*:
+     - Implemented `AutonomousLaserTracker` with discrete target lock state machine:
+       `SEARCHING` -> `ACQUIRING` -> `LOCKED_ENGAGED` -> `COASTING` -> `LOST`.
+     - Angular alignment error monitoring: $\Delta \theta = \sqrt{(\Delta pan)^2 + (\Delta tilt)^2}$.
+     - Autonomous laser activation on GPIO 17 when target is aligned within lock tolerance ($\le 1.2^\circ$) for $\ge 3$ consecutive cycles.
+     - Hardware safety interlocks:
+       - Immediate GPIO 17 drop to `LOW` on target loss, high slew velocity, or tracking error $> 1.2^\circ$.
+       - Maximum continuous engagement duration timer (10.0s thermal/safety cutoff).
+       - Fail-safe `emergency_stop()` and cleanup handlers.
+  3. *CLI & Factory Registration (`cli.py`, `factory.py`, `tracker.py`)*:
+     - Registered `person_model`, `yolo`, and `onnx` detector types in factory.
+     - Implemented `run_autonomous_tracker` with real-time HUD showing Center-of-Mass crosshairs, tracking state, and laser armed/safe status.
+     - Added `gimbal-tracker auto-track -c config/pi.person_tracking.yaml [--preview]` CLI entry point.
+  4. *Configuration Artifact (`config/pi.person_tracking.yaml`)*:
+     - Production deployment profile for Pi 5 at 50 Hz servo loop and 320x320 / 640x480 resolution.
+- **Verification Results**:
+  - Full test suite: **76 / 76 tests passed 100%**:
+    - `test_person_model.py`: 7/7 PASSED (CoM thorax, bbox center, 4-point pose, shoulders-only, YOLO detection tensor decoding, pose tensor decoding, mock mode).
+    - `test_autonomous_tracker.py`: 6/6 PASSED (initial state, lock transition, laser fire, target jump fail-safe, coast/park timeouts, 10s thermal cutoff, emergency stop).
+    - `test_predator_pipeline.py`: 48/48 PASSED.
+    - Vollebak gimbal unit tests: 15/15 PASSED.
+
 
