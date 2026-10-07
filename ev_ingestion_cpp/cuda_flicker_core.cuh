@@ -4,6 +4,7 @@
 #include <vector>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include "flicker_dsp.hpp"
@@ -197,6 +198,7 @@ private:
     uint64_t current_window_start_us_{0};   ///< Head bin start, snapped to a multiple of bin_duration_us_
     bool window_anchored_{false};           ///< False until the first chunk establishes the bin grid
     size_t head_idx_{0};
+    mutable std::recursive_mutex core_mutex_;
     SpectralGateConfig gate_cfg_{};         ///< Derived CFAR gate (set_spectral_gate_config)
 
     // Order-correct periodicity sieve on 2x2 micro-tiles (Phase 33.4). Runs on the CPU in the

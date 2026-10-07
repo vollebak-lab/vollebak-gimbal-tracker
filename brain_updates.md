@@ -1376,3 +1376,42 @@ All 12 evaluation corpus fixtures passed every quantitative acceptance gate on t
   - Confirmed False Alarms: **0.00 FA / hour**.
 - **Unit Test Gate:** All 7 unit test suites (`test_flicker_dsp`, `test_ego_motion`, `test_cuda_flicker`, `test_evt21_decoder`, `test_hot_pixel_mask`, `test_gpu_sieve`, `test_raw_pipeline`) pass with 0 failures on Orin Nano hardware.
 
+## 50. Phase 33.9: Live Drone Flight Tracking Stability & Ring Buffer Phase Synchronization (2026-10-07 UTC)
+
+### 1. Live Flight Testing Results
+- **Flight 1 Success:** Live drone tracked with 100% confidence, robust continuity, and zero false alarms beyond 40 ft ($f_{\text{BPF}} \approx 248\text{--}250\text{ Hz}$, $7,450\text{--}7,520\text{ RPM}$, $\text{SNR} = 16.8\text{--}21.8\text{ dB}$).
+- **The Burst Crash:** At `18:50:05 UTC`, as the drone generated a high-rate burst ($>2.4\text{ MEv/s}$ raw), candidate count saturated at 512, triggering an asynchronous CUDA illegal memory access (`cuda_flicker_core.cu:709` / `raw_pipeline.cu:500`) causing process SIGABRT and systemd auto-restart (PID 191356).
+- **Flight 2 Failure State:** Drone was within FOV emitting high event volume (e.g. Frame #1460 recorded 5.51 Million events in 40 ms), but 0 candidates were detected across all 1152 cells.
+
+### 2. Scientific Root Cause Analysis (RCA)
+1. **Ring Buffer De-synchronization on Timestamp Skips:**
+   - In `CudaFlickerCore::ingest_device_events` and `ingest_chunk`, when elapsed time exceeded buffer capacity (`steps >= history_samples_`), `steps` was clamped to 512 while `current_window_start_us_` jumped forward to `max_t`.
+   - In `advance_temporal_bins(512)`: `head_idx_ = (head_idx_ + 512) % 512 = head_idx_`, causing `head_idx_` not to advance at all.
+   - This permanently de-synchronized `head_idx_` from `current_window_start_us_`, scrambling event temporal bin assignment in `kernel_warp_sieve_ingest` and cuFFT window ordering in `kernel_prepare_fft_window`.
+2. **Latched / Frozen Cell Event Totals:**
+   - In `kernel_advance_temporal_bins`, `cell_total_events` was only decremented if `expired_sum > 0.0f`.
+   - When buffers were skipped, `ring_buffers` became 0, leaving `expired_sum == 0.0f` and causing residual cell totals to become permanently latched at `Ev=2861` and `MaxCell=118` across 60 cells in ROI, never decaying.
+   - This starved dynamic cells from neural evaluation in `get_active_cells_with_spectra`.
+3. **Data Race / Thread Contention on CudaFlickerCore:**
+   - `RawPipeline`'s worker thread ingested device events on `cuda_stream_` concurrently with the main analysis thread executing cuFFT on `stream_` and calling `get_active_cells_with_spectra` / `get_roi_diagnostics`, causing asynchronous memory collisions under high burst rates.
+
+### 3. Surgical Solutions Implemented
+1. **Thread-Safe Core Locking:**
+   - Equipped `CudaFlickerCore` with `mutable std::recursive_mutex core_mutex_` protecting all public ingestion and analysis methods.
+2. **Absolute Window Grid & Zeroing on Overrun:**
+   - In `ingest_device_events` and `ingest_chunk`:
+     - When `steps >= history_samples_` (gap $>128\text{ ms}$): resets all ring buffers, cell totals, and sieve hits via `cudaMemsetAsync`, and snaps `head_idx_ = (current_window_start_us_ / bin_duration_us_) % history_samples_`.
+     - Handles timestamp regressions ($t_{\text{now}} + 1\text{s} < t_{\text{anchor}}$) with clean re-anchoring.
+3. **Candidate Buffer Clamping & Array Bounds Safety:**
+   - Enforced `num_cands = std::min(num_cands, static_cast<uint32_t>(max_candidates_))` on host candidate copy.
+   - Added `cell_idx < num_total_cells_` bounds checks before device memory copies in `get_active_cells_with_spectra`.
+
+### 4. Verification & Hardware Deployment
+- **Deployment Script:** Executed `deploy.ps1` with remote build `orin_build_install.sh` on Orin Nano hardware.
+- **Unit Test Gate:** All 7 test suites (`test_flicker_dsp`, `test_ego_motion`, `test_cuda_flicker`, `test_evt21_decoder`, `test_hot_pixel_mask`, `test_gpu_sieve`, `test_raw_pipeline`) passed 100%.
+- **Live Hardware Verification (`predator-camera.service` PID 222852, build `2aea773-dirty-src3fd42c8253f3`):**
+  - Queried live `/pipeline_stats`: `roi_diagnostics` is dynamically updating and breathing with live sensor photon flux (decayed from 791 to 97 to 0 events as windows expired).
+  - Frozen `Ev=2861` completely eliminated.
+  - Zero crashes, zero ring overruns, and zero CUDA errors.
+
+

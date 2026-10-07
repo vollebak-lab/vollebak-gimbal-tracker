@@ -154,6 +154,17 @@ __global__ void kernel_advance_temporal_bins(
     int cell_idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (cell_idx >= num_cells) return;
 
+    if (steps >= 512) {
+        for (int s = 0; s < 512; ++s) {
+            ring_buffers[cell_idx * 512 + s] = 0.0f;
+        }
+        cell_total_events[cell_idx] = 0.0f;
+        if (cell_max_sieve_hits != nullptr) {
+            cell_max_sieve_hits[cell_idx] = 0;
+        }
+        return;
+    }
+
     float expired_sum = 0.0f;
     for (size_t s = 0; s < steps; ++s) {
         size_t slot = (old_head_idx + 1 + s) % 512;
@@ -165,6 +176,7 @@ __global__ void kernel_advance_temporal_bins(
     if (expired_sum > 0.0f) {
         float cur_tot = cell_total_events[cell_idx];
         float new_tot = fmaxf(0.0f, cur_tot - expired_sum);
+        if (new_tot < 0.5f) new_tot = 0.0f;
         cell_total_events[cell_idx] = new_tot;
         if (cell_max_sieve_hits != nullptr && new_tot <= 0.0f) {
             cell_max_sieve_hits[cell_idx] = 0;
@@ -352,12 +364,15 @@ CudaFlickerCore::~CudaFlickerCore() {
 }
 
 void CudaFlickerCore::reset() {
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     CUDA_CHECK(cudaDeviceSynchronize());
     sieve_.reset();
     retained_count_.store(0);
     CUDA_CHECK(cudaMemset(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_cell_total_events_, 0, num_total_cells_ * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t)));
+    if (d_cell_max_sieve_hits_) {
+        CUDA_CHECK(cudaMemset(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t)));
+    }
     current_window_start_us_ = 0;
     window_anchored_ = false;
     head_idx_ = 0;
@@ -368,7 +383,10 @@ void CudaFlickerCore::reset_sieve_hit_accumulators() {
     // Only the per-cell accumulator is reset here. The CPU tile sieve state is owned by the
     // camera-callback thread and self-resets on period gaps/inconsistency, so touching it from
     // the analysis thread would be a data race.
-    CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), stream_));
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
+    if (d_cell_max_sieve_hits_) {
+        CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), stream_));
+    }
 }
 
 uint64_t CudaFlickerCore::get_and_reset_retained_count() {
@@ -392,25 +410,37 @@ void CudaFlickerCore::advance_temporal_bins(size_t steps, cudaStream_t stream) {
 
 void CudaFlickerCore::ingest_chunk(size_t chunk_size, uint64_t chunk_max_t,
                                    const float* d_suppression_mask, float suppression_threshold) {
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     // Window alignment: advance temporal ring buffer bins up to the newest event of this chunk.
     // The head bin start is always snapped to an absolute grid (multiple of bin_duration_us_) so
     // bin boundaries do not depend on which event arrived first or on the stream start offset.
-    if (!window_anchored_) {
+    if (!window_anchored_ || (chunk_max_t + 1000000 < current_window_start_us_)) {
         uint64_t chunk_min_t = h_event_buffer_[0].t;
         for (size_t i = 1; i < chunk_size; ++i) chunk_min_t = std::min(chunk_min_t, h_event_buffer_[i].t);
         current_window_start_us_ = (chunk_min_t / bin_duration_us_) * bin_duration_us_;
+        head_idx_ = (current_window_start_us_ / bin_duration_us_) % history_samples_;
+        CUDA_CHECK(cudaMemsetAsync(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float), stream_));
+        CUDA_CHECK(cudaMemsetAsync(d_cell_total_events_, 0, num_total_cells_ * sizeof(float), stream_));
+        if (d_cell_max_sieve_hits_) {
+            CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), stream_));
+        }
         window_anchored_ = true;
     }
     if (chunk_max_t >= current_window_start_us_ + bin_duration_us_) {
         uint64_t elapsed_us = chunk_max_t - current_window_start_us_;
         uint64_t steps = elapsed_us / bin_duration_us_;
         if (steps >= history_samples_) {
-            steps = history_samples_;
             current_window_start_us_ = (chunk_max_t / bin_duration_us_) * bin_duration_us_;
+            head_idx_ = (current_window_start_us_ / bin_duration_us_) % history_samples_;
+            CUDA_CHECK(cudaMemsetAsync(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float), stream_));
+            CUDA_CHECK(cudaMemsetAsync(d_cell_total_events_, 0, num_total_cells_ * sizeof(float), stream_));
+            if (d_cell_max_sieve_hits_) {
+                CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), stream_));
+            }
         } else {
             current_window_start_us_ += steps * bin_duration_us_;
+            advance_temporal_bins(steps, stream_);
         }
-        advance_temporal_bins(steps);
     }
 
     // Asynchronous DMA from pinned staging; upload_done_ guards the staging buffer's reuse.
@@ -494,6 +524,7 @@ void CudaFlickerCore::ingest_device_events(
     float suppression_threshold)
 {
     if (count == 0 || d_events == nullptr) return;
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     cudaStream_t s = stream ? stream : stream_;
 
     // 1. Homography matrix (pageable source: copied before cudaMemcpyAsync returns)
@@ -502,20 +533,31 @@ void CudaFlickerCore::ingest_device_events(
     CUDA_CHECK(cudaMemcpyAsync(d_homography_matrix_, h_mat, 9 * sizeof(float), cudaMemcpyHostToDevice, s));
 
     // 2. Window alignment: advance temporal ring buffer bins up to max_t
-    if (!window_anchored_) {
+    if (!window_anchored_ || (max_t + 1000000 < current_window_start_us_)) {
         current_window_start_us_ = (min_t / bin_duration_us_) * bin_duration_us_;
+        head_idx_ = (current_window_start_us_ / bin_duration_us_) % history_samples_;
+        CUDA_CHECK(cudaMemsetAsync(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float), s));
+        CUDA_CHECK(cudaMemsetAsync(d_cell_total_events_, 0, num_total_cells_ * sizeof(float), s));
+        if (d_cell_max_sieve_hits_) {
+            CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), s));
+        }
         window_anchored_ = true;
     }
     if (max_t >= current_window_start_us_ + bin_duration_us_) {
         uint64_t elapsed_us = max_t - current_window_start_us_;
         uint64_t steps = elapsed_us / bin_duration_us_;
         if (steps >= history_samples_) {
-            steps = history_samples_;
             current_window_start_us_ = (max_t / bin_duration_us_) * bin_duration_us_;
+            head_idx_ = (current_window_start_us_ / bin_duration_us_) % history_samples_;
+            CUDA_CHECK(cudaMemsetAsync(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float), s));
+            CUDA_CHECK(cudaMemsetAsync(d_cell_total_events_, 0, num_total_cells_ * sizeof(float), s));
+            if (d_cell_max_sieve_hits_) {
+                CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), s));
+            }
         } else {
             current_window_start_us_ += steps * bin_duration_us_;
+            advance_temporal_bins(steps, s);
         }
-        advance_temporal_bins(steps, s);
     }
 
     // 3. Launch accumulation kernel directly on device events
@@ -531,6 +573,7 @@ void CudaFlickerCore::ingest_device_events(
 }
 
 void CudaFlickerCore::set_spectral_gate_config(const SpectralGateConfig& cfg) {
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     gate_cfg_ = derive_spectral_gate(cfg, sample_rate_hz_, static_cast<int>(history_samples_), num_total_cells_);
 }
 
@@ -538,6 +581,7 @@ void CudaFlickerCore::execute_batched_spectral_analysis(
     double gyro_speed_deg_s,
     std::vector<FlickerDetectionResult>& out_candidates) {
 
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     out_candidates.clear();
 
     // 1. Prepare Hanning-windowed input for all 1152 cells
@@ -565,11 +609,11 @@ void CudaFlickerCore::execute_batched_spectral_analysis(
     CUDA_CHECK(cudaMemcpyAsync(&num_cands, d_num_candidates_, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 
+    num_cands = std::min(num_cands, static_cast<uint32_t>(max_candidates_));
     if (num_cands > 0) {
-        size_t to_fetch = std::min(static_cast<size_t>(num_cands), max_candidates_);
-        CUDA_CHECK(cudaMemcpy(h_candidate_buffer_, d_candidates_, to_fetch * sizeof(CudaDetectionCandidate), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_candidate_buffer_, d_candidates_, num_cands * sizeof(CudaDetectionCandidate), cudaMemcpyDeviceToHost));
 
-        for (size_t i = 0; i < to_fetch; ++i) {
+        for (size_t i = 0; i < num_cands; ++i) {
             const auto& c = h_candidate_buffer_[i];
             FlickerDetectionResult res;
             res.is_drone_detected = true;
@@ -591,6 +635,7 @@ void CudaFlickerCore::execute_batched_spectral_analysis(
 }
 
 int CudaFlickerCore::get_active_cell_count(double min_threshold) {
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     CUDA_CHECK(cudaMemcpy(h_cell_totals_, d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
     int count = 0;
     for (int i = 0; i < num_base_cells_; ++i) {
@@ -602,6 +647,7 @@ int CudaFlickerCore::get_active_cell_count(double min_threshold) {
 }
 
 RoiDiagnostics CudaFlickerCore::get_roi_diagnostics(int col_min, int col_max, int row_min, int row_max) {
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     RoiDiagnostics diag;
     CUDA_CHECK(cudaMemcpy(h_cell_totals_, d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_cell_sieve_hits_, d_cell_max_sieve_hits_, num_total_cells_ * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -663,6 +709,7 @@ void CudaFlickerCore::get_active_cells_with_spectra(
     std::vector<std::vector<float>>& out_spectra,
     float min_events) {
 
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     out_cell_indices.clear();
     out_spectra.clear();
 
@@ -706,6 +753,7 @@ void CudaFlickerCore::get_active_cells_with_spectra(
 
     for (size_t b = 0; b < batch; ++b) {
         int cell_idx = out_cell_indices[b];
+        if (cell_idx < 0 || cell_idx >= num_total_cells_) continue;
         CUDA_CHECK(cudaMemcpyAsync(out_spectra[b].data(),
                                    &d_power_spectrum_[cell_idx * 257],
                                    257 * sizeof(float),
@@ -728,12 +776,14 @@ void CudaFlickerCore::get_active_cells_with_spectra(
 }
 
 void CudaFlickerCore::get_cell_total_events(std::vector<float>& out_totals) {
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
     out_totals.resize(num_total_cells_);
     CUDA_CHECK(cudaMemcpy(out_totals.data(), d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 void CudaFlickerCore::compute_normalized_spectrum(const float* time_series_512, float* out_spectrum_257, float* out_median_noise) {
     if (!time_series_512 || !out_spectrum_257) return;
+    std::lock_guard<std::recursive_mutex> lock(core_mutex_);
 
     // Copy time series into cell 0 ring buffer with chronological alignment (head_idx = 511)
     CUDA_CHECK(cudaMemcpyAsync(&d_ring_buffers_[0], time_series_512, 512 * sizeof(float), cudaMemcpyHostToDevice, stream_));
