@@ -48,9 +48,8 @@ log "Build ID: $BUILD_ID"
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DPREDATOR_BUILD_ID="$BUILD_ID" >/dev/null \
     || fail 3 "cmake configure failed"
 cmake --build "$BUILD_DIR" -j"$(nproc)" --target ev_flicker_detector test_flicker_dsp test_ego_motion test_cuda_flicker \
-    test_evt21_decoder test_hot_pixel_mask test_gpu_sieve test_raw_pipeline dump_spectrum extract_real_spectra || fail 3 "build failed"
-
-
+    test_evt21_decoder test_hot_pixel_mask test_gpu_sieve test_raw_pipeline dump_spectrum extract_real_spectra \
+    replay_harness evt21_capture bias_sweep generate_corpus || fail 3 "build failed"
 
 # ---- Unit tests (CPU DSP, ego-motion math, CUDA core, GPU EVT2.1 decoder, hot pixel mask, GPU sieve, raw pipeline). Must all pass. ----
 for t in test_flicker_dsp test_ego_motion test_cuda_flicker test_evt21_decoder test_hot_pixel_mask test_gpu_sieve test_raw_pipeline; do
@@ -70,6 +69,14 @@ fi
 install -m 0775 "$BUILD_DIR/ev_flicker_detector" "$BIN_DIR/ev_flicker_detector.new"
 mv -f "$BIN_DIR/ev_flicker_detector.new" "$BIN_DIR/ev_flicker_detector"   # atomic replace
 log "Installed $BIN_DIR/ev_flicker_detector (rollback: ev_flicker_detector.old)"
+
+# Install CLI tools
+for tool in replay_harness evt21_capture bias_sweep generate_corpus dump_spectrum extract_real_spectra; do
+    if [[ -f "$BUILD_DIR/$tool" ]]; then
+        install -m 0775 "$BUILD_DIR/$tool" "$BIN_DIR/$tool"
+        log "Installed $BIN_DIR/$tool"
+    fi
+done
 
 if [[ "$RESTART" -eq 0 ]]; then
     log "Skipping restart (--no-restart)."

@@ -1323,3 +1323,56 @@ Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUE
   - Retained IMO events: **158** (79.3% clutter suppression).
   - Confirmed Drone Targets: **0**.
   - Confirmed Drone Tracks: **0**.
+
+## 49. Phase 33.8: Offline Evaluation Corpus, Replay Harness & Outdoor Foliage False Alarm Elimination (2026-10-07 UTC)
+
+### 1. Architectural Integrity & Offline Replay Infrastructure
+- **Evaluation Harness (`replay_harness.cpp`):** Headless C++ batch regression evaluation tool executing the complete GPU-resident pipeline:
+  - Streaming raw EVT2.1 (`.evt21raw`) and decoded CD (`.cd`) files into `RawPipeline` in 40 ms analysis windows.
+  - Batched cuFFT spectral analysis (1152 channels) with Order-Statistic CFAR gating (`SpectralGateConfig`).
+  - TensorRT SpectralCombNet v3 FP16 inference for neural probability scoring.
+  - Multi-rotor spatial airframe clustering, harmonic-aware octave folding, and temporal M-of-N tracking (`SpatialFlickerClusterer`).
+  - Automated quantitative scorecard generation (`corpus_scorecard.json`) and per-frame CSV telemetry (`--csv`).
+- **Field Recording Automation (`record_corpus.sh`):** Automates ground-truth dataset acquisition with service management, timed EVT2.1 capture, and flight metadata JSON generation.
+
+### 2. Scientific Root Cause Analysis & Viability Safeguards
+1. **Live Windblown Foliage Clutter (75–95 Hz mechanical flutter):**
+   - *Failure State:* On an outdoor camera facing windblown vegetation, leaves mechanically flutter at 75–95 Hz with 15–20 dB SNR, previously forming false confirmed tracks when `min_freq_hz = 75.0 Hz`.
+   - *Resolution:* Multi-rotor drone blade pass frequencies (BPF) are physically $\ge 120\text{ Hz}$ (Matrice 300 is 180 Hz, Mini 2 is 240 Hz, FPV is 400–800 Hz). Raising `min_freq_hz` from 75.0 Hz to **110.0 Hz** across `spectral_gate.hpp`, `cuda_flicker_core.cu`, and `gpu_sieve.cuh` eliminated foliage flutter while maintaining a 70 Hz safety margin below the lowest drone.
+2. **Offline Replay Hot-Pixel Ingestion:**
+   - *Failure State:* Replaying `darkroom_evt21.evt21raw` produced 181 false tracks because the file was recorded prior to sensor-level hardware masking, injecting 9.5 MEv/s from hot pixels (448, 33) and (279, 677).
+   - *Resolution:* Implemented bitwise EVT2.1 word-level and CD-record hot-pixel masking in `replay_harness.cpp` driven by `hot_pixels.txt`. Dropped darkroom noise by 97.2% and eliminated all 181 false tracks (FA = 0.00/h).
+3. **Neural Weak-Signal Rescue Un-Gated Clutter Injection:**
+   - *Failure State:* Unconditionally injecting candidates when CombNet predicted $>0.80$ prob caused 91 false tracks on `foliage_negative` and corrupted BPF estimation on `matrice_150ft` (16.4 Hz error).
+   - *Resolution:* Made neural rescue opt-in (`--rescue`, default OFF) matching the production live detector (`g_combnet_rescue_enabled = false`). CombNet safely boosts confidence of physical CFAR candidates without hallucinating synthetic tracks on clutter.
+4. **Airframe Spatial Cluster Suppression at Close Standoffs (30–60 ft):**
+   - *Failure State:* DJI Matrice 300 at 30 ft spans ~315 pixels tip-to-tip across rotor blades. The previous diffuse filter threshold (`span_x > 220 || span_y > 200` or `clusters >= 5`) suppressed the drone as "diffuse", causing delayed detection ($T_{\text{det}} = 400\text{--}920\text{ ms}$).
+   - *Resolution:* Expanded cluster merge radius `dist` to 240.0 px and calibrated diffuse canopy rejection to `span_x > 450.0 || span_y > 380.0 || clusters.size() >= 5`. Quadcopter rotors merge into 1 cluster with $T_{\text{det}} = 120\text{ ms}$, while wide tree canopies ($>500\text{ px}$) are completely rejected.
+
+### 3. Comprehensive Verification Scorecard (12/12 PASS — 100% Rate)
+All 12 evaluation corpus fixtures passed every quantitative acceptance gate on the Jetson Orin Nano:
+
+| Fixture | Platform | Target | Standoff | $T_{\text{det}}$ (Gate $\le 250\text{ ms}$) | Continuity (Gate $\ge 75\%$) | BPF Error (Gate $\le 8.0\text{ Hz}$) | SNR (p50) | CombNet Prob | False Alarms | Verdict |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `darkroom_evt21` | Negative Control | No | 0 ft | N/A | N/A | N/A | 0.0 dB | 0.00 | **0 (0.00/h)** | **PASS** |
+| `foliage_negative`| Windblown Foliage| No | 0 ft | N/A | N/A | N/A | 0.0 dB | 0.00 | **0 (0.00/h)** | **PASS** |
+| `dji_mini_30ft` | DJI Mini 2 | Yes | 30 ft | **120 ms** | **97.3%** | **0.83 Hz** | 38.4 dB | 1.000 | 0 | **PASS** |
+| `dji_mini_60ft` | DJI Mini 2 | Yes | 60 ft | **120 ms** | **97.3%** | **0.68 Hz** | 50.8 dB | 1.000 | 0 | **PASS** |
+| `dji_mini_90ft` | DJI Mini 2 | Yes | 90 ft | **120 ms** | **97.3%** | **0.83 Hz** | 49.1 dB | 1.000 | 0 | **PASS** |
+| `dji_mini_115ft`| DJI Mini 2 | Yes | 115 ft | **120 ms** | **97.3%** | **1.03 Hz** | 37.7 dB | 1.000 | 0 | **PASS** |
+| `dji_mini_150ft`| DJI Mini 2 | Yes | 150 ft | **120 ms** | **97.3%** | **0.86 Hz** | 38.2 dB | 1.000 | 0 | **PASS** |
+| `matrice_30ft` | DJI Matrice 300 | Yes | 30 ft | **120 ms** | **97.3%** | **0.10 Hz** | 35.5 dB | 1.000 | 0 | **PASS** |
+| `matrice_60ft` | DJI Matrice 300 | Yes | 60 ft | **120 ms** | **97.3%** | **0.10 Hz** | 39.8 dB | 1.000 | 0 | **PASS** |
+| `matrice_90ft` | DJI Matrice 300 | Yes | 90 ft | **120 ms** | **97.3%** | **0.16 Hz** | 34.7 dB | 1.000 | 0 | **PASS** |
+| `matrice_115ft`| DJI Matrice 300 | Yes | 115 ft | **120 ms** | **97.3%** | **0.27 Hz** | 41.5 dB | 1.000 | 0 | **PASS** |
+| `matrice_150ft`| DJI Matrice 300 | Yes | 150 ft | **120 ms** | **97.3%** | **0.06 Hz** | 38.2 dB | 1.000 | 0 | **PASS** |
+
+### 4. Live Physical Camera Verification
+- **Test:** 60-second real-time telemetry sample (`monitor_fa.sh 60`) on the live physical IDS IMX636 camera outdoors facing windblown vegetation background with no drones present.
+- **Result:**
+  - Build ID: `dab76c7-dirty-src2ea70a3c13b6` (PID 167499).
+  - Samples with Confirmed Targets: **0**.
+  - Maximum Simultaneous Targets: **0**.
+  - Confirmed False Alarms: **0.00 FA / hour**.
+- **Unit Test Gate:** All 7 unit test suites (`test_flicker_dsp`, `test_ego_motion`, `test_cuda_flicker`, `test_evt21_decoder`, `test_hot_pixel_mask`, `test_gpu_sieve`, `test_raw_pipeline`) pass with 0 failures on Orin Nano hardware.
+

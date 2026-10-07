@@ -68,4 +68,15 @@ EVT21_HD uint64_t make_time_high_word(uint32_t high28) {
     return static_cast<uint64_t>((high28 & kTimeHighMax) | (static_cast<uint32_t>(kTimeHigh) << 28));
 }
 
+/// Binary fixture record written by evt21_capture and consumed by tests / offline replay.
+struct CdRecord {
+    uint16_t x{0};
+    uint16_t y{0};
+    int16_t p{0};
+    int16_t reserved{0};
+    int64_t t{0};
+};
+static_assert(sizeof(CdRecord) == 16, "CdRecord must be exactly 16 bytes");
+
 }  // namespace predator::evt21
+

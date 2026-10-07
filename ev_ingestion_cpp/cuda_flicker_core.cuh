@@ -113,7 +113,7 @@ public:
      * @brief Advances temporal ring buffer bins in GPU memory
      * @param steps Number of time bins to advance
      */
-    void advance_temporal_bins(size_t steps);
+    void advance_temporal_bins(size_t steps, cudaStream_t stream = nullptr);
 
     /**
      * @brief Validates a gate configuration and derives its CFAR threshold (spectral_gate.hpp).

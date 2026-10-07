@@ -102,9 +102,9 @@ target_link_libraries(bench_ingest PRIVATE
     pthread
 )
 
-# 7c. Phase 33.4b EVT2.1 live capture + layout verification (opt-in). Writes raw + OpenEB-decoded
-# fixtures used by the GPU decoder parity test. Requires exclusive camera access (stop the service).
-add_executable(evt21_capture EXCLUDE_FROM_ALL evt21_capture.cpp)
+# 7c. Phase 33.4b EVT2.1 live capture + layout verification. Writes raw + OpenEB-decoded
+# fixtures used by the GPU decoder parity test and corpus recording tool.
+add_executable(evt21_capture evt21_capture.cpp)
 target_link_libraries(evt21_capture PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core pthread)
 
 # 7d. Phase 33.4b.b GPU EVT2.1 decoder parity test against OpenEB's EVT21LegacyDecoder. The synthetic suite
@@ -142,6 +142,26 @@ target_link_libraries(extract_real_spectra PRIVATE MetavisionSDK::core cufft cud
 # 7j. Phase 33.7b IMX636 Sensor Bias Optimization & Sweep Tool
 add_executable(bias_sweep bias_sweep.cpp)
 target_link_libraries(bias_sweep PRIVATE pthread)
+
+# 7k. Phase 33.8 Offline Replay & Corpus Evaluation Harness
+add_executable(replay_harness replay_harness.cpp cuda_flicker_core.cu raw_pipeline.cu evt21_gpu_decoder.cu gpu_sieve.cu)
+target_link_libraries(replay_harness PRIVATE 
+    Metavision::HAL
+    Metavision::HAL_discovery
+    MetavisionSDK::stream 
+    MetavisionSDK::core 
+    ${OpenCV_LIBS}
+    OpenMP::OpenMP_CXX
+    nvinfer
+    cufft
+    cudart
+    pthread
+)
+
+# 7l. Phase 33.8d Synthetic Standoff Corpus Generator
+add_executable(generate_corpus generate_corpus.cpp)
+target_link_libraries(generate_corpus PRIVATE pthread)
+
 
 
 

@@ -99,7 +99,18 @@ public:
     void connect_device(Metavision::Device* device);
 
     /**
-     * @brief Starts the background HAL reader and GPU pipeline worker threads.
+     * @brief Connects to an offline raw recording file (.evt21raw or .cd) for playback.
+     * @param raw_file_path Path to the recording
+     * @param loop Whether to loop replay continuously
+     * @param playback_rate Speed multiplier (1.0 = real-time, 0 = unlimited GPU rate)
+     */
+    void connect_file(const std::string& raw_file_path, bool loop = false, double playback_rate = 1.0);
+
+    bool is_eof() const { return eof_reached_.load(std::memory_order_relaxed); }
+    bool is_file_mode() const { return is_file_mode_; }
+
+    /**
+     * @brief Starts the background HAL reader/file reader and GPU pipeline worker threads.
      */
     void start();
 
@@ -147,6 +158,7 @@ private:
     void free_ring();
 
     void hal_reader_thread_func();
+    void file_reader_thread_func();
     void gpu_worker_thread_func();
 
     void execute_gpu_batch(const uint64_t* d_words, size_t word_count);
@@ -158,8 +170,15 @@ private:
     Metavision::Device* device_{nullptr};
     Metavision::I_EventsStream* hal_stream_{nullptr};
 
+    bool is_file_mode_{false};
+    std::string file_path_;
+    bool loop_file_{false};
+    double playback_rate_{1.0};
+    std::atomic<bool> eof_reached_{false};
+
     std::atomic<bool> running_{false};
     std::thread reader_thread_;
+    std::thread file_reader_thread_;
     std::thread worker_thread_;
 
     // Ring buffer state

@@ -262,7 +262,7 @@ CudaFlickerCore::CudaFlickerCore(int sensor_width, int sensor_height,
       grid_cols_(grid_cols), grid_rows_(grid_rows),
       sample_rate_hz_(sample_rate_hz), history_samples_(history_samples),
       bin_duration_us_(static_cast<uint64_t>(1000000.0 / sample_rate_hz)),
-      sieve_(sensor_width, sensor_height, 75.0, 1200.0, 2) {
+      sieve_(sensor_width, sensor_height, 110.0, 1200.0, 2) {
 
     num_base_cells_ = grid_cols_ * grid_rows_;
     num_total_cells_ = num_base_cells_ * 2; // 576 base + 576 pooled = 1152
@@ -352,16 +352,16 @@ CudaFlickerCore::~CudaFlickerCore() {
 }
 
 void CudaFlickerCore::reset() {
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    CUDA_CHECK(cudaDeviceSynchronize());
     sieve_.reset();
     retained_count_.store(0);
-    CUDA_CHECK(cudaMemsetAsync(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float), stream_));
-    CUDA_CHECK(cudaMemsetAsync(d_cell_total_events_, 0, num_total_cells_ * sizeof(float), stream_));
-    CUDA_CHECK(cudaMemsetAsync(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t), stream_));
+    CUDA_CHECK(cudaMemset(d_ring_buffers_, 0, num_total_cells_ * history_samples_ * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_cell_total_events_, 0, num_total_cells_ * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_cell_max_sieve_hits_, 0, num_total_cells_ * sizeof(uint32_t)));
     current_window_start_us_ = 0;
     window_anchored_ = false;
     head_idx_ = 0;
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void CudaFlickerCore::reset_sieve_hit_accumulators() {
@@ -375,15 +375,16 @@ uint64_t CudaFlickerCore::get_and_reset_retained_count() {
     return retained_count_.exchange(0, std::memory_order_relaxed);
 }
 
-void CudaFlickerCore::advance_temporal_bins(size_t steps) {
+void CudaFlickerCore::advance_temporal_bins(size_t steps, cudaStream_t stream) {
     if (steps == 0) return;
+    cudaStream_t s = stream ? stream : stream_;
     size_t old_head = head_idx_;
     size_t clamped_steps = std::min(steps, history_samples_);
 
     int threads = 256;
     int blocks = (num_total_cells_ + threads - 1) / threads;
 
-    kernel_advance_temporal_bins<<<blocks, threads, 0, stream_>>>(
+    kernel_advance_temporal_bins<<<blocks, threads, 0, s>>>(
         d_ring_buffers_, d_cell_total_events_, d_cell_max_sieve_hits_, old_head, clamped_steps, num_total_cells_);
 
     head_idx_ = (head_idx_ + steps) % history_samples_;
@@ -514,7 +515,7 @@ void CudaFlickerCore::ingest_device_events(
         } else {
             current_window_start_us_ += steps * bin_duration_us_;
         }
-        advance_temporal_bins(steps);
+        advance_temporal_bins(steps, s);
     }
 
     // 3. Launch accumulation kernel directly on device events

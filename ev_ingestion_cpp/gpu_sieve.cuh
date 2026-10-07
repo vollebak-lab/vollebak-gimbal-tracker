@@ -40,7 +40,7 @@ static_assert(sizeof(MicroTileState) == 8, "MicroTileState must stay 8 bytes");
 struct GpuSieveConfig {
     int sensor_width{1280};
     int sensor_height{720};
-    double min_freq_hz{70.0};
+    double min_freq_hz{110.0};
     double max_freq_hz{800.0};
     uint8_t min_consecutive_hits{2};
 };

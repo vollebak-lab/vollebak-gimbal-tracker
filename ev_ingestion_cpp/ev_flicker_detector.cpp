@@ -92,6 +92,10 @@ static bool g_ego_warp_enabled = false;     // PREDATOR_ENABLE_EGO_WARP (default
 static bool g_combnet_prune_enabled = false; // PREDATOR_COMBNET_PRUNE (default OFF until CombNet v3 gate)
 static bool g_combnet_rescue_enabled = false; // PREDATOR_COMBNET_RESCUE (default OFF, Phase 33.7)
 static bool g_focus_mode_enabled = false;    // PREDATOR_FOCUS_MODE (default OFF, toggle via /toggle_focus)
+static bool g_is_replay_mode = false;        // Active when replaying an offline recording file
+static std::string g_replay_file = "";       // Offline recording file path
+static bool g_replay_loop = false;           // Whether replay is looped continuously
+static double g_replay_rate = 1.0;           // Playback rate multiplier
 static std::atomic<double> g_live_focus_score{0.0};
 static std::atomic<double> g_peak_focus_score{0.0};
 static float g_cfar_fa_per_hour = 0.0f;      // PREDATOR_CFAR_FA_PER_HOUR (Phase 33.5 false-alarm budget)
@@ -502,6 +506,10 @@ public:
            << ", \"combnet_prune\": " << (g_combnet_prune_enabled ? "true" : "false")
            << ", \"combnet_rescue\": " << (g_combnet_rescue_enabled ? "true" : "false")
            << ", \"focus_mode\": " << (g_focus_mode_enabled ? "true" : "false") << "},\n"
+           << "  \"replay\": {\"active\": " << (g_is_replay_mode ? "true" : "false")
+           << ", \"file\": \"" << g_replay_file << "\""
+           << ", \"loop\": " << (g_replay_loop ? "true" : "false")
+           << ", \"rate\": " << g_replay_rate << "},\n"
            << "  \"focus\": {\"score\": " << g_live_focus_score.load(std::memory_order_relaxed)
            << ", \"peak\": " << g_peak_focus_score.load(std::memory_order_relaxed)
            << ", \"mode\": " << (g_focus_mode_enabled ? "true" : "false") << "},\n"
@@ -1365,8 +1373,34 @@ int main(int argc, char* argv[]) {
     setenv("MV_PSEE_PLUGIN_DATA_TRANSFER_BUFFER_POOL_BYTE_SIZE", "8388608", 1);
 
     int port = 8080;
-    if (argc > 1) {
-        port = std::stoi(argv[1]);
+    std::string input_file;
+    bool loop_playback = false;
+    double playback_rate = 1.0;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--input" || arg == "-i") {
+            if (i + 1 < argc) input_file = argv[++i];
+        } else if (arg == "--loop") {
+            loop_playback = true;
+        } else if (arg == "--rate" || arg == "-r") {
+            if (i + 1 < argc) playback_rate = std::stod(argv[++i]);
+        } else if (arg == "--port" || arg == "-p") {
+            if (i + 1 < argc) port = std::stoi(argv[++i]);
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [options] [port]\n"
+                      << "Options:\n"
+                      << "  -i, --input <file>   Offline replay (.evt21raw, .cd, or .raw)\n"
+                      << "      --loop           Loop playback continuously\n"
+                      << "  -r, --rate <float>   Playback rate multiplier (1.0 = real-time, 0 = max GPU speed)\n"
+                      << "  -p, --port <int>     Web UI / JSON API HTTP port (default 8080)\n"
+                      << "  -h, --help           Show this help message\n";
+            return 0;
+        } else if (arg.rfind("--", 0) != 0 && arg.rfind("-", 0) != 0) {
+            try {
+                port = std::stoi(arg);
+            } catch (...) {}
+        }
     }
 
     // Resolve runtime feature flags once (Phase 33 defaults: both OFF).
@@ -1375,102 +1409,145 @@ int main(int argc, char* argv[]) {
     g_combnet_rescue_enabled = env_flag("PREDATOR_COMBNET_RESCUE", false);
     g_focus_mode_enabled = env_flag("PREDATOR_FOCUS_MODE", false);
 
+    const bool is_replay = !input_file.empty();
+    g_is_replay_mode = is_replay;
+    g_replay_file = input_file;
+    g_replay_loop = loop_playback;
+    g_replay_rate = playback_rate;
+
     std::cout << "========================================================\n";
     std::cout << "  Predator — Real-Time Propeller Flicker Detector Engine\n";
     std::cout << "  Ego-Motion Compensation + TensorRT Suppression Core   \n";
     std::cout << "  Lens: 12mm f/2.5 M12 1/2.5\" (5MP)                      \n";
     std::cout << "  Build: " << PREDATOR_BUILD_ID << "\n";
+    if (is_replay) {
+        std::cout << "  Mode: OFFLINE REPLAY (" << input_file << ")\n";
+        std::cout << "  Loop: " << (loop_playback ? "YES" : "NO") << ", Rate: " << playback_rate << "x\n";
+    } else {
+        std::cout << "  Mode: LIVE CAMERA (IMX636 EVT21)\n";
+    }
     std::cout << "========================================================\n";
 
     try {
-        std::cout << "[INFO] Opening Metavision Event Camera with EVT21 format...\n";
-        Metavision::DeviceConfig dev_cfg;
-        dev_cfg.set_format("EVT21");
-        std::unique_ptr<Metavision::Device> device = Metavision::DeviceDiscovery::open("", dev_cfg);
-        if (!device) {
-            throw std::runtime_error("No Metavision event camera found");
-        }
-
-        auto* hwid = device->get_facility<Metavision::I_HW_Identification>();
-        std::string cam_serial = hwid ? hwid->get_serial() : "unknown";
-        std::string cam_format = hwid ? hwid->get_current_data_encoding_format() : "unknown";
-
+        std::unique_ptr<Metavision::Device> device;
         const int width = 1280;
         const int height = 720;
-        std::cout << "[INFO] Camera initialized! Serial: " << cam_serial << ", Format: " << cam_format 
-                  << ", Resolution: " << width << " x " << height << "\n";
+        std::string cam_serial = is_replay ? "offline_replay" : "unknown";
+        std::string cam_format = "EVT21";
+
+        if (is_replay) {
+            if (!std::ifstream(input_file).good()) {
+                std::fprintf(stderr, "[ERROR] Input replay file does not exist: %s\n", input_file.c_str());
+                return 2;
+            }
+
+            if (input_file.size() >= 4 && input_file.rfind(".raw") == input_file.size() - 4) {
+                try {
+                    device = Metavision::DeviceDiscovery::open_raw_file(input_file);
+                    if (device) {
+                        auto* hwid = device->get_facility<Metavision::I_HW_Identification>();
+                        cam_serial = hwid ? hwid->get_serial() : "raw_file";
+                        cam_format = hwid ? hwid->get_current_data_encoding_format() : "raw";
+                        std::cout << "[INFO] Opened HAL raw file: Serial=" << cam_serial << ", Format=" << cam_format << "\n";
+                    }
+                } catch (const std::exception& e) {
+                    std::cout << "[WARN] HAL open_raw_file failed: " << e.what() << "; falling back to direct RawPipeline replay.\n";
+                }
+            }
+            std::cout << "[INFO] Offline Replay Source: " << input_file << " (" << width << " x " << height << ")\n";
+        } else {
+            std::cout << "[INFO] Opening Metavision Event Camera with EVT21 format...\n";
+            Metavision::DeviceConfig dev_cfg;
+            dev_cfg.set_format("EVT21");
+            device = Metavision::DeviceDiscovery::open("", dev_cfg);
+            if (!device) {
+                throw std::runtime_error("No Metavision event camera found");
+            }
+
+            auto* hwid = device->get_facility<Metavision::I_HW_Identification>();
+            cam_serial = hwid ? hwid->get_serial() : "unknown";
+            cam_format = hwid ? hwid->get_current_data_encoding_format() : "unknown";
+
+            std::cout << "[INFO] Camera initialized! Serial: " << cam_serial << ", Format: " << cam_format 
+                      << ", Resolution: " << width << " x " << height << "\n";
+        }
 
         // Configure IMX636 Sensor Biases for 12mm f/2.5 Optics (Adaptive Shade & Solar Flux Tuning)
-        try {
-            auto *biases = device->get_facility<Metavision::I_LL_Biases>();
-            if (biases) {
-                {
-                    std::lock_guard<std::mutex> lk(g_bias_mutex);
-                    g_ll_biases = biases;
+        if (device) {
+            try {
+                auto *biases = device->get_facility<Metavision::I_LL_Biases>();
+                if (biases) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_bias_mutex);
+                        g_ll_biases = biases;
+                    }
+                    int diff_on = 7;
+                    int diff_off = 8;
+                    int refr = 25;
+                    int fo = -10;
+                    const char* env_on = std::getenv("PREDATOR_BIAS_DIFF_ON");
+                    const char* env_off = std::getenv("PREDATOR_BIAS_DIFF_OFF");
+                    const char* env_refr = std::getenv("PREDATOR_BIAS_REFR");
+                    const char* env_fo = std::getenv("PREDATOR_BIAS_FO");
+                    if (env_on) diff_on = std::stoi(env_on);
+                    if (env_off) diff_off = std::stoi(env_off);
+                    if (env_refr) refr = std::stoi(env_refr);
+                    if (env_fo) fo = std::stoi(env_fo);
+                    biases->set("bias_diff_on", diff_on);
+                    biases->set("bias_diff_off", diff_off);
+                    biases->set("bias_refr", refr);
+                    biases->set("bias_fo", fo);
+                    std::cout << "[INFO] Adaptive IMX636 biases active: diff_on=" << diff_on 
+                              << ", diff_off=" << diff_off << ", refr=" << refr << ", fo=" << fo << ".\n";
                 }
-                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=6, diff_off=6, refr=20, fo=-8)
-                int diff_on = 6;
-                int diff_off = 6;
-                int refr = 20;
-                int fo = -8;
-                const char* env_on = std::getenv("PREDATOR_BIAS_DIFF_ON");
-                const char* env_off = std::getenv("PREDATOR_BIAS_DIFF_OFF");
-                const char* env_refr = std::getenv("PREDATOR_BIAS_REFR");
-                const char* env_fo = std::getenv("PREDATOR_BIAS_FO");
-                if (env_on) diff_on = std::stoi(env_on);
-                if (env_off) diff_off = std::stoi(env_off);
-                if (env_refr) refr = std::stoi(env_refr);
-                if (env_fo) fo = std::stoi(env_fo);
-                biases->set("bias_diff_on", diff_on);
-                biases->set("bias_diff_off", diff_off);
-                biases->set("bias_refr", refr);
-                biases->set("bias_fo", fo);
-                std::cout << "[INFO] Adaptive IMX636 biases active: diff_on=" << diff_on 
-                          << ", diff_off=" << diff_off << ", refr=" << refr << ", fo=" << fo << ".\n";
+            } catch (const std::exception &e) {
+                std::cout << "[WARN] Could not set analog biases: " << e.what() << "\n";
             }
-        } catch (const std::exception &e) {
-            std::cout << "[WARN] Could not set analog biases: " << e.what() << "\n";
+        } else {
+            std::cout << "[INFO] Offline replay: Hardware analog biases bypassed.\n";
         }
 
         // Phase 33.7a: Configure IMX636 Hardware Pixel Mask (I_DigitalEventMask)
-        try {
-            const char* mask_file_env = std::getenv("PREDATOR_HOT_PIXELS_FILE");
-            std::string mask_filepath = mask_file_env ? mask_file_env : "hot_pixels.txt";
+        if (device) {
+            try {
+                const char* mask_file_env = std::getenv("PREDATOR_HOT_PIXELS_FILE");
+                std::string mask_filepath = mask_file_env ? mask_file_env : "hot_pixels.txt";
 
-            // If default file doesn't exist in current working directory, check /home/orin/ev_deploy/hot_pixels.txt
-            if (!mask_file_env && !std::ifstream(mask_filepath).good()) {
-                if (std::ifstream("/home/orin/ev_deploy/hot_pixels.txt").good()) {
-                    mask_filepath = "/home/orin/ev_deploy/hot_pixels.txt";
-                }
-            }
-
-            predator::HotPixelMaskConfig mask_cfg;
-            mask_cfg.sensor_width = static_cast<uint16_t>(width);
-            mask_cfg.sensor_height = static_cast<uint16_t>(height);
-
-            auto parse_res = predator::parse_hot_pixels_file(mask_filepath, mask_cfg);
-            if (parse_res.success) {
-                for (const auto& w : parse_res.warnings) {
-                    std::cout << "[WARN] Hot pixel mask: " << w << "\n";
-                }
-                auto mask_status = predator::apply_hardware_pixel_mask(*device, parse_res.pixels);
-                std::cout << "[INFO] " << mask_status.message << "\n";
-                if (mask_status.applied) {
-                    g_hardware_mask_applied = true;
-                    g_hardware_mask_facility = mask_status.facility_name;
-                    g_masked_hot_pixels = parse_res.pixels;
-                    for (const auto& p : g_masked_hot_pixels) {
-                        std::cout << "  -> Masked hot pixel (" << p.x << ", " << p.y
-                                  << ") with baseline rate " << p.rate << " ev/s\n";
+                // If default file doesn't exist in current working directory, check /home/orin/ev_deploy/hot_pixels.txt
+                if (!mask_file_env && !std::ifstream(mask_filepath).good()) {
+                    if (std::ifstream("/home/orin/ev_deploy/hot_pixels.txt").good()) {
+                        mask_filepath = "/home/orin/ev_deploy/hot_pixels.txt";
                     }
                 }
-            } else if (mask_file_env) {
-                std::cout << "[WARN] Hot pixel mask file requested but could not be parsed: " << parse_res.error << "\n";
-            } else {
-                std::cout << "[INFO] No hot_pixels.txt found; running with all hardware pixel masks clear.\n";
+
+                predator::HotPixelMaskConfig mask_cfg;
+                mask_cfg.sensor_width = static_cast<uint16_t>(width);
+                mask_cfg.sensor_height = static_cast<uint16_t>(height);
+
+                auto parse_res = predator::parse_hot_pixels_file(mask_filepath, mask_cfg);
+                if (parse_res.success) {
+                    for (const auto& w : parse_res.warnings) {
+                        std::cout << "[WARN] Hot pixel mask: " << w << "\n";
+                    }
+                    auto mask_status = predator::apply_hardware_pixel_mask(*device, parse_res.pixels);
+                    std::cout << "[INFO] " << mask_status.message << "\n";
+                    if (mask_status.applied) {
+                        g_hardware_mask_applied = true;
+                        g_hardware_mask_facility = mask_status.facility_name;
+                        g_masked_hot_pixels = parse_res.pixels;
+                        for (const auto& p : g_masked_hot_pixels) {
+                            std::cout << "  -> Masked hot pixel (" << p.x << ", " << p.y
+                                      << ") with baseline rate " << p.rate << " ev/s\n";
+                        }
+                    }
+                } else if (mask_file_env) {
+                    std::cout << "[WARN] Hot pixel mask file requested but could not be parsed: " << parse_res.error << "\n";
+                } else {
+                    std::cout << "[INFO] No hot_pixels.txt found; running with all hardware pixel masks clear.\n";
+                }
+            } catch (const std::exception &e) {
+                std::cout << "[WARN] Could not apply hardware pixel mask: " << e.what() << "\n";
             }
-        } catch (const std::exception &e) {
-            std::cout << "[WARN] Could not apply hardware pixel mask: " << e.what() << "\n";
         }
 
         predator::LensParameters lens_params;
@@ -1499,9 +1576,11 @@ int main(int argc, char* argv[]) {
         // Continuous Gyroscope Warper & Stabilization Engine
         predator::ContinuousGyroWarper gyro_warper(lens_params);
 
-        // Connect to Arduino Nicla Sense ME IMU reader on /dev/ttyACM0
+        // Connect to Arduino Nicla Sense ME IMU reader on /dev/ttyACM0 (live mode only)
         predator::NiclaSerialReader imu_reader(gyro_warper, "/dev/ttyACM0");
-        imu_reader.start();
+        if (!is_replay) {
+            imu_reader.start();
+        }
 
         // Start High-Rate Diagnostic Logger
         g_diag_logger.start();
@@ -1536,7 +1615,11 @@ int main(int argc, char* argv[]) {
         pipe_cfg.ui_fps = 30.0;
 
         predator::RawPipeline raw_pipeline(pipe_cfg, cuda_core, gyro_warper);
-        raw_pipeline.connect_device(device.get());
+        if (device) {
+            raw_pipeline.connect_device(device.get());
+        } else {
+            raw_pipeline.connect_file(input_file, loop_playback, playback_rate);
+        }
 
         // Connect synthesized GPU UI frame callback (Phase 33.4b.e)
         raw_pipeline.set_frame_callback([&](const uint8_t* gray_data, int w, int h, uint64_t ts) {
@@ -1666,7 +1749,7 @@ int main(int argc, char* argv[]) {
                                         [&](const predator::FlickerDetectionResult& rd) {
                                             bool is_sharp_blade = (rd.spectral_q_factor >= 4.0 && rd.peak_power >= 60.0);
                                             return rd.patch_x == patch_col && rd.patch_y == patch_row &&
-                                                   rd.peak_snr_db < 10.0f && rd.max_sieve_hits < 2 && !is_sharp_blade;
+                                                   rd.max_sieve_hits < 2 && !is_sharp_blade;
                                         }),
                                     raw_detections.end());
                             }
@@ -1688,7 +1771,7 @@ int main(int argc, char* argv[]) {
 
                         // Neural Weak-Signal Rescue: ONLY rescue if cell has true physical peak validity AND rescue is enabled!
                         if (g_combnet_rescue_enabled && !already_detected && np.has_valid_peak && np.physical_snr_db >= 8.0f && np.drone_prob >= 0.80f &&
-                            np.fund_freq_hz >= 75.0f && np.fund_freq_hz <= 1000.0f) {
+                            np.fund_freq_hz >= 110.0f && np.fund_freq_hz <= 1000.0f) {
                             predator::FlickerDetectionResult res;
                             res.is_drone_detected = true;
                             res.fundamental_bpf_hz = np.fund_freq_hz;

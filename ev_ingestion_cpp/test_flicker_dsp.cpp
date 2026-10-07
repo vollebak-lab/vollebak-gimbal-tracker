@@ -530,12 +530,13 @@ void test_cfar_gate_statistics() {
     std::cout << "[TEST 13] CFAR Gate: False-Alarm Bound & Detection (Phase 33.5)... ";
     using namespace predator;
 
-    // (a) Default derivation: 6 FA/h over 1152 cells x bins 9..128 at 4 kHz / 512. The OS-CFAR
+    // (a) Default derivation: 6 FA/h over 1152 cells x bins 14..128 (110-1000 Hz) at 4 kHz / 512. The OS-CFAR
     // threshold must exceed the known-noise-mean threshold ln(N/Pfa) (estimator loss is real) and
     // stay within a few dB of it.
     const SpectralGateConfig def = derive_spectral_gate(SpectralGateConfig{}, 4000.0, 512, 1152);
-    assert(def.min_bin == 9 && def.max_bin == 128);
-    const double known_noise_eta = std::log(1152.0 * 120.0 / (6.0 * 0.128 / 3600.0));
+    assert(def.min_bin == 14 && def.max_bin == 128);
+    const double n_search_bins = static_cast<double>(def.max_bin - def.min_bin + 1);
+    const double known_noise_eta = std::log(1152.0 * n_search_bins / (6.0 * 0.128 / 3600.0));
     assert(def.cfar_threshold > known_noise_eta);
     assert(def.cfar_threshold_db < 10.0 * std::log10(known_noise_eta) + 4.0);
 

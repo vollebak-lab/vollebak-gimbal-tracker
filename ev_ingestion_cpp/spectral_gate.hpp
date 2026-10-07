@@ -70,7 +70,7 @@ inline const char* gate_verdict_name(GateVerdict v) {
  */
 struct SpectralGateConfig {
     // ---- User fields ----
-    float min_freq_hz{75.0f};            ///< Blade-pass search band lower edge
+    float min_freq_hz{110.0f};           ///< Blade-pass search band lower edge (suppresses sub-110 Hz windblown foliage flutter)
     float max_freq_hz{1000.0f};          ///< Blade-pass search band upper edge
     float false_alarms_per_hour{6.0f};   ///< Field-wide single-window FA budget (6/h = 1 per 10 min)
     float min_events{6.0f};              ///< Compute pre-filter only; FA control is the CFAR threshold

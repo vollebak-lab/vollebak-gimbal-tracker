@@ -1,0 +1,13 @@
+{
+  "name": "darkroom_evt21",
+  "platform": "Negative Control Dark Room",
+  "standoff_ft": 0.0,
+  "blade_count": 0,
+  "expected_bpf_hz": 0.0,
+  "ground_truth_target": false,
+  "duration_s": 10.0,
+  "target_start_s": 0.0,
+  "target_end_s": 0.0,
+  "raw_file": "darkroom_evt21.evt21raw",
+  "cd_file": "darkroom_evt21.cd"
+}

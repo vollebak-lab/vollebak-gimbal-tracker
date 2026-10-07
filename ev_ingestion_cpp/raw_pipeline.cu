@@ -4,8 +4,11 @@
  */
 
 #include "raw_pipeline.cuh"
+#include "evt21_format.hpp"
+#include "evt21_encoder.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 #include <algorithm>
 #include <cstring>
@@ -156,9 +159,18 @@ void RawPipeline::connect_device(Metavision::Device* device) {
     }
 }
 
+void RawPipeline::connect_file(const std::string& raw_file_path, bool loop, double playback_rate) {
+    is_file_mode_ = true;
+    file_path_ = raw_file_path;
+    loop_file_ = loop;
+    playback_rate_ = playback_rate;
+    eof_reached_.store(false);
+}
+
 void RawPipeline::start() {
     if (running_.load()) return;
     running_.store(true);
+    eof_reached_.store(false);
 
     if (hal_stream_) {
         hal_stream_->start();
@@ -167,6 +179,8 @@ void RawPipeline::start() {
     worker_thread_ = std::thread(&RawPipeline::gpu_worker_thread_func, this);
     if (hal_stream_) {
         reader_thread_ = std::thread(&RawPipeline::hal_reader_thread_func, this);
+    } else if (is_file_mode_) {
+        file_reader_thread_ = std::thread(&RawPipeline::file_reader_thread_func, this);
     }
 }
 
@@ -182,6 +196,10 @@ void RawPipeline::stop() {
 
     if (reader_thread_.joinable()) {
         reader_thread_.join();
+    }
+
+    if (file_reader_thread_.joinable()) {
+        file_reader_thread_.join();
     }
 
     if (worker_thread_.joinable()) {
@@ -215,6 +233,7 @@ void RawPipeline::hal_reader_thread_func() {
     while (running_.load(std::memory_order_relaxed)) {
         if (hal_stream_->wait_next_buffer() < 0) {
             if (!running_.load(std::memory_order_relaxed)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
@@ -251,6 +270,7 @@ void RawPipeline::hal_reader_thread_func() {
         // Copy raw words into mapped pinned slot
         std::memcpy(cur_slot->h_words + cur_slot->word_count, buf.data(), buf_words * sizeof(uint64_t));
         cur_slot->word_count += buf_words;
+        __sync_synchronize();
 
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -280,6 +300,164 @@ void RawPipeline::hal_reader_thread_func() {
     }
 }
 
+void RawPipeline::file_reader_thread_func() {
+#if defined(__linux__) && !defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "raw_file_reader");
+#endif
+
+    const bool is_cd = (file_path_.size() >= 3 && file_path_.rfind(".cd") == file_path_.size() - 3);
+
+    std::unique_ptr<predator::evt21::Evt21Encoder> cd_encoder;
+    if (is_cd) {
+        cd_encoder = std::make_unique<predator::evt21::Evt21Encoder>(config_.sensor_width, config_.sensor_height);
+    }
+
+    size_t cur_slot_idx = 0;
+
+    while (running_.load(std::memory_order_relaxed)) {
+        std::ifstream file(file_path_, std::ios::binary);
+        if (!file.is_open()) {
+            std::fprintf(stderr, "[RawPipeline ERROR] Cannot open input file: %s\n", file_path_.c_str());
+            eof_reached_.store(true);
+            break;
+        }
+
+        std::chrono::steady_clock::time_point anchor_wall_time = std::chrono::steady_clock::now();
+        uint64_t anchor_ev_time = 0;
+        bool have_anchor = false;
+
+        if (is_cd) {
+            constexpr size_t kCdChunkSize = 8192;
+            std::vector<predator::evt21::CdRecord> cd_records(kCdChunkSize);
+            std::vector<uint64_t> encoded_words;
+            encoded_words.reserve(kCdChunkSize * 2);
+
+            while (running_.load(std::memory_order_relaxed) && file.good()) {
+                file.read(reinterpret_cast<char*>(cd_records.data()), kCdChunkSize * sizeof(predator::evt21::CdRecord));
+                size_t records_read = file.gcount() / sizeof(predator::evt21::CdRecord);
+                if (records_read == 0) break;
+
+                encoded_words.clear();
+                cd_encoder->encode(cd_records.data(), cd_records.data() + records_read, encoded_words);
+                if (encoded_words.empty()) continue;
+
+                size_t offset = 0;
+                while (offset < encoded_words.size() && running_.load(std::memory_order_relaxed)) {
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex_);
+                        queue_cv_.wait(lock, [&] {
+                            return ready_queue_.size() < config_.ring_slots || !running_.load(std::memory_order_relaxed);
+                        });
+                        if (!running_.load(std::memory_order_relaxed)) break;
+                    }
+
+                    RawRingSlot* cur_slot = &ring_slots_[cur_slot_idx];
+                    size_t words_to_copy = std::min(encoded_words.size() - offset, config_.max_words_per_slot);
+                    std::memcpy(cur_slot->h_words, encoded_words.data() + offset, words_to_copy * sizeof(uint64_t));
+                    cur_slot->word_count = words_to_copy;
+                    offset += words_to_copy;
+
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        stats_.total_raw_words += words_to_copy;
+                        stats_.total_usb_buffers++;
+                    }
+
+                    if (playback_rate_ > 0.0) {
+                        for (size_t i = 0; i < words_to_copy; ++i) {
+                            if (predator::evt21::word_type(cur_slot->h_words[i]) == predator::evt21::kTimeHigh) {
+                                uint64_t cur_ev_time = static_cast<uint64_t>(predator::evt21::time_high(cur_slot->h_words[i])) << 6;
+                                if (!have_anchor || cur_ev_time < anchor_ev_time) {
+                                    anchor_wall_time = std::chrono::steady_clock::now();
+                                    anchor_ev_time = cur_ev_time;
+                                    have_anchor = true;
+                                } else {
+                                    double elapsed_ev_s = static_cast<double>(cur_ev_time - anchor_ev_time) * 1e-6;
+                                    auto target_wall = anchor_wall_time + std::chrono::duration<double>(elapsed_ev_s / playback_rate_);
+                                    if (std::chrono::steady_clock::now() < target_wall) {
+                                        std::this_thread::sleep_until(target_wall);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex_);
+                        ready_queue_.push_back(cur_slot_idx);
+                        queue_cv_.notify_one();
+                    }
+                    cur_slot_idx = (cur_slot_idx + 1) % config_.ring_slots;
+                }
+            }
+        } else {
+            const size_t chunk_words = std::min(config_.coalesce_words, config_.max_words_per_slot);
+
+            while (running_.load(std::memory_order_relaxed) && file.good()) {
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+                    queue_cv_.wait(lock, [&] {
+                        return ready_queue_.size() < config_.ring_slots || !running_.load(std::memory_order_relaxed);
+                    });
+                    if (!running_.load(std::memory_order_relaxed)) break;
+                }
+
+                RawRingSlot* cur_slot = &ring_slots_[cur_slot_idx];
+                file.read(reinterpret_cast<char*>(cur_slot->h_words), chunk_words * sizeof(uint64_t));
+                size_t words_read = file.gcount() / sizeof(uint64_t);
+                if (words_read == 0) break;
+                cur_slot->word_count = words_read;
+
+                {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    stats_.total_raw_words += words_read;
+                    stats_.total_usb_buffers++;
+                }
+
+                if (playback_rate_ > 0.0) {
+                    for (size_t i = 0; i < words_read; ++i) {
+                        if (predator::evt21::word_type(cur_slot->h_words[i]) == predator::evt21::kTimeHigh) {
+                            uint64_t cur_ev_time = static_cast<uint64_t>(predator::evt21::time_high(cur_slot->h_words[i])) << 6;
+                            if (!have_anchor || cur_ev_time < anchor_ev_time) {
+                                anchor_wall_time = std::chrono::steady_clock::now();
+                                anchor_ev_time = cur_ev_time;
+                                have_anchor = true;
+                            } else {
+                                double elapsed_ev_s = static_cast<double>(cur_ev_time - anchor_ev_time) * 1e-6;
+                                auto target_wall = anchor_wall_time + std::chrono::duration<double>(elapsed_ev_s / playback_rate_);
+                                if (std::chrono::steady_clock::now() < target_wall) {
+                                    std::this_thread::sleep_until(target_wall);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+                    ready_queue_.push_back(cur_slot_idx);
+                    queue_cv_.notify_one();
+                }
+                cur_slot_idx = (cur_slot_idx + 1) % config_.ring_slots;
+            }
+        }
+
+        if (!loop_file_ || !running_.load(std::memory_order_relaxed)) {
+            eof_reached_.store(true);
+            std::cout << "[RawPipeline INFO] File replay reached EOF: " << file_path_ << "\n";
+            while (running_.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            break;
+        }
+
+        // Looping: reset decoder and sieve state for continuous loop
+        reset();
+    }
+}
+
 void RawPipeline::gpu_worker_thread_func() {
 #if defined(__linux__) && !defined(__ANDROID__)
     pthread_setname_np(pthread_self(), "gpu_worker");
@@ -298,6 +476,7 @@ void RawPipeline::gpu_worker_thread_func() {
 
             slot_idx = ready_queue_.front();
             ready_queue_.pop_front();
+            queue_cv_.notify_one();
         }
 
         RawRingSlot& slot = ring_slots_[slot_idx];
@@ -405,6 +584,7 @@ void RawPipeline::process_raw_words_sync(const uint64_t* words, size_t word_coun
     while (offset < word_count) {
         size_t chunk = std::min(word_count - offset, config_.max_words_per_slot);
         std::memcpy(ring_slots_[0].h_words, words + offset, chunk * sizeof(uint64_t));
+        __sync_synchronize();
         execute_gpu_batch(ring_slots_[0].d_words, chunk);
         offset += chunk;
     }

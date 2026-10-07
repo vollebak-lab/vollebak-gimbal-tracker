@@ -215,7 +215,7 @@ public:
 class MicroNeighborhoodPeriodicitySieve {
 public:
     MicroNeighborhoodPeriodicitySieve(int width = 1280, int height = 720,
-                                      double min_freq_hz = 70.0, double max_freq_hz = 800.0,
+                                      double min_freq_hz = 110.0, double max_freq_hz = 800.0,
                                       uint8_t min_consecutive_hits = 2)
         : width_(width), height_(height),
           tile_w_((width + 1) / 2), tile_h_((height + 1) / 2),
@@ -863,7 +863,7 @@ public:
                     double dx = xi - xj;
                     double dy = yi - yj;
                     double dist = std::sqrt(dx * dx + dy * dy);
-                    if (dist <= 160.0) {
+                    if (dist <= 240.0) {
                         visited[j] = true;
                         cluster.push_back(cands[j]);
                     }
@@ -884,11 +884,11 @@ public:
             double span_x = max_x - min_x;
             double span_y = max_y - min_y;
 
-            // Sensor-wide diffuse carrier: if the same frequency is observed across >= 3 separate clusters
-            // or spans more than 240px across the sensor, this is physically impossible for a single drone airframe.
-            // It represents ambient scene flicker (AC lighting, monitor modulation, or wide-area canopy flutter).
-            // Spatial physics MUST override single-cell 1D neural scores (a 1D net has zero spatial context).
-            bool is_sensor_wide_diffuse = (clusters.size() >= 3) || (span_x > 240 || span_y > 240);
+            // Sensor-wide diffuse carrier / wide-area foliage clutter rejection:
+            // On a 12mm lens, a heavy quadcopter (DJI Matrice 300, 895mm wheelbase) at 25-30ft standoff
+            // spans up to ~320-360px tip-to-tip across blade tips. Diffuse canopy sway and AC lighting
+            // span >= 500px across the sensor or form >= 5 disjoint spatial clusters.
+            bool is_sensor_wide_diffuse = (span_x > 450.0 || span_y > 380.0) || (clusters.size() >= 5);
             if (is_sensor_wide_diffuse) {
                 continue; // Suppress sensor-wide diffuse carriers unconditionally
             }
@@ -930,6 +930,9 @@ public:
                 double sum_x = cluster.centroid_px_x * cluster.confidence;
                 double sum_y = cluster.centroid_px_y * cluster.confidence;
                 double max_snr = cluster.peak_snr_db;
+                float max_neural_prob = cluster.neural_drone_prob;
+                uint32_t max_sieve = cluster.max_sieve_hits;
+                bool any_neural = cluster.is_neural_detection;
                 int rotor_hits = 1;
 
                 for (size_t j = i + 1; j < localized_candidates.size(); ++j) {
@@ -940,13 +943,16 @@ public:
                     double dy = cluster.centroid_px_y - b.centroid_px_y;
                     double dist = std::sqrt(dx * dx + dy * dy);
 
-                    // Airframe cluster radius (140 pixels spans the full quadcopter frame at 15-60ft)
-                    if (dist < 140.0) {
+                    // Airframe cluster radius (240 pixels spans the full quadcopter frame at 15-60ft)
+                    if (dist < 240.0) {
                         merged[j] = true;
                         sum_x += b.centroid_px_x * b.confidence;
                         sum_y += b.centroid_px_y * b.confidence;
                         weight_sum += b.confidence;
                         max_snr = std::max(max_snr, b.peak_snr_db);
+                        max_neural_prob = std::max(max_neural_prob, b.neural_drone_prob);
+                        max_sieve = std::max(max_sieve, b.max_sieve_hits);
+                        any_neural |= b.is_neural_detection;
                         rotor_hits++;
                     }
                 }
@@ -956,6 +962,9 @@ public:
                     cluster.centroid_px_y = static_cast<int>(std::round(sum_y / weight_sum));
                 }
                 cluster.peak_snr_db = max_snr;
+                cluster.neural_drone_prob = max_neural_prob;
+                cluster.max_sieve_hits = max_sieve;
+                cluster.is_neural_detection = any_neural;
                 // Multi-rotor confidence fusion: combining signals across rotors elevates confidence
                 cluster.confidence = std::min(1.0, cluster.confidence + (rotor_hits - 1) * 0.18);
                 fused_results.push_back(cluster);
@@ -967,6 +976,7 @@ public:
 
     static void reset_tracker() {
         get_tracks().clear();
+        get_next_id() = 1;
     }
 
 private:
@@ -975,9 +985,14 @@ private:
         return s_tracks;
     }
 
+    static int& get_next_id() {
+        static int s_next_id = 1;
+        return s_next_id;
+    }
+
     static std::vector<FlickerDetectionResult> update_tracker(const std::vector<FlickerDetectionResult>& current_dets) {
         auto& s_tracks = get_tracks();
-        static int s_next_id = 1;
+        auto& s_next_id = get_next_id();
 
         const int M_HITS_FOR_CONFIRM = 3;  // Robust 3 frame confirmation
         const int MAX_COAST_FRAMES   = 5;  // Coast 5 frames (200ms) across sparse blade sweeps
@@ -1030,6 +1045,10 @@ private:
                                   (std::abs(2.0 * f_track - f_cand) < 18.0) ||
                                   (std::abs(f_track - 3.0 * f_cand) < 22.0) ||
                                   (std::abs(3.0 * f_track - f_cand) < 22.0) ||
+                                  (std::abs(f_track - 4.0 * f_cand) < 28.0) ||
+                                  (std::abs(4.0 * f_track - f_cand) < 28.0) ||
+                                  (std::abs(f_track - 5.0 * f_cand) < 32.0) ||
+                                  (std::abs(5.0 * f_track - f_cand) < 32.0) ||
                                   (std::abs(2.0 * f_track - 3.0 * f_cand) < 22.0) ||
                                   (std::abs(3.0 * f_track - 2.0 * f_cand) < 22.0);
 
@@ -1049,14 +1068,20 @@ private:
                 // Update track state
                 double prev_bpf = track.last_detection.fundamental_bpf_hz;
                 track.last_detection = d;
-                // Preserve fundamental if current hit was a 2x/3x harmonic
+                // Preserve fundamental if current hit was a 2x/3x/4x/5x harmonic or 0.5x subharmonic
                 if (std::abs(2.0 * prev_bpf - d.fundamental_bpf_hz) < 18.0 ||
-                    std::abs(3.0 * prev_bpf - d.fundamental_bpf_hz) < 22.0) {
+                    std::abs(3.0 * prev_bpf - d.fundamental_bpf_hz) < 22.0 ||
+                    std::abs(4.0 * prev_bpf - d.fundamental_bpf_hz) < 28.0 ||
+                    std::abs(5.0 * prev_bpf - d.fundamental_bpf_hz) < 32.0 ||
+                    std::abs(0.5 * prev_bpf - d.fundamental_bpf_hz) < 18.0) {
                     track.last_detection.fundamental_bpf_hz = prev_bpf;
                     track.last_detection.estimated_rpm = (prev_bpf * 60.0) / 2.0;
                 } else if (std::abs(prev_bpf - 2.0 * d.fundamental_bpf_hz) < 18.0 ||
-                           std::abs(prev_bpf - 3.0 * d.fundamental_bpf_hz) < 22.0) {
-                    // Previous was higher harmonic, current is closer to fundamental
+                           std::abs(prev_bpf - 3.0 * d.fundamental_bpf_hz) < 22.0 ||
+                           std::abs(prev_bpf - 4.0 * d.fundamental_bpf_hz) < 28.0 ||
+                           std::abs(prev_bpf - 5.0 * d.fundamental_bpf_hz) < 32.0 ||
+                           std::abs(prev_bpf - 0.5 * d.fundamental_bpf_hz) < 18.0) {
+                    // Previous was higher harmonic or subharmonic, current is closer to fundamental
                     track.last_detection.fundamental_bpf_hz = d.fundamental_bpf_hz;
                     track.last_detection.estimated_rpm = (d.fundamental_bpf_hz * 60.0) / 2.0;
                 }
@@ -1118,10 +1143,10 @@ private:
         std::vector<Track> confirmed_tracks;
         for (const auto& t : s_tracks) {
             if (t.state == TrackState::CONFIRMED && t.last_detection.confidence >= 0.55) {
-                // Filter unreinforced optical border noise (X < 60 or X > 1220, Y < 40 or Y > 680)
+                // Filter unreinforced optical border noise (X < 80 or X > 1200, Y < 60 or Y > 660)
                 int cx = t.last_detection.centroid_px_x;
                 int cy = t.last_detection.centroid_px_y;
-                bool is_border = (cx < 60 || cx > 1220 || cy < 40 || cy > 680);
+                bool is_border = (cx < 80 || cx > 1200 || cy < 60 || cy > 660);
                 if (is_border && t.last_detection.confidence < 0.70) {
                     continue; // Suppress extreme edge noise
                 }
