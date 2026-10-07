@@ -1056,3 +1056,59 @@ Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUE
 - *Service Rate at Tuned Biases:* Maintained low noise baseline (~20 kev/s, 99.9% suppression, 0 false alarms, all noise peaks failing CFAR 14.74 dB gate).
 - *Telemetry Visibility:* Live verified via `curl http://127.0.0.1:8080/pipeline_stats` showing `applied: true`, `facility: "I_DigitalEventMask"`, `count: 2`, and pixel coordinates with baseline rates.
 - *Deploy Gate:* 5/5 unit test suites passing (`test_flicker_dsp`, `test_ego_motion`, `test_cuda_flicker`, `test_evt21_decoder`, `test_hot_pixel_mask`). Build ID `2f428d7-dirty-src283f3e70e240`.
+
+## 43. Step 2 RCA: Identification & Measurement of the ~28% Rate-Independent Thread (2026-10-07 UTC)
+
+**Diagnostic Objective:**
+- Identify the exact thread consuming ~28% of a CPU core in `ev_flicker_detector` on the Jetson Orin Nano, independent of event rate.
+- Adhere strictly to the Scientific Debugging Protocol: diagnosis and measurement only; no premature code fixes before root cause is proved.
+
+**Thread Instrumentation & Discovery:**
+- Embedded POSIX `pthread_setname_np(pthread_self(), ...)` across all threads:
+  - `disp_encoder` (`display_encoder_thread_func`)
+  - `analysis_main` (`main()` analysis cadence loop)
+  - `diag_logger` (`DiagnosticsLogger::worker_thread`)
+  - `nicla_reader` (`NiclaSerialReader::read_loop`)
+  - `http_server` (`http_server_thread_func`)
+- Added real-time microsecond latency instrumentation (`UiEncoderStats`) into `display_encoder_thread_func` and exposed telemetry under `ui_encoder` in `/pipeline_stats`.
+- Deployed and verified via `deploy.ps1` (PID 48575, build ID `a0dfde3-dirty-srcdaf90b905a97`, all 5 test suites passed).
+
+**Measured Thread Utilization (`ps -T -p 48575` & `top -H`):**
+| TID | Thread Name (`comm`) | %CPU | Cumulative Time | Role |
+|---|---|---|---|---|
+| 48591 | `disp_encoder` | **29.1%** | 00:00:08 | UI OpenCV HUD rendering + Turbo JPEG compression |
+| 48575 | `analysis_main` | **11.5%** | 00:00:03 | 25 Hz analysis cadence loop, cuFFT enqueue, CFAR, tracker |
+| 48593 | `analysis_main` | **9.1%** | 00:00:02 | OpenEB USB packet receiver / CD callback dispatch |
+| 48594 | `analysis_main` | **1.1%** | 00:00:00 | OpenEB background worker |
+| 48590 | `diag_logger` | **0.2%** | 00:00:00 | Asynchronous CSV diagnostics disk logger |
+| 48592 | `http_server` | **0.0%** | 00:00:00 | TCP socket server / HTTP client listener |
+| 48589 | `nicla_reader` | **0.0%** | 00:00:00 | Nicla Sense ME 200 Hz IMU serial reader |
+| 48588 | `cuda-EvtHandlr` | **0.0%** | 00:00:00 | CUDA driver event handler |
+| 48581 | `libusb_event` | **0.0%** | 00:00:00 | LibUSB asynchronous transfer event worker |
+
+**Telemetry & Latency Root Cause Analysis:**
+- Telemetry query from `curl http://127.0.0.1:8080/pipeline_stats`:
+  ```json
+  "ui_encoder": {
+    "total_frames": 854,
+    "last_draw_us": 1102.18,
+    "avg_draw_us": 1108.36,
+    "last_encode_us": 7865.77,
+    "avg_encode_us": 7891.26
+  }
+  ```
+- **Quantitative Root Cause:**
+  1. `Metavision::PeriodicFrameGenerationAlgorithm frame_gen(..., 30.0)` runs a fixed 30.0 FPS clock. Every 33.3 ms, it pushes a 1280x720 3-channel OpenCV frame to `g_frame_mgr`.
+  2. `display_encoder_thread_func` wakes up 30 times a second and executes:
+     - OpenCV HUD rendering: text labels, bounding boxes, ego-motion badge -> **1.11 ms** (`avg_draw_us`).
+     - Turbo JPEG compression: `cv::imencode(".jpg", frame, jpeg_buf, encode_params)` on a 1280x720 frame on the Cortex-A78AE core -> **7.89 ms** (`avg_encode_us`).
+     - Total CPU compute per frame: $1.11\text{ ms} + 7.89\text{ ms} = \mathbf{9.00\text{ ms}}$.
+  3. Continuous CPU load:
+     $$9.00\text{ ms/frame} \times 30.0\text{ frames/sec} = 270.0\text{ ms/sec} = \mathbf{27.0\%\text{ of 1 CPU core}}.$$
+  4. This loop runs unconditionally in the background even when 0 HTTP clients are connected to `/stream.mjpg` or requesting `/frame.jpg`. JPEG encoding accounts for 87.7% of this thread's execution time.
+
+**Resolution Plan for Step 5 (Phase 33.4b.e):**
+- When executing Phase 33.4b.e (UI frame from GPU accumulators):
+  1. Construct UI display frames directly from GPU accumulation tensors on-device, bypassing CPU per-event `PeriodicFrameGenerationAlgorithm`.
+  2. Gate JPEG encoding to demand-driven execution (only compress when an active client is connected to `/stream.mjpg` or rate-limit when idle/unpolled), immediately recovering ~27% CPU overhead.
+

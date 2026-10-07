@@ -19,6 +19,7 @@
 #ifdef __linux__
 #include <linux/serial.h>
 #include <sys/ioctl.h>
+#include <pthread.h>
 #endif
 
 #include "flicker_dsp.hpp"
@@ -499,6 +500,9 @@ public:
 
 private:
     void read_loop() {
+#if defined(__linux__) && !defined(__ANDROID__)
+        pthread_setname_np(pthread_self(), "nicla_reader");
+#endif
         while (running_.load()) {
             int fd = open(port_.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
             if (fd < 0) {

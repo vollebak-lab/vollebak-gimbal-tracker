@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include <metavision/sdk/stream/camera.h>
 #include <metavision/sdk/base/events/event_cd.h>
@@ -194,6 +195,9 @@ public:
 
 private:
     void worker_thread() {
+#if defined(__linux__) && !defined(__ANDROID__)
+        pthread_setname_np(pthread_self(), "diag_logger");
+#endif
         std::vector<DiagnosticsLogRecord> local_batch;
         std::vector<std::string> local_debug;
         local_batch.reserve(200);
@@ -391,6 +395,28 @@ public:
         uint64_t retained_events{0};
     };
 
+    struct UiEncoderStats {
+        uint64_t total_frames{0};
+        double last_draw_us{0.0};
+        double avg_draw_us{0.0};
+        double last_encode_us{0.0};
+        double avg_encode_us{0.0};
+    };
+
+    void update_ui_stats(double draw_us, double encode_us) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ui_stats_.total_frames++;
+        ui_stats_.last_draw_us = draw_us;
+        ui_stats_.last_encode_us = encode_us;
+        if (ui_stats_.total_frames == 1) {
+            ui_stats_.avg_draw_us = draw_us;
+            ui_stats_.avg_encode_us = encode_us;
+        } else {
+            ui_stats_.avg_draw_us = 0.95 * ui_stats_.avg_draw_us + 0.05 * draw_us;
+            ui_stats_.avg_encode_us = 0.95 * ui_stats_.avg_encode_us + 0.05 * encode_us;
+        }
+    }
+
     void update_detections(const std::vector<predator::FlickerDetectionResult>& detections,
                            const std::vector<predator::SpatialFlickerClusterer::Track>& all_tracks,
                            const predator::RoiDiagnostics& roi_diag) {
@@ -469,6 +495,13 @@ public:
            << "    \"max_sieve_hits\": " << roi_diag_.max_sieve_hits << ",\n"
            << "    \"active_cells\": " << roi_diag_.active_cells << "\n"
            << "  },\n"
+           << "  \"ui_encoder\": {\n"
+           << "    \"total_frames\": " << ui_stats_.total_frames << ",\n"
+           << "    \"last_draw_us\": " << ui_stats_.last_draw_us << ",\n"
+           << "    \"avg_draw_us\": " << ui_stats_.avg_draw_us << ",\n"
+           << "    \"last_encode_us\": " << ui_stats_.last_encode_us << ",\n"
+           << "    \"avg_encode_us\": " << ui_stats_.avg_encode_us << "\n"
+           << "  },\n"
            << "  \"num_targets\": " << active_detections_.size() << ",\n"
            << "  \"num_tracks\": " << all_tracks_.size() << ",\n"
            << "  \"tracks\": [\n";
@@ -517,17 +550,22 @@ private:
     std::vector<predator::SpatialFlickerClusterer::Track> all_tracks_;
     predator::RoiDiagnostics roi_diag_;
     EgoMotionStats ego_stats_;
+    UiEncoderStats ui_stats_;
 };
 
 static DetectionManager g_detection_mgr;
 
 void display_encoder_thread_func(int width, int height) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "disp_encoder");
+#endif
     // Fast Turbo JPEG encoding parameters (sub-8ms latency)
     std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, 60, cv::IMWRITE_JPEG_OPTIMIZE, 0};
     cv::Mat frame;
 
     while (g_running) {
         if (g_frame_mgr.wait_for_frame(frame, 30)) {
+            auto t0 = std::chrono::steady_clock::now();
             auto all_tracks = g_detection_mgr.get_all_tracks();
             auto active_dets = g_detection_mgr.get_detections();
             auto ego_stats = g_detection_mgr.get_ego_stats();
@@ -578,8 +616,16 @@ void display_encoder_thread_func(int width, int height) {
             cv::putText(frame, ego_badge, cv::Point(16, 56), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                         ego_stats.imu_connected ? cv::Scalar(0, 255, 200) : cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
 
+            auto t1 = std::chrono::steady_clock::now();
+
             std::vector<uchar> jpeg_buf;
             cv::imencode(".jpg", frame, jpeg_buf, encode_params);
+            auto t2 = std::chrono::steady_clock::now();
+
+            double draw_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            double encode_us = std::chrono::duration<double, std::micro>(t2 - t1).count();
+            g_detection_mgr.update_ui_stats(draw_us, encode_us);
+
             g_stream_broadcaster.update_frame(jpeg_buf);
         }
     }
@@ -986,6 +1032,9 @@ void handle_http_client(int client_fd) {
 }
 
 void http_server_thread_func(int port) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "http_server");
+#endif
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return;
 
@@ -1021,6 +1070,9 @@ void http_server_thread_func(int port) {
 }
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "analysis_main");
+#endif
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
