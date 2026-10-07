@@ -831,8 +831,19 @@ public:
             if (cands.empty()) continue;
 
             double freq_hz = cands[0].fundamental_bpf_hz;
-            bool is_ac_carrier = (std::abs(freq_hz - 100.0) < 3.0) ||
-                                 (std::abs(freq_hz - 120.0) < 3.0);
+            bool is_ac_carrier = ((freq_hz >= 94.0 && freq_hz <= 106.0) ||   // 100 Hz band (50 Hz grid 2x)
+                                  (freq_hz >= 114.0 && freq_hz <= 130.0) ||  // 120 Hz band (60 Hz grid 2x)
+                                  (freq_hz >= 234.0 && freq_hz <= 256.0));  // 240 Hz band (60 Hz grid 4x / 120 Hz 2x)
+
+            auto get_coord = [](const FlickerDetectionResult& c, double& x, double& y) {
+                if (c.patch_x > 0 || c.patch_y > 0) {
+                    x = c.patch_x * 40.0 + 20.0;
+                    y = c.patch_y * 40.0 + 20.0;
+                } else {
+                    x = c.centroid_px_x;
+                    y = c.centroid_px_y;
+                }
+            };
 
             // Group candidates into spatial clusters (neighbors within 160px)
             std::vector<std::vector<FlickerDetectionResult>> clusters;
@@ -842,11 +853,15 @@ public:
                 if (visited[i]) continue;
                 visited[i] = true;
                 std::vector<FlickerDetectionResult> cluster = { cands[i] };
+                double xi, yi;
+                get_coord(cands[i], xi, yi);
 
                 for (size_t j = i + 1; j < cands.size(); ++j) {
                     if (visited[j]) continue;
-                    double dx = (cands[i].patch_x - cands[j].patch_x) * 40.0;
-                    double dy = (cands[i].patch_y - cands[j].patch_y) * 40.0;
+                    double xj, yj;
+                    get_coord(cands[j], xj, yj);
+                    double dx = xi - xj;
+                    double dy = yi - yj;
                     double dist = std::sqrt(dx * dx + dy * dy);
                     if (dist <= 160.0) {
                         visited[j] = true;
@@ -856,30 +871,45 @@ public:
                 clusters.push_back(cluster);
             }
 
-            // For each spatial cluster:
-            // 1. Suppress widespread AC powerline flutter (100/120 Hz mains lighting across multiple locations)
-            // 2. Suppress isolated single-point AC powerline glints (cl.size() <= 2 on AC harmonic)
-            // 3. Suppress isolated single-cell diffuse flutter (cl.size() == 1 with low confidence)
-            // 4. Retain real localized multi-rotor drone clusters and high-confidence rotor hits
-            bool diffuse_flutter = (clusters.size() >= 5);
+            // Spatial Extent of All Candidates in this Frequency Bin
+            double min_x = 1e6, max_x = -1e6, min_y = 1e6, max_y = -1e6;
+            for (const auto& c : cands) {
+                double px, py;
+                get_coord(c, px, py);
+                min_x = std::min(min_x, px);
+                max_x = std::max(max_x, px);
+                min_y = std::min(min_y, py);
+                max_y = std::max(max_y, py);
+            }
+            double span_x = max_x - min_x;
+            double span_y = max_y - min_y;
+
+            // Sensor-wide diffuse carrier: if the same frequency is observed across >= 3 separate clusters
+            // or spans more than 240px across the sensor, this is physically impossible for a single drone airframe.
+            // It represents ambient scene flicker (AC lighting, monitor modulation, or wide-area canopy flutter).
+            // Spatial physics MUST override single-cell 1D neural scores (a 1D net has zero spatial context).
+            bool is_sensor_wide_diffuse = (clusters.size() >= 3) || (span_x > 240 || span_y > 240);
+            if (is_sensor_wide_diffuse) {
+                continue; // Suppress sensor-wide diffuse carriers unconditionally
+            }
+
+            if (is_ac_carrier && (clusters.size() >= 2 || (clusters.size() == 1 && clusters[0].size() <= 2))) {
+                continue; // Suppress global AC mains lighting and single-point AC powerline glints
+            }
+
             for (const auto& cl : clusters) {
-                // Drone Signature Protection: neural-confirmed or periodic micro-sieve locked => never suppress.
-                // (Phase 33.5: SNR >= 10 dB and absolute-power spike tests were removed. Every candidate
-                // now passes the CFAR threshold (~13 dB), so they exempted all clutter, incl. AC mains.)
+                // Drone Signature Protection: periodic micro-sieve locked => retain
                 bool is_drone_signature = false;
                 for (const auto& c : cl) {
-                    if (c.is_neural_detection || c.max_sieve_hits >= 2) {
+                    if (c.max_sieve_hits >= 2) {
                         is_drone_signature = true;
                         break;
                     }
                 }
 
-                if (is_ac_carrier && !is_drone_signature && (clusters.size() >= 2 || cl.size() <= 2)) {
-                    continue; // Suppress global AC mains lighting and single-point AC powerline glints
-                }
                 // For extreme-range standoff targets (100m - 300m), all rotors fall into a single 40x40 cell (cl.size() == 1).
                 // Retain single-cell candidates if confirmed by drone signature, low DDHF spectral flatness (gamma <= 0.18) or high confidence.
-                if (diffuse_flutter && cl.size() == 1 && !is_drone_signature && cl[0].confidence < 0.70 && cl[0].spectral_flatness > 0.18) {
+                if (cl.size() == 1 && !is_drone_signature && cl[0].confidence < 0.70 && cl[0].spectral_flatness > 0.18) {
                     continue; // Suppress isolated single-cell diffuse background noise
                 }
                 for (const auto& c : cl) {
@@ -1036,10 +1066,7 @@ private:
                 track.total_age++;
 
                 if (track.state == TrackState::TENTATIVE) {
-                    // Phase 33.5: the former "2 hits && SNR >= 10 dB" fast path was removed; every
-                    // CFAR candidate exceeds 10 dB, which silently reduced M-of-N to 2 overlapping windows.
-                    if (track.hit_count >= M_HITS_FOR_CONFIRM ||
-                        (track.hit_count >= 2 && track.last_detection.is_neural_detection && track.last_detection.confidence >= 0.60)) {
+                    if (track.hit_count >= M_HITS_FOR_CONFIRM) {
                         track.state = TrackState::CONFIRMED;
                     }
                 }

@@ -90,6 +90,10 @@ static float env_positive_float(const char* name, float default_value) {
 // Runtime feature flags (resolved once in main(), read by telemetry).
 static bool g_ego_warp_enabled = false;     // PREDATOR_ENABLE_EGO_WARP (default OFF, Phase 33)
 static bool g_combnet_prune_enabled = false; // PREDATOR_COMBNET_PRUNE (default OFF until CombNet v3 gate)
+static bool g_combnet_rescue_enabled = false; // PREDATOR_COMBNET_RESCUE (default OFF, Phase 33.7)
+static bool g_focus_mode_enabled = false;    // PREDATOR_FOCUS_MODE (default OFF, toggle via /toggle_focus)
+static std::atomic<double> g_live_focus_score{0.0};
+static std::atomic<double> g_peak_focus_score{0.0};
 static float g_cfar_fa_per_hour = 0.0f;      // PREDATOR_CFAR_FA_PER_HOUR (Phase 33.5 false-alarm budget)
 static float g_cfar_threshold_db = 0.0f;     // Derived CFAR threshold in use
 
@@ -471,7 +475,12 @@ public:
            << "  \"timestamp_ms\": " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\n"
            << "  \"build_id\": \"" << PREDATOR_BUILD_ID << "\",\n"
            << "  \"flags\": {\"ego_warp\": " << (g_ego_warp_enabled ? "true" : "false")
-           << ", \"combnet_prune\": " << (g_combnet_prune_enabled ? "true" : "false") << "},\n"
+           << ", \"combnet_prune\": " << (g_combnet_prune_enabled ? "true" : "false")
+           << ", \"combnet_rescue\": " << (g_combnet_rescue_enabled ? "true" : "false")
+           << ", \"focus_mode\": " << (g_focus_mode_enabled ? "true" : "false") << "},\n"
+           << "  \"focus\": {\"score\": " << g_live_focus_score.load(std::memory_order_relaxed)
+           << ", \"peak\": " << g_peak_focus_score.load(std::memory_order_relaxed)
+           << ", \"mode\": " << (g_focus_mode_enabled ? "true" : "false") << "},\n"
            << "  \"cfar\": {\"fa_per_hour\": " << g_cfar_fa_per_hour << ", \"threshold_db\": " << g_cfar_threshold_db << "},\n"
            << "  \"lens\": {\"model\": \"12mm f/2.5 M12 (1/2.5\\\" format)\", \"fl_mm\": 12.0, \"hfov_deg\": 29.1, \"vfov_deg\": 16.6},\n"
            << "  \"hot_pixel_mask\": {\n"
@@ -604,40 +613,95 @@ void display_encoder_thread_func(int width, int height) {
             auto active_dets = g_detection_mgr.get_detections();
             auto ego_stats = g_detection_mgr.get_ego_stats();
 
-            // Draw detection bounding boxes and HUD on frame
-            // Only render CONFIRMED drone targets (Green for active lock, Amber for coasting)
-            for (const auto& trk : all_tracks) {
-                bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
-                if (!is_confirmed) {
-                    continue; // Suppress unconfirmed tentative tracks from HUD
+            // Compute Live Focus Sharpness (Laplacian variance on central 640x360 ROI)
+            int roi_w = std::min(640, width);
+            int roi_h = std::min(360, height);
+            int roi_x = (width - roi_w) / 2;
+            int roi_y = (height - roi_h) / 2;
+            cv::Rect center_roi(roi_x, roi_y, roi_w, roi_h);
+
+            cv::Mat roi = frame(center_roi);
+            cv::Mat gray_roi;
+            cv::cvtColor(roi, gray_roi, cv::COLOR_BGR2GRAY);
+            cv::Mat lap;
+            cv::Laplacian(gray_roi, lap, CV_16S);
+            cv::Scalar mean, stddev;
+            cv::meanStdDev(lap, mean, stddev);
+            double focus_score = stddev.val[0] * stddev.val[0];
+            g_live_focus_score.store(focus_score, std::memory_order_relaxed);
+            double cur_peak = g_peak_focus_score.load(std::memory_order_relaxed);
+            if (focus_score > cur_peak) {
+                cur_peak = focus_score;
+                g_peak_focus_score.store(cur_peak, std::memory_order_relaxed);
+            }
+
+            if (g_focus_mode_enabled) {
+                // Focus Assist Mode: suppress target boxes, highlight central focus region and sharpness bar
+                cv::Scalar yellow(0, 255, 255);
+                cv::rectangle(frame, center_roi, yellow, 2);
+                int cx = width / 2;
+                int cy = height / 2;
+                cv::line(frame, cv::Point(cx - 30, cy), cv::Point(cx + 30, cy), yellow, 2);
+                cv::line(frame, cv::Point(cx, cy - 30), cv::Point(cx, cy + 30), yellow, 2);
+
+                int bar_w = 440;
+                int bar_h = 24;
+                int bar_x = (width - bar_w) / 2;
+                int bar_y = height - 55;
+                cv::rectangle(frame, cv::Rect(bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4), cv::Scalar(30, 30, 30), -1);
+                cv::rectangle(frame, cv::Rect(bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4), cv::Scalar(180, 180, 180), 1);
+
+                float fill_ratio = (cur_peak > 1e-3) ? static_cast<float>(std::min(1.0, focus_score / cur_peak)) : 0.0f;
+                int fill_w = static_cast<int>(bar_w * fill_ratio);
+                if (fill_w > 0) {
+                    cv::Scalar fill_color = (fill_ratio >= 0.95f) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 215, 255);
+                    cv::rectangle(frame, cv::Rect(bar_x, bar_y, fill_w, bar_h), fill_color, -1);
                 }
-                const auto& d = trk.last_detection;
-                int bx = d.centroid_px_x - 40;
-                int by = d.centroid_px_y - 40;
-                cv::Rect target_rect(std::max(0, bx), std::max(0, by), 
-                                     std::min(80, width - std::max(0, bx)), 
-                                     std::min(80, height - std::max(0, by)));
-                
-                bool is_coasting = (trk.miss_count > 0);
-                cv::Scalar box_color = is_coasting ? cv::Scalar(0, 215, 255) : cv::Scalar(0, 255, 128); // Amber coasting vs Green locked
-                cv::rectangle(frame, target_rect, box_color, 2);
-                
-                char label[128];
-                const char* net_tag = d.is_neural_detection ? " [NET]" : "";
-                if (is_coasting) {
-                    snprintf(label, sizeof(label), "DRONE #%d [COAST %d] %.0fHz [%.1fdB]%s", 
-                             trk.track_id, trk.miss_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
-                } else {
-                    snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
-                             trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
+
+                char score_text[128];
+                snprintf(score_text, sizeof(score_text), "FOCUS SHARPNESS: %.1f / PEAK: %.1f (%d%%)",
+                         focus_score, cur_peak, static_cast<int>(fill_ratio * 100.0f));
+                cv::putText(frame, score_text, cv::Point(bar_x, bar_y - 8),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.52, yellow, 2, cv::LINE_AA);
+            } else {
+                // Draw detection bounding boxes and HUD on frame
+                // Only render CONFIRMED drone targets (Green for active lock, Amber for coasting)
+                for (const auto& trk : all_tracks) {
+                    bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
+                    if (!is_confirmed) {
+                        continue; // Suppress unconfirmed tentative tracks from HUD
+                    }
+                    const auto& d = trk.last_detection;
+                    int bx = d.centroid_px_x - 40;
+                    int by = d.centroid_px_y - 40;
+                    cv::Rect target_rect(std::max(0, bx), std::max(0, by), 
+                                         std::min(80, width - std::max(0, bx)), 
+                                         std::min(80, height - std::max(0, by)));
+                    
+                    bool is_coasting = (trk.miss_count > 0);
+                    cv::Scalar box_color = is_coasting ? cv::Scalar(0, 215, 255) : cv::Scalar(0, 255, 128); // Amber coasting vs Green locked
+                    cv::rectangle(frame, target_rect, box_color, 2);
+                    
+                    char label[128];
+                    const char* net_tag = d.is_neural_detection ? " [NET]" : "";
+                    if (is_coasting) {
+                        snprintf(label, sizeof(label), "DRONE #%d [COAST %d] %.0fHz [%.1fdB]%s", 
+                                 trk.track_id, trk.miss_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
+                    } else {
+                        snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
+                                 trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
+                    }
+                    cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
                 }
-                cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
             }
 
             // Top HUD
-            std::string hud_top = "PREDATOR-01 | 12mm f/2.5 M12 | DDHF + Ego-Motion Core";
-            cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
+            char hud_top[256];
+            snprintf(hud_top, sizeof(hud_top), "PREDATOR-01 | 12mm f/2.5 M12 | FOCUS: %.1f [PEAK: %.1f]%s",
+                     focus_score, cur_peak, g_focus_mode_enabled ? " [FOCUS MODE]" : "");
+            cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.60,
+                        g_focus_mode_enabled ? cv::Scalar(0, 255, 255) : cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
 
             // Ego-Motion & Frequency-Domain Core HUD Badge
             char ego_badge[256];
@@ -855,6 +919,23 @@ static const char* HTML_DASHBOARD = R"html(
                 </div>
             </div>
             <div class="card">
+                <div class="card-title">Focus Assist Engine <span id="val-focus-mode" style="color:var(--text-muted); font-size:11px;">STANDBY</span></div>
+                <div class="metric-grid">
+                    <div class="metric-box">
+                        <div class="metric-label">Laplacian Sharpness</div>
+                        <div class="metric-value" id="val-focus-score" style="font-size:16px; color:var(--accent-gold);">0.0</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Peak Sharpness</div>
+                        <div class="metric-value" id="val-focus-peak" style="font-size:16px; color:var(--accent-green);">0.0</div>
+                    </div>
+                </div>
+                <div style="display:flex; gap:8px; margin-top:10px;">
+                    <button onclick="fetch('/toggle_focus')" style="flex:1; background:rgba(255,170,0,0.15); border:1px solid var(--accent-gold); color:var(--accent-gold); padding:6px; border-radius:4px; font-weight:700; cursor:pointer;">Toggle Focus Reticle</button>
+                    <button onclick="fetch('/reset_focus')" style="background:rgba(255,255,255,0.05); border:1px solid var(--border-color); color:var(--text-muted); padding:6px 12px; border-radius:4px; font-weight:600; cursor:pointer;">Reset Peak</button>
+                </div>
+            </div>
+            <div class="card">
                 <div class="card-title">Optical & CUDA Core</div>
                 <div class="metric-grid">
                     <div class="metric-box">
@@ -912,12 +993,17 @@ static const char* HTML_DASHBOARD = R"html(
                     document.getElementById('val-foliage').textContent = (data.ego_motion.active_cells || 0);
                     document.getElementById('val-suppressed').textContent = (data.ego_motion.suppressed_events_pct || 0).toFixed(0) + "%";
                     document.getElementById('target-count').textContent = data.num_targets;
-                    const foliage = data.ego_motion.foliage_dispersion_pct || 0.0;
-                    const folElem = document.getElementById('val-foliage');
-                    folElem.textContent = foliage.toFixed(0) + "%";
-                    folElem.style.color = foliage > 20 ? "var(--accent-red)" : (foliage > 8 ? "var(--accent-gold)" : "var(--accent-green)");
-                    document.getElementById('val-suppressed').textContent = (data.ego_motion.suppressed_events_pct || 0).toFixed(0) + "%";
-                    document.getElementById('target-count').textContent = data.num_targets;
+                    if (data.focus) {
+                        const scoreElem = document.getElementById('val-focus-score');
+                        const peakElem = document.getElementById('val-focus-peak');
+                        const modeElem = document.getElementById('val-focus-mode');
+                        if (scoreElem) scoreElem.textContent = (data.focus.score || 0).toFixed(1);
+                        if (peakElem) peakElem.textContent = (data.focus.peak || 0).toFixed(1);
+                        if (modeElem) {
+                            modeElem.textContent = data.focus.mode ? "ACTIVE" : "STANDBY";
+                            modeElem.style.color = data.focus.mode ? "var(--accent-gold)" : "var(--text-muted)";
+                        }
+                    }
                     
                     const container = document.getElementById('targets-container');
                     if (data.num_targets === 0) {
@@ -1053,6 +1139,26 @@ void handle_http_client(int client_fd) {
                 if (send(client_fd, "\r\n", 2, MSG_NOSIGNAL) <= 0) break;
             }
         }
+    } else if (request.find("/toggle_focus") != std::string::npos) {
+        g_focus_mode_enabled = !g_focus_mode_enabled;
+        std::string res = std::string("{\"focus_mode\": ") + (g_focus_mode_enabled ? "true" : "false") + "}\n";
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
+    } else if (request.find("/reset_focus") != std::string::npos) {
+        g_peak_focus_score.store(0.0, std::memory_order_relaxed);
+        std::string res = "{\"reset\": true}\n";
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
     } else if (request.find("GET /stats") != std::string::npos || request.find("GET /flicker_stats") != std::string::npos || request.find("GET /pipeline_stats") != std::string::npos) {
         std::string json = g_detection_mgr.get_telemetry_json();
         std::string header = "HTTP/1.1 200 OK\r\n"
@@ -1133,6 +1239,8 @@ int main(int argc, char* argv[]) {
     // Resolve runtime feature flags once (Phase 33 defaults: both OFF).
     g_ego_warp_enabled = env_flag("PREDATOR_ENABLE_EGO_WARP", false);
     g_combnet_prune_enabled = env_flag("PREDATOR_COMBNET_PRUNE", false);
+    g_combnet_rescue_enabled = env_flag("PREDATOR_COMBNET_RESCUE", false);
+    g_focus_mode_enabled = env_flag("PREDATOR_FOCUS_MODE", false);
 
     std::cout << "========================================================\n";
     std::cout << "  Predator — Real-Time Propeller Flicker Detector Engine\n";
@@ -1272,6 +1380,8 @@ int main(int argc, char* argv[]) {
         const bool enable_ego_warp = g_ego_warp_enabled;
         std::cout << "[INFO] Pipeline Ingestion Mode: Ego-Warp=" << (enable_ego_warp ? "ACTIVE (Nicla 200Hz)" : "BYPASS (Identity)")
                   << ", CombNet-Prune=" << (g_combnet_prune_enabled ? "ON" : "OFF")
+                  << ", CombNet-Rescue=" << (g_combnet_rescue_enabled ? "ON" : "OFF")
+                  << ", Focus-Mode=" << (g_focus_mode_enabled ? "ON" : "OFF")
                   << ", Pure Frequency-Domain Harmonic Pipeline Active.\n";
 
         // Zero-CPU GPU-Resident Raw Tap Ingestion Pipeline (Phase 33.4b.c)
@@ -1433,8 +1543,8 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Neural Weak-Signal Rescue: ONLY rescue if cell has true physical peak validity!
-                        if (!already_detected && np.has_valid_peak && np.physical_snr_db >= 5.0f && np.drone_prob >= 0.55f &&
+                        // Neural Weak-Signal Rescue: ONLY rescue if cell has true physical peak validity AND rescue is enabled!
+                        if (g_combnet_rescue_enabled && !already_detected && np.has_valid_peak && np.physical_snr_db >= 8.0f && np.drone_prob >= 0.80f &&
                             np.fund_freq_hz >= 75.0f && np.fund_freq_hz <= 1000.0f) {
                             predator::FlickerDetectionResult res;
                             res.is_drone_detected = true;
