@@ -18,7 +18,7 @@ See [Bart integration audit](docs/bart-integration-audit.md) for the component-b
 For the prepared Windows laptop and Raspberry Pi pair, daily operation is now:
 
 1. Connect and power the hardware.
-2. Double-click `RUN_SYSTEM.cmd`.
+2. Double-click the **Vollebak Gimbal Dashboard** desktop shortcut. Install it once with `INSTALL_DASHBOARD_SHORTCUT.cmd` if needed.
 3. Confirm camera health in the browser, clear the gimbal area, and press **START TRACKING**.
 4. Double-click `STOP_SYSTEM.cmd` when finished.
 

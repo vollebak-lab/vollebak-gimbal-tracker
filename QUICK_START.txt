@@ -5,7 +5,8 @@ NORMAL START
 1. Give the gimbal clear space and connect its external 12 V power.
 2. Connect the Pi Ethernet cable, Logitech camera, and IMX636 event camera.
 3. Power on the Raspberry Pi and wait 30 seconds.
-4. Double-click RUN_SYSTEM.cmd.
+4. Double-click "Vollebak Gimbal Dashboard" on the Windows desktop.
+   If the shortcut is not installed yet, double-click INSTALL_DASHBOARD_SHORTCUT.cmd once.
 5. Wait for http://192.168.0.3:8080 to open.
 6. Confirm LOGITECH and IMX636 show ONLINE.
 7. Clear people and cables, then click START TRACKING.
