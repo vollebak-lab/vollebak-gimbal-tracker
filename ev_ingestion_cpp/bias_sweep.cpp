@@ -192,6 +192,7 @@ struct SweepResultRow {
     double supp_pct;
     double avg_active_cells;
     int peak_sieve_hits;
+    int max_targets;
     int max_tracks;
     double avg_focus;
 };
@@ -280,10 +281,11 @@ int main(int argc, char* argv[]) {
               << std::setw(10) << "Supp %"
               << std::setw(10) << "ActCells"
               << std::setw(8)  << "Sieve"
+              << std::setw(9)  << "Targets"
               << std::setw(8)  << "Tracks"
               << std::setw(10) << "Focus"
               << "\n";
-    std::cout << std::string(95, '-') << "\n";
+    std::cout << std::string(104, '-') << "\n";
 
     for (int don : cfg.diff_on_vals) {
         for (int doff : cfg.diff_off_vals) {
@@ -308,6 +310,7 @@ int main(int argc, char* argv[]) {
                     double sum_supp = 0.0;
                     double sum_focus = 0.0;
                     int max_sieve = 0;
+                    int max_targets = 0;
                     int max_tracks = 0;
                     int sample_count = 0;
 
@@ -324,6 +327,7 @@ int main(int argc, char* argv[]) {
                         sum_supp += cur_m.suppressed_pct;
                         sum_focus += cur_m.focus_score;
                         max_sieve = std::max(max_sieve, cur_m.max_sieve_hits);
+                        max_targets = std::max(max_targets, cur_m.num_targets);
                         max_tracks = std::max(max_tracks, cur_m.num_tracks);
                         sample_count++;
                     }
@@ -352,6 +356,7 @@ int main(int argc, char* argv[]) {
                     row.supp_pct = (sample_count > 0) ? (sum_supp / sample_count) : 0.0;
                     row.avg_active_cells = (sample_count > 0) ? (sum_active_cells / sample_count) : 0.0;
                     row.peak_sieve_hits = max_sieve;
+                    row.max_targets = max_targets;
                     row.max_tracks = max_tracks;
                     row.avg_focus = (sample_count > 0) ? (sum_focus / sample_count) : 0.0;
 
@@ -367,6 +372,7 @@ int main(int argc, char* argv[]) {
                               << std::setw(10) << std::fixed << std::setprecision(1) << row.supp_pct
                               << std::setw(10) << std::fixed << std::setprecision(1) << row.avg_active_cells
                               << std::setw(8)  << row.peak_sieve_hits
+                              << std::setw(9)  << row.max_targets
                               << std::setw(8)  << row.max_tracks
                               << std::setw(10) << std::fixed << std::setprecision(1) << row.avg_focus
                               << "\n" << std::flush;
@@ -387,13 +393,13 @@ int main(int argc, char* argv[]) {
     // 5. Write CSV file
     std::ofstream csv(cfg.output_csv);
     if (csv.is_open()) {
-        csv << "diff_on,diff_off,fo,refr,raw_ev_rate,retained_ev_rate,supp_pct,avg_active_cells,peak_sieve_hits,max_tracks,avg_focus\n";
+        csv << "diff_on,diff_off,fo,refr,raw_ev_rate,retained_ev_rate,supp_pct,avg_active_cells,peak_sieve_hits,max_targets,max_tracks,avg_focus\n";
         for (const auto& r : results) {
             csv << r.diff_on << "," << r.diff_off << "," << r.fo << "," << r.refr << ","
                 << std::fixed << std::setprecision(2)
                 << r.raw_ev_rate << "," << r.retained_ev_rate << "," << r.supp_pct << ","
-                << r.avg_active_cells << "," << r.peak_sieve_hits << "," << r.max_tracks << ","
-                << r.avg_focus << "\n";
+                << r.avg_active_cells << "," << r.peak_sieve_hits << "," << r.max_targets << ","
+                << r.max_tracks << "," << r.avg_focus << "\n";
         }
         std::cout << "[INFO] Successfully wrote " << results.size() << " sweep data points to " << cfg.output_csv << "\n";
     }

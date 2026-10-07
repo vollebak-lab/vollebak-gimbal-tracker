@@ -893,10 +893,6 @@ public:
                 continue; // Suppress sensor-wide diffuse carriers unconditionally
             }
 
-            if (is_ac_carrier && (clusters.size() >= 2 || (clusters.size() == 1 && clusters[0].size() <= 2))) {
-                continue; // Suppress global AC mains lighting and single-point AC powerline glints
-            }
-
             for (const auto& cl : clusters) {
                 // Drone Signature Protection: periodic micro-sieve locked => retain
                 bool is_drone_signature = false;
@@ -905,6 +901,10 @@ public:
                         is_drone_signature = true;
                         break;
                     }
+                }
+
+                if (is_ac_carrier && !is_drone_signature) {
+                    continue; // Suppress AC mains lighting, lamps, and powerline flicker unconditionally unless micro-sieve locked
                 }
 
                 // For extreme-range standoff targets (100m - 300m), all rotors fall into a single 40x40 cell (cl.size() == 1).
