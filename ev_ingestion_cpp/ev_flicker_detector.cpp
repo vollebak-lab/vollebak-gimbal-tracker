@@ -97,6 +97,30 @@ static std::atomic<double> g_peak_focus_score{0.0};
 static float g_cfar_fa_per_hour = 0.0f;      // PREDATOR_CFAR_FA_PER_HOUR (Phase 33.5 false-alarm budget)
 static float g_cfar_threshold_db = 0.0f;     // Derived CFAR threshold in use
 
+// Sensor Analog Bias Facility Pointer & Thread-Safe Accessors (Phase 33.7b)
+static Metavision::I_LL_Biases* g_ll_biases = nullptr;
+static std::mutex g_bias_mutex;
+
+static std::map<std::string, int> get_current_biases() {
+    std::lock_guard<std::mutex> lk(g_bias_mutex);
+    if (!g_ll_biases) return {};
+    try {
+        return g_ll_biases->get_all_biases();
+    } catch (...) {
+        return {};
+    }
+}
+
+static bool set_sensor_bias(const std::string& name, int value) {
+    std::lock_guard<std::mutex> lk(g_bias_mutex);
+    if (!g_ll_biases) return false;
+    try {
+        return g_ll_biases->set(name, value);
+    } catch (...) {
+        return false;
+    }
+}
+
 struct DiagnosticsLogRecord {
     uint64_t timestamp_us{0};
     uint64_t host_ms{0};
@@ -483,6 +507,13 @@ public:
            << ", \"mode\": " << (g_focus_mode_enabled ? "true" : "false") << "},\n"
            << "  \"cfar\": {\"fa_per_hour\": " << g_cfar_fa_per_hour << ", \"threshold_db\": " << g_cfar_threshold_db << "},\n"
            << "  \"lens\": {\"model\": \"12mm f/2.5 M12 (1/2.5\\\" format)\", \"fl_mm\": 12.0, \"hfov_deg\": 29.1, \"vfov_deg\": 16.6},\n"
+           << "  \"biases\": {\n";
+        auto cur_biases = get_current_biases();
+        size_t b_idx = 0;
+        for (const auto& kv : cur_biases) {
+            ss << "    \"" << kv.first << "\": " << kv.second << (++b_idx < cur_biases.size() ? ",\n" : "\n");
+        }
+        ss << "  },\n"
            << "  \"hot_pixel_mask\": {\n"
            << "    \"applied\": " << (g_hardware_mask_applied ? "true" : "false") << ",\n"
            << "    \"facility\": \"" << g_hardware_mask_facility << "\",\n"
@@ -936,6 +967,27 @@ static const char* HTML_DASHBOARD = R"html(
                 </div>
             </div>
             <div class="card">
+                <div class="card-title">IMX636 Sensor Biases <span id="val-bias-status" style="color:var(--accent-green); font-size:11px;">SYNCED</span></div>
+                <div class="metric-grid">
+                    <div class="metric-box">
+                        <div class="metric-label">diff_on (contrast ON)</div>
+                        <div class="metric-value" id="val-bias-diff-on" style="font-size:15px; color:var(--accent-cyan);">6</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">diff_off (contrast OFF)</div>
+                        <div class="metric-value" id="val-bias-diff-off" style="font-size:15px; color:var(--accent-cyan);">6</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">fo (follower BW)</div>
+                        <div class="metric-value" id="val-bias-fo" style="font-size:15px; color:var(--accent-gold);">-8</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">refr (dead-time)</div>
+                        <div class="metric-value" id="val-bias-refr" style="font-size:15px; color:var(--accent-gold);">20</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
                 <div class="card-title">Optical & CUDA Core</div>
                 <div class="metric-grid">
                     <div class="metric-box">
@@ -1003,6 +1055,16 @@ static const char* HTML_DASHBOARD = R"html(
                             modeElem.textContent = data.focus.mode ? "ACTIVE" : "STANDBY";
                             modeElem.style.color = data.focus.mode ? "var(--accent-gold)" : "var(--text-muted)";
                         }
+                    }
+                    if (data.biases) {
+                        const don = document.getElementById('val-bias-diff-on');
+                        const doff = document.getElementById('val-bias-diff-off');
+                        const fo = document.getElementById('val-bias-fo');
+                        const refr = document.getElementById('val-bias-refr');
+                        if (don && data.biases.bias_diff_on !== undefined) don.textContent = data.biases.bias_diff_on;
+                        if (doff && data.biases.bias_diff_off !== undefined) doff.textContent = data.biases.bias_diff_off;
+                        if (fo && data.biases.bias_fo !== undefined) fo.textContent = data.biases.bias_fo;
+                        if (refr && data.biases.bias_refr !== undefined) refr.textContent = data.biases.bias_refr;
                     }
                     
                     const container = document.getElementById('targets-container');
@@ -1159,6 +1221,77 @@ void handle_http_client(int client_fd) {
                              "Connection: close\r\n\r\n";
         send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
         send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
+    } else if (request.find("/get_biases") != std::string::npos) {
+        auto cur = get_current_biases();
+        std::ostringstream res_ss;
+        res_ss << "{\"biases\": {";
+        size_t b_idx = 0;
+        for (const auto& kv : cur) {
+            res_ss << "\"" << kv.first << "\": " << kv.second << (++b_idx < cur.size() ? ", " : "");
+        }
+        res_ss << "}}\n";
+        std::string res = res_ss.str();
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
+    } else if (request.find("/set_bias") != std::string::npos) {
+        std::string qstr;
+        size_t qpos = request.find("?");
+        size_t epos = request.find(" ", qpos);
+        if (qpos != std::string::npos && epos != std::string::npos) {
+            qstr = request.substr(qpos + 1, epos - qpos - 1);
+        }
+        int applied_count = 0;
+        std::string last_name;
+        int last_val = 0;
+        std::istringstream qss(qstr);
+        std::string pair;
+        while (std::getline(qss, pair, '&')) {
+            size_t eq = pair.find('=');
+            if (eq != std::string::npos) {
+                std::string k = pair.substr(0, eq);
+                std::string v = pair.substr(eq + 1);
+                if (k == "name") {
+                    last_name = v;
+                } else if (k == "val" || k == "value") {
+                    last_val = std::stoi(v);
+                    if (!last_name.empty()) {
+                        if (set_sensor_bias(last_name, last_val)) applied_count++;
+                    }
+                } else if (k.find("bias_") == 0 || k == "diff_on" || k == "diff_off" || k == "fo" || k == "refr" || k == "hpf") {
+                    std::string bname = (k.find("bias_") == 0) ? k : ("bias_" + k);
+                    int bval = std::stoi(v);
+                    if (set_sensor_bias(bname, bval)) {
+                        applied_count++;
+                        last_name = bname;
+                        last_val = bval;
+                    }
+                }
+            }
+        }
+        auto cur = get_current_biases();
+        std::ostringstream res_ss;
+        res_ss << "{\"success\": " << (applied_count > 0 ? "true" : "false")
+               << ", \"applied_count\": " << applied_count
+               << ", \"last_name\": \"" << last_name 
+               << "\", \"last_val\": " << last_val << ", \"biases\": {";
+        size_t b_idx = 0;
+        for (const auto& kv : cur) {
+            res_ss << "\"" << kv.first << "\": " << kv.second << (++b_idx < cur.size() ? ", " : "");
+        }
+        res_ss << "}}\n";
+        std::string res = res_ss.str();
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
     } else if (request.find("GET /stats") != std::string::npos || request.find("GET /flicker_stats") != std::string::npos || request.find("GET /pipeline_stats") != std::string::npos) {
         std::string json = g_detection_mgr.get_telemetry_json();
         std::string header = "HTTP/1.1 200 OK\r\n"
@@ -1271,19 +1404,29 @@ int main(int argc, char* argv[]) {
         try {
             auto *biases = device->get_facility<Metavision::I_LL_Biases>();
             if (biases) {
-                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=6, diff_off=6 for 80-115ft sensitivity)
+                {
+                    std::lock_guard<std::mutex> lk(g_bias_mutex);
+                    g_ll_biases = biases;
+                }
+                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=6, diff_off=6, refr=20, fo=-8)
                 int diff_on = 6;
                 int diff_off = 6;
+                int refr = 20;
+                int fo = -8;
                 const char* env_on = std::getenv("PREDATOR_BIAS_DIFF_ON");
                 const char* env_off = std::getenv("PREDATOR_BIAS_DIFF_OFF");
+                const char* env_refr = std::getenv("PREDATOR_BIAS_REFR");
+                const char* env_fo = std::getenv("PREDATOR_BIAS_FO");
                 if (env_on) diff_on = std::stoi(env_on);
                 if (env_off) diff_off = std::stoi(env_off);
+                if (env_refr) refr = std::stoi(env_refr);
+                if (env_fo) fo = std::stoi(env_fo);
                 biases->set("bias_diff_on", diff_on);
                 biases->set("bias_diff_off", diff_off);
-                biases->set("bias_refr", 20);
-                biases->set("bias_fo", -8);
+                biases->set("bias_refr", refr);
+                biases->set("bias_fo", fo);
                 std::cout << "[INFO] Adaptive IMX636 biases active: diff_on=" << diff_on 
-                          << ", diff_off=" << diff_off << ", refr=+20, fo=-8.\n";
+                          << ", diff_off=" << diff_off << ", refr=" << refr << ", fo=" << fo << ".\n";
             }
         } catch (const std::exception &e) {
             std::cout << "[WARN] Could not set analog biases: " << e.what() << "\n";

@@ -139,6 +139,10 @@ target_link_libraries(dump_spectrum PRIVATE MetavisionSDK::core cufft cudart pth
 add_executable(extract_real_spectra extract_real_spectra.cpp cuda_flicker_core.cu)
 target_link_libraries(extract_real_spectra PRIVATE MetavisionSDK::core cufft cudart pthread)
 
+# 7j. Phase 33.7b IMX636 Sensor Bias Optimization & Sweep Tool
+add_executable(bias_sweep bias_sweep.cpp)
+target_link_libraries(bias_sweep PRIVATE pthread)
+
 
 
 # 8. Optional ONNX Runtime Ingestion Binary
