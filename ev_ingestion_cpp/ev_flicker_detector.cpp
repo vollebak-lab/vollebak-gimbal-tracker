@@ -13,6 +13,8 @@
 #include <condition_variable>
 #include <algorithm>
 #include <iomanip>
+#include <cstdlib>
+#include <cmath>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -22,11 +24,15 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include <metavision/sdk/stream/camera.h>
 #include <metavision/sdk/base/events/event_cd.h>
-#include <metavision/sdk/core/algorithms/periodic_frame_generation_algorithm.h>
-#include <metavision/sdk/core/utils/colors.h>
+#include <metavision/hal/device/device.h>
+#include <metavision/hal/device/device_discovery.h>
+#include <metavision/hal/utils/device_config.h>
+#include <metavision/hal/facilities/i_hw_identification.h>
+#include <metavision/hal/facilities/i_events_stream.h>
 #include <metavision/hal/facilities/i_ll_biases.h>
 #include <opencv2/opencv.hpp>
 
@@ -34,10 +40,90 @@
 #include "ego_motion.hpp"
 #include "spectral_combnet_trt.hpp"
 #include "cuda_flicker_core.cuh"
+#include "hot_pixel_mask.hpp"
+#include "raw_pipeline.cuh"
 #include <omp.h>
 
 // Global shutdown flag
 static std::atomic<bool> g_running{true};
+
+// Demand-gated UI JPEG compression activity timestamp (Phase 33.4b.e)
+static std::atomic<uint64_t> g_last_client_request_ms{0};
+
+// Hardware pixel masking telemetry state (Phase 33.7a)
+static bool g_hardware_mask_applied = false;
+static std::string g_hardware_mask_facility = "none";
+static std::vector<predator::HotPixel> g_masked_hot_pixels;
+
+// Build provenance stamp injected by CMake (-DPREDATOR_BUILD_ID=...). Lets the
+// running binary be matched to the exact source tree (prevents deploy drift).
+#ifndef PREDATOR_BUILD_ID
+#define PREDATOR_BUILD_ID "unstamped"
+#endif
+
+/// Reads a boolean feature flag from the environment.
+/// Accepts "1"/"0"; any other value or an unset variable yields `default_value`.
+static bool env_flag(const char* name, bool default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    const std::string s(v);
+    if (s == "1") return true;
+    if (s == "0") return false;
+    std::cerr << "[WARN] Ignoring invalid value for " << name << "='" << s << "' (expected 0 or 1)\n";
+    return default_value;
+}
+
+/// Reads a strictly positive finite float from the environment; invalid values are rejected
+/// with a warning and `default_value` is used.
+static float env_positive_float(const char* name, float default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    char* end = nullptr;
+    const float f = std::strtof(v, &end);
+    if (end == v || *end != '\0' || !std::isfinite(f) || f <= 0.0f) {
+        std::cerr << "[WARN] Ignoring invalid value for " << name << "='" << v << "' (expected a positive number)\n";
+        return default_value;
+    }
+    return f;
+}
+
+// Runtime feature flags (resolved once in main(), read by telemetry).
+static bool g_ego_warp_enabled = false;     // PREDATOR_ENABLE_EGO_WARP (default OFF, Phase 33)
+static bool g_combnet_prune_enabled = false; // PREDATOR_COMBNET_PRUNE (default OFF until CombNet v3 gate)
+static bool g_combnet_rescue_enabled = false; // PREDATOR_COMBNET_RESCUE (default OFF, Phase 33.7)
+static bool g_focus_mode_enabled = false;    // PREDATOR_FOCUS_MODE (default OFF, toggle via /toggle_focus)
+static bool g_is_replay_mode = false;        // Active when replaying an offline recording file
+static std::string g_replay_file = "";       // Offline recording file path
+static bool g_replay_loop = false;           // Whether replay is looped continuously
+static double g_replay_rate = 1.0;           // Playback rate multiplier
+static std::atomic<double> g_live_focus_score{0.0};
+static std::atomic<double> g_peak_focus_score{0.0};
+static float g_cfar_fa_per_hour = 0.0f;      // PREDATOR_CFAR_FA_PER_HOUR (Phase 33.5 false-alarm budget)
+static float g_cfar_threshold_db = 0.0f;     // Derived CFAR threshold in use
+
+// Sensor Analog Bias Facility Pointer & Thread-Safe Accessors (Phase 33.7b)
+static Metavision::I_LL_Biases* g_ll_biases = nullptr;
+static std::mutex g_bias_mutex;
+
+static std::map<std::string, int> get_current_biases() {
+    std::lock_guard<std::mutex> lk(g_bias_mutex);
+    if (!g_ll_biases) return {};
+    try {
+        return g_ll_biases->get_all_biases();
+    } catch (...) {
+        return {};
+    }
+}
+
+static bool set_sensor_bias(const std::string& name, int value) {
+    std::lock_guard<std::mutex> lk(g_bias_mutex);
+    if (!g_ll_biases) return false;
+    try {
+        return g_ll_biases->set(name, value);
+    } catch (...) {
+        return false;
+    }
+}
 
 struct DiagnosticsLogRecord {
     uint64_t timestamp_us{0};
@@ -148,6 +234,9 @@ public:
 
 private:
     void worker_thread() {
+#if defined(__linux__) && !defined(__ANDROID__)
+        pthread_setname_np(pthread_self(), "diag_logger");
+#endif
         std::vector<DiagnosticsLogRecord> local_batch;
         std::vector<std::string> local_debug;
         local_batch.reserve(200);
@@ -345,6 +434,28 @@ public:
         uint64_t retained_events{0};
     };
 
+    struct UiEncoderStats {
+        uint64_t total_frames{0};
+        double last_draw_us{0.0};
+        double avg_draw_us{0.0};
+        double last_encode_us{0.0};
+        double avg_encode_us{0.0};
+    };
+
+    void update_ui_stats(double draw_us, double encode_us) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ui_stats_.total_frames++;
+        ui_stats_.last_draw_us = draw_us;
+        ui_stats_.last_encode_us = encode_us;
+        if (ui_stats_.total_frames == 1) {
+            ui_stats_.avg_draw_us = draw_us;
+            ui_stats_.avg_encode_us = encode_us;
+        } else {
+            ui_stats_.avg_draw_us = 0.95 * ui_stats_.avg_draw_us + 0.05 * draw_us;
+            ui_stats_.avg_encode_us = 0.95 * ui_stats_.avg_encode_us + 0.05 * encode_us;
+        }
+    }
+
     void update_detections(const std::vector<predator::FlickerDetectionResult>& detections,
                            const std::vector<predator::SpatialFlickerClusterer::Track>& all_tracks,
                            const predator::RoiDiagnostics& roi_diag) {
@@ -357,6 +468,11 @@ public:
     void update_ego_stats(const EgoMotionStats& stats) {
         std::lock_guard<std::mutex> lock(mutex_);
         ego_stats_ = stats;
+    }
+
+    void update_raw_stats(const predator::RawPipelineStats& stats) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        raw_stats_ = stats;
     }
 
     std::vector<predator::FlickerDetectionResult> get_detections() {
@@ -385,7 +501,39 @@ public:
         ss << std::fixed << std::setprecision(2);
         ss << "{\n"
            << "  \"timestamp_ms\": " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\n"
-           << "  \"lens\": {\"model\": \"12mm f/2.0 M12 (1/2.5\\\" format)\", \"fl_mm\": 12.0, \"hfov_deg\": 29.1, \"vfov_deg\": 16.6},\n"
+           << "  \"build_id\": \"" << PREDATOR_BUILD_ID << "\",\n"
+           << "  \"flags\": {\"ego_warp\": " << (g_ego_warp_enabled ? "true" : "false")
+           << ", \"combnet_prune\": " << (g_combnet_prune_enabled ? "true" : "false")
+           << ", \"combnet_rescue\": " << (g_combnet_rescue_enabled ? "true" : "false")
+           << ", \"focus_mode\": " << (g_focus_mode_enabled ? "true" : "false") << "},\n"
+           << "  \"replay\": {\"active\": " << (g_is_replay_mode ? "true" : "false")
+           << ", \"file\": \"" << g_replay_file << "\""
+           << ", \"loop\": " << (g_replay_loop ? "true" : "false")
+           << ", \"rate\": " << g_replay_rate << "},\n"
+           << "  \"focus\": {\"score\": " << g_live_focus_score.load(std::memory_order_relaxed)
+           << ", \"peak\": " << g_peak_focus_score.load(std::memory_order_relaxed)
+           << ", \"mode\": " << (g_focus_mode_enabled ? "true" : "false") << "},\n"
+           << "  \"cfar\": {\"fa_per_hour\": " << g_cfar_fa_per_hour << ", \"threshold_db\": " << g_cfar_threshold_db << "},\n"
+           << "  \"lens\": {\"model\": \"12mm f/2.5 M12 (1/2.5\\\" format)\", \"fl_mm\": 12.0, \"hfov_deg\": 29.1, \"vfov_deg\": 16.6},\n"
+           << "  \"biases\": {\n";
+        auto cur_biases = get_current_biases();
+        size_t b_idx = 0;
+        for (const auto& kv : cur_biases) {
+            ss << "    \"" << kv.first << "\": " << kv.second << (++b_idx < cur_biases.size() ? ",\n" : "\n");
+        }
+        ss << "  },\n"
+           << "  \"hot_pixel_mask\": {\n"
+           << "    \"applied\": " << (g_hardware_mask_applied ? "true" : "false") << ",\n"
+           << "    \"facility\": \"" << g_hardware_mask_facility << "\",\n"
+           << "    \"count\": " << g_masked_hot_pixels.size() << ",\n"
+           << "    \"pixels\": [\n";
+        for (size_t i = 0; i < g_masked_hot_pixels.size(); ++i) {
+            const auto& p = g_masked_hot_pixels[i];
+            ss << "      {\"x\": " << p.x << ", \"y\": " << p.y << ", \"rate_ev_s\": " << p.rate << "}"
+               << (i + 1 < g_masked_hot_pixels.size() ? ",\n" : "\n");
+        }
+        ss << "    ]\n"
+           << "  },\n"
            << "  \"ego_motion\": {\n"
            << "    \"imu_connected\": " << (ego_stats_.imu_connected ? "true" : "false") << ",\n"
            << "    \"imu_packets\": " << ego_stats_.imu_packets << ",\n"
@@ -406,6 +554,26 @@ public:
            << "    \"max_cell_events\": " << roi_diag_.max_cell_events << ",\n"
            << "    \"max_sieve_hits\": " << roi_diag_.max_sieve_hits << ",\n"
            << "    \"active_cells\": " << roi_diag_.active_cells << "\n"
+           << "  },\n"
+           << "  \"ui_encoder\": {\n"
+           << "    \"total_frames\": " << ui_stats_.total_frames << ",\n"
+           << "    \"last_draw_us\": " << ui_stats_.last_draw_us << ",\n"
+           << "    \"avg_draw_us\": " << ui_stats_.avg_draw_us << ",\n"
+           << "    \"last_encode_us\": " << ui_stats_.last_encode_us << ",\n"
+           << "    \"avg_encode_us\": " << ui_stats_.avg_encode_us << "\n"
+           << "  },\n"
+           << "  \"raw_pipeline\": {\n"
+           << "    \"total_usb_buffers\": " << raw_stats_.total_usb_buffers << ",\n"
+           << "    \"total_raw_words\": " << raw_stats_.total_raw_words << ",\n"
+           << "    \"total_decoded_events\": " << raw_stats_.total_decoded_events << ",\n"
+           << "    \"total_retained_events\": " << raw_stats_.total_retained_events << ",\n"
+           << "    \"dropped_buffers\": " << raw_stats_.dropped_buffers << ",\n"
+           << "    \"ring_overruns\": " << raw_stats_.ring_overruns << ",\n"
+           << "    \"last_batch_words\": " << raw_stats_.last_batch_words << ",\n"
+           << "    \"last_batch_events\": " << raw_stats_.last_batch_events << ",\n"
+           << "    \"last_gpu_decode_us\": " << raw_stats_.last_gpu_decode_us << ",\n"
+           << "    \"last_gpu_sieve_us\": " << raw_stats_.last_gpu_sieve_us << ",\n"
+           << "    \"last_gpu_ingest_us\": " << raw_stats_.last_gpu_ingest_us << "\n"
            << "  },\n"
            << "  \"num_targets\": " << active_detections_.size() << ",\n"
            << "  \"num_tracks\": " << all_tracks_.size() << ",\n"
@@ -455,54 +623,124 @@ private:
     std::vector<predator::SpatialFlickerClusterer::Track> all_tracks_;
     predator::RoiDiagnostics roi_diag_;
     EgoMotionStats ego_stats_;
+    UiEncoderStats ui_stats_;
+    predator::RawPipelineStats raw_stats_;
 };
 
 static DetectionManager g_detection_mgr;
 
 void display_encoder_thread_func(int width, int height) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "disp_encoder");
+#endif
     // Fast Turbo JPEG encoding parameters (sub-8ms latency)
     std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, 60, cv::IMWRITE_JPEG_OPTIMIZE, 0};
     cv::Mat frame;
 
     while (g_running) {
         if (g_frame_mgr.wait_for_frame(frame, 30)) {
+            // Demand-gated UI JPEG compression (Phase 33.4b.e): only draw HUD and compress JPEG when active clients are connected
+            uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            bool client_active = (now_ms - g_last_client_request_ms.load(std::memory_order_relaxed)) < 2500;
+            if (!client_active) {
+                continue;
+            }
+
+            auto t0 = std::chrono::steady_clock::now();
             auto all_tracks = g_detection_mgr.get_all_tracks();
             auto active_dets = g_detection_mgr.get_detections();
             auto ego_stats = g_detection_mgr.get_ego_stats();
 
-            // Draw detection bounding boxes and HUD on frame
-            // Render CONFIRMED drone targets in bright green, and ACQUIRING targets (hit >= 2 or SNR >= 10.0 dB) in Amber
-            for (const auto& trk : all_tracks) {
-                bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
-                if (!is_confirmed && trk.hit_count < 2 && trk.last_detection.peak_snr_db < 10.0f) {
-                    continue; // Suppress single-frame 1-hit noise blips
+            // Compute Live Focus Sharpness (Laplacian variance on central 640x360 ROI)
+            int roi_w = std::min(640, width);
+            int roi_h = std::min(360, height);
+            int roi_x = (width - roi_w) / 2;
+            int roi_y = (height - roi_h) / 2;
+            cv::Rect center_roi(roi_x, roi_y, roi_w, roi_h);
+
+            cv::Mat roi = frame(center_roi);
+            cv::Mat gray_roi;
+            cv::cvtColor(roi, gray_roi, cv::COLOR_BGR2GRAY);
+            cv::Mat lap;
+            cv::Laplacian(gray_roi, lap, CV_16S);
+            cv::Scalar mean, stddev;
+            cv::meanStdDev(lap, mean, stddev);
+            double focus_score = stddev.val[0] * stddev.val[0];
+            g_live_focus_score.store(focus_score, std::memory_order_relaxed);
+            double cur_peak = g_peak_focus_score.load(std::memory_order_relaxed);
+            if (focus_score > cur_peak) {
+                cur_peak = focus_score;
+                g_peak_focus_score.store(cur_peak, std::memory_order_relaxed);
+            }
+
+            if (g_focus_mode_enabled) {
+                // Focus Assist Mode: suppress target boxes, highlight central focus region and sharpness bar
+                cv::Scalar yellow(0, 255, 255);
+                cv::rectangle(frame, center_roi, yellow, 2);
+                int cx = width / 2;
+                int cy = height / 2;
+                cv::line(frame, cv::Point(cx - 30, cy), cv::Point(cx + 30, cy), yellow, 2);
+                cv::line(frame, cv::Point(cx, cy - 30), cv::Point(cx, cy + 30), yellow, 2);
+
+                int bar_w = 440;
+                int bar_h = 24;
+                int bar_x = (width - bar_w) / 2;
+                int bar_y = height - 55;
+                cv::rectangle(frame, cv::Rect(bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4), cv::Scalar(30, 30, 30), -1);
+                cv::rectangle(frame, cv::Rect(bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4), cv::Scalar(180, 180, 180), 1);
+
+                float fill_ratio = (cur_peak > 1e-3) ? static_cast<float>(std::min(1.0, focus_score / cur_peak)) : 0.0f;
+                int fill_w = static_cast<int>(bar_w * fill_ratio);
+                if (fill_w > 0) {
+                    cv::Scalar fill_color = (fill_ratio >= 0.95f) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 215, 255);
+                    cv::rectangle(frame, cv::Rect(bar_x, bar_y, fill_w, bar_h), fill_color, -1);
                 }
-                const auto& d = trk.last_detection;
-                int bx = d.centroid_px_x - 40;
-                int by = d.centroid_px_y - 40;
-                cv::Rect target_rect(std::max(0, bx), std::max(0, by), 
-                                     std::min(80, width - std::max(0, bx)), 
-                                     std::min(80, height - std::max(0, by)));
-                
-                cv::Scalar box_color = is_confirmed ? cv::Scalar(0, 255, 128) : cv::Scalar(0, 215, 255); // Green vs Amber
-                cv::rectangle(frame, target_rect, box_color, is_confirmed ? 2 : 1);
-                
-                char label[128];
-                const char* net_tag = d.is_neural_detection ? " [NET]" : "";
-                if (is_confirmed) {
-                    snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
-                             trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
-                } else {
-                    snprintf(label, sizeof(label), "[ACQUIRING #%d %d/3] %.0fHz [%.1fdB]%s", 
-                             trk.track_id, trk.hit_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
+
+                char score_text[128];
+                snprintf(score_text, sizeof(score_text), "FOCUS SHARPNESS: %.1f / PEAK: %.1f (%d%%)",
+                         focus_score, cur_peak, static_cast<int>(fill_ratio * 100.0f));
+                cv::putText(frame, score_text, cv::Point(bar_x, bar_y - 8),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.52, yellow, 2, cv::LINE_AA);
+            } else {
+                // Draw detection bounding boxes and HUD on frame
+                // Only render CONFIRMED drone targets (Green for active lock, Amber for coasting)
+                for (const auto& trk : all_tracks) {
+                    bool is_confirmed = (trk.state == predator::SpatialFlickerClusterer::TrackState::CONFIRMED);
+                    if (!is_confirmed) {
+                        continue; // Suppress unconfirmed tentative tracks from HUD
+                    }
+                    const auto& d = trk.last_detection;
+                    int bx = d.centroid_px_x - 40;
+                    int by = d.centroid_px_y - 40;
+                    cv::Rect target_rect(std::max(0, bx), std::max(0, by), 
+                                         std::min(80, width - std::max(0, bx)), 
+                                         std::min(80, height - std::max(0, by)));
+                    
+                    bool is_coasting = (trk.miss_count > 0);
+                    cv::Scalar box_color = is_coasting ? cv::Scalar(0, 215, 255) : cv::Scalar(0, 255, 128); // Amber coasting vs Green locked
+                    cv::rectangle(frame, target_rect, box_color, 2);
+                    
+                    char label[128];
+                    const char* net_tag = d.is_neural_detection ? " [NET]" : "";
+                    if (is_coasting) {
+                        snprintf(label, sizeof(label), "DRONE #%d [COAST %d] %.0fHz [%.1fdB]%s", 
+                                 trk.track_id, trk.miss_count, d.fundamental_bpf_hz, d.peak_snr_db, net_tag);
+                    } else {
+                        snprintf(label, sizeof(label), "DRONE #%d %.0fHz (%.0f RPM) [%.1fdB]%s", 
+                                 trk.track_id, d.fundamental_bpf_hz, d.estimated_rpm, d.peak_snr_db, net_tag);
+                    }
+                    cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
                 }
-                cv::putText(frame, label, cv::Point(target_rect.x, std::max(16, target_rect.y - 6)),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv::LINE_AA);
             }
 
             // Top HUD
-            std::string hud_top = "PREDATOR-01 | 12mm f/2.0 M12 | DDHF + Ego-Motion Core";
-            cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
+            char hud_top[256];
+            snprintf(hud_top, sizeof(hud_top), "PREDATOR-01 | 12mm f/2.5 M12 | FOCUS: %.1f [PEAK: %.1f]%s",
+                     focus_score, cur_peak, g_focus_mode_enabled ? " [FOCUS MODE]" : "");
+            cv::putText(frame, hud_top, cv::Point(16, 28), cv::FONT_HERSHEY_SIMPLEX, 0.60,
+                        g_focus_mode_enabled ? cv::Scalar(0, 255, 255) : cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
 
             // Ego-Motion & Frequency-Domain Core HUD Badge
             char ego_badge[256];
@@ -515,8 +753,16 @@ void display_encoder_thread_func(int width, int height) {
             cv::putText(frame, ego_badge, cv::Point(16, 56), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                         ego_stats.imu_connected ? cv::Scalar(0, 255, 200) : cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
 
+            auto t1 = std::chrono::steady_clock::now();
+
             std::vector<uchar> jpeg_buf;
             cv::imencode(".jpg", frame, jpeg_buf, encode_params);
+            auto t2 = std::chrono::steady_clock::now();
+
+            double draw_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            double encode_us = std::chrono::duration<double, std::micro>(t2 - t1).count();
+            g_detection_mgr.update_ui_stats(draw_us, encode_us);
+
             g_stream_broadcaster.update_frame(jpeg_buf);
         }
     }
@@ -712,11 +958,49 @@ static const char* HTML_DASHBOARD = R"html(
                 </div>
             </div>
             <div class="card">
+                <div class="card-title">Focus Assist Engine <span id="val-focus-mode" style="color:var(--text-muted); font-size:11px;">STANDBY</span></div>
+                <div class="metric-grid">
+                    <div class="metric-box">
+                        <div class="metric-label">Laplacian Sharpness</div>
+                        <div class="metric-value" id="val-focus-score" style="font-size:16px; color:var(--accent-gold);">0.0</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Peak Sharpness</div>
+                        <div class="metric-value" id="val-focus-peak" style="font-size:16px; color:var(--accent-green);">0.0</div>
+                    </div>
+                </div>
+                <div style="display:flex; gap:8px; margin-top:10px;">
+                    <button onclick="fetch('/toggle_focus')" style="flex:1; background:rgba(255,170,0,0.15); border:1px solid var(--accent-gold); color:var(--accent-gold); padding:6px; border-radius:4px; font-weight:700; cursor:pointer;">Toggle Focus Reticle</button>
+                    <button onclick="fetch('/reset_focus')" style="background:rgba(255,255,255,0.05); border:1px solid var(--border-color); color:var(--text-muted); padding:6px 12px; border-radius:4px; font-weight:600; cursor:pointer;">Reset Peak</button>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-title">IMX636 Sensor Biases <span id="val-bias-status" style="color:var(--accent-green); font-size:11px;">SYNCED</span></div>
+                <div class="metric-grid">
+                    <div class="metric-box">
+                        <div class="metric-label">diff_on (contrast ON)</div>
+                        <div class="metric-value" id="val-bias-diff-on" style="font-size:15px; color:var(--accent-cyan);">6</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">diff_off (contrast OFF)</div>
+                        <div class="metric-value" id="val-bias-diff-off" style="font-size:15px; color:var(--accent-cyan);">6</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">fo (follower BW)</div>
+                        <div class="metric-value" id="val-bias-fo" style="font-size:15px; color:var(--accent-gold);">-8</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">refr (dead-time)</div>
+                        <div class="metric-value" id="val-bias-refr" style="font-size:15px; color:var(--accent-gold);">20</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
                 <div class="card-title">Optical & CUDA Core</div>
                 <div class="metric-grid">
                     <div class="metric-box">
                         <div class="metric-label">Optics / GPU</div>
-                        <div class="metric-value" style="font-size:13px;">12mm f/2.0 | cuFFT</div>
+                        <div class="metric-value" style="font-size:13px;">12mm f/2.5 | cuFFT</div>
                     </div>
                     <div class="metric-box">
                         <div class="metric-label">Sample Rate</div>
@@ -769,12 +1053,27 @@ static const char* HTML_DASHBOARD = R"html(
                     document.getElementById('val-foliage').textContent = (data.ego_motion.active_cells || 0);
                     document.getElementById('val-suppressed').textContent = (data.ego_motion.suppressed_events_pct || 0).toFixed(0) + "%";
                     document.getElementById('target-count').textContent = data.num_targets;
-                    const foliage = data.ego_motion.foliage_dispersion_pct || 0.0;
-                    const folElem = document.getElementById('val-foliage');
-                    folElem.textContent = foliage.toFixed(0) + "%";
-                    folElem.style.color = foliage > 20 ? "var(--accent-red)" : (foliage > 8 ? "var(--accent-gold)" : "var(--accent-green)");
-                    document.getElementById('val-suppressed').textContent = (data.ego_motion.suppressed_events_pct || 0).toFixed(0) + "%";
-                    document.getElementById('target-count').textContent = data.num_targets;
+                    if (data.focus) {
+                        const scoreElem = document.getElementById('val-focus-score');
+                        const peakElem = document.getElementById('val-focus-peak');
+                        const modeElem = document.getElementById('val-focus-mode');
+                        if (scoreElem) scoreElem.textContent = (data.focus.score || 0).toFixed(1);
+                        if (peakElem) peakElem.textContent = (data.focus.peak || 0).toFixed(1);
+                        if (modeElem) {
+                            modeElem.textContent = data.focus.mode ? "ACTIVE" : "STANDBY";
+                            modeElem.style.color = data.focus.mode ? "var(--accent-gold)" : "var(--text-muted)";
+                        }
+                    }
+                    if (data.biases) {
+                        const don = document.getElementById('val-bias-diff-on');
+                        const doff = document.getElementById('val-bias-diff-off');
+                        const fo = document.getElementById('val-bias-fo');
+                        const refr = document.getElementById('val-bias-refr');
+                        if (don && data.biases.bias_diff_on !== undefined) don.textContent = data.biases.bias_diff_on;
+                        if (doff && data.biases.bias_diff_off !== undefined) doff.textContent = data.biases.bias_diff_off;
+                        if (fo && data.biases.bias_fo !== undefined) fo.textContent = data.biases.bias_fo;
+                        if (refr && data.biases.bias_refr !== undefined) refr.textContent = data.biases.bias_refr;
+                    }
                     
                     const container = document.getElementById('targets-container');
                     if (data.num_targets === 0) {
@@ -815,6 +1114,16 @@ void handle_http_client(int client_fd) {
     }
     buffer[bytes_read] = '\0';
     std::string request(buffer);
+
+    // Record visual streaming request activity for demand-gated encoding (Phase 33.4b.e)
+    if (request.find("/frame.jpg") != std::string::npos ||
+        request.find("/stream.mjpg") != std::string::npos ||
+        request.find("GET / ") != std::string::npos ||
+        request.find("GET /index.html") != std::string::npos) {
+        uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        g_last_client_request_ms.store(now_ms, std::memory_order_relaxed);
+    }
 
     if (request.find("/frame.jpg") != std::string::npos) {
         std::vector<uchar> jpeg_data;
@@ -900,6 +1209,97 @@ void handle_http_client(int client_fd) {
                 if (send(client_fd, "\r\n", 2, MSG_NOSIGNAL) <= 0) break;
             }
         }
+    } else if (request.find("/toggle_focus") != std::string::npos) {
+        g_focus_mode_enabled = !g_focus_mode_enabled;
+        std::string res = std::string("{\"focus_mode\": ") + (g_focus_mode_enabled ? "true" : "false") + "}\n";
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
+    } else if (request.find("/reset_focus") != std::string::npos) {
+        g_peak_focus_score.store(0.0, std::memory_order_relaxed);
+        std::string res = "{\"reset\": true}\n";
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
+    } else if (request.find("/get_biases") != std::string::npos) {
+        auto cur = get_current_biases();
+        std::ostringstream res_ss;
+        res_ss << "{\"biases\": {";
+        size_t b_idx = 0;
+        for (const auto& kv : cur) {
+            res_ss << "\"" << kv.first << "\": " << kv.second << (++b_idx < cur.size() ? ", " : "");
+        }
+        res_ss << "}}\n";
+        std::string res = res_ss.str();
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
+    } else if (request.find("/set_bias") != std::string::npos) {
+        std::string qstr;
+        size_t qpos = request.find("?");
+        size_t epos = request.find(" ", qpos);
+        if (qpos != std::string::npos && epos != std::string::npos) {
+            qstr = request.substr(qpos + 1, epos - qpos - 1);
+        }
+        int applied_count = 0;
+        std::string last_name;
+        int last_val = 0;
+        std::istringstream qss(qstr);
+        std::string pair;
+        while (std::getline(qss, pair, '&')) {
+            size_t eq = pair.find('=');
+            if (eq != std::string::npos) {
+                std::string k = pair.substr(0, eq);
+                std::string v = pair.substr(eq + 1);
+                if (k == "name") {
+                    last_name = v;
+                } else if (k == "val" || k == "value") {
+                    last_val = std::stoi(v);
+                    if (!last_name.empty()) {
+                        if (set_sensor_bias(last_name, last_val)) applied_count++;
+                    }
+                } else if (k.find("bias_") == 0 || k == "diff_on" || k == "diff_off" || k == "fo" || k == "refr" || k == "hpf") {
+                    std::string bname = (k.find("bias_") == 0) ? k : ("bias_" + k);
+                    int bval = std::stoi(v);
+                    if (set_sensor_bias(bname, bval)) {
+                        applied_count++;
+                        last_name = bname;
+                        last_val = bval;
+                    }
+                }
+            }
+        }
+        auto cur = get_current_biases();
+        std::ostringstream res_ss;
+        res_ss << "{\"success\": " << (applied_count > 0 ? "true" : "false")
+               << ", \"applied_count\": " << applied_count
+               << ", \"last_name\": \"" << last_name 
+               << "\", \"last_val\": " << last_val << ", \"biases\": {";
+        size_t b_idx = 0;
+        for (const auto& kv : cur) {
+            res_ss << "\"" << kv.first << "\": " << kv.second << (++b_idx < cur.size() ? ", " : "");
+        }
+        res_ss << "}}\n";
+        std::string res = res_ss.str();
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: " + std::to_string(res.length()) + "\r\n"
+                             "Connection: close\r\n\r\n";
+        send(client_fd, header.c_str(), header.length(), MSG_NOSIGNAL);
+        send(client_fd, res.c_str(), res.length(), MSG_NOSIGNAL);
     } else if (request.find("GET /stats") != std::string::npos || request.find("GET /flicker_stats") != std::string::npos || request.find("GET /pipeline_stats") != std::string::npos) {
         std::string json = g_detection_mgr.get_telemetry_json();
         std::string header = "HTTP/1.1 200 OK\r\n"
@@ -923,6 +1323,9 @@ void handle_http_client(int client_fd) {
 }
 
 void http_server_thread_func(int port) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "http_server");
+#endif
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return;
 
@@ -958,6 +1361,9 @@ void http_server_thread_func(int port) {
 }
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "analysis_main");
+#endif
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -967,44 +1373,181 @@ int main(int argc, char* argv[]) {
     setenv("MV_PSEE_PLUGIN_DATA_TRANSFER_BUFFER_POOL_BYTE_SIZE", "8388608", 1);
 
     int port = 8080;
-    if (argc > 1) {
-        port = std::stoi(argv[1]);
+    std::string input_file;
+    bool loop_playback = false;
+    double playback_rate = 1.0;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--input" || arg == "-i") {
+            if (i + 1 < argc) input_file = argv[++i];
+        } else if (arg == "--loop") {
+            loop_playback = true;
+        } else if (arg == "--rate" || arg == "-r") {
+            if (i + 1 < argc) playback_rate = std::stod(argv[++i]);
+        } else if (arg == "--port" || arg == "-p") {
+            if (i + 1 < argc) port = std::stoi(argv[++i]);
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [options] [port]\n"
+                      << "Options:\n"
+                      << "  -i, --input <file>   Offline replay (.evt21raw, .cd, or .raw)\n"
+                      << "      --loop           Loop playback continuously\n"
+                      << "  -r, --rate <float>   Playback rate multiplier (1.0 = real-time, 0 = max GPU speed)\n"
+                      << "  -p, --port <int>     Web UI / JSON API HTTP port (default 8080)\n"
+                      << "  -h, --help           Show this help message\n";
+            return 0;
+        } else if (arg.rfind("--", 0) != 0 && arg.rfind("-", 0) != 0) {
+            try {
+                port = std::stoi(arg);
+            } catch (...) {}
+        }
     }
+
+    // Resolve runtime feature flags once (Phase 33 defaults: both OFF).
+    g_ego_warp_enabled = env_flag("PREDATOR_ENABLE_EGO_WARP", false);
+    g_combnet_prune_enabled = env_flag("PREDATOR_COMBNET_PRUNE", false);
+    g_combnet_rescue_enabled = env_flag("PREDATOR_COMBNET_RESCUE", false);
+    g_focus_mode_enabled = env_flag("PREDATOR_FOCUS_MODE", false);
+
+    const bool is_replay = !input_file.empty();
+    g_is_replay_mode = is_replay;
+    g_replay_file = input_file;
+    g_replay_loop = loop_playback;
+    g_replay_rate = playback_rate;
 
     std::cout << "========================================================\n";
     std::cout << "  Predator — Real-Time Propeller Flicker Detector Engine\n";
     std::cout << "  Ego-Motion Compensation + TensorRT Suppression Core   \n";
-    std::cout << "  Lens: 12mm f/2.0 M12 1/2.5\" (5MP)                      \n";
+    std::cout << "  Lens: 12mm f/2.5 M12 1/2.5\" (5MP)                      \n";
+    std::cout << "  Build: " << PREDATOR_BUILD_ID << "\n";
+    if (is_replay) {
+        std::cout << "  Mode: OFFLINE REPLAY (" << input_file << ")\n";
+        std::cout << "  Loop: " << (loop_playback ? "YES" : "NO") << ", Rate: " << playback_rate << "x\n";
+    } else {
+        std::cout << "  Mode: LIVE CAMERA (IMX636 EVT21)\n";
+    }
     std::cout << "========================================================\n";
 
     try {
-        std::cout << "[INFO] Opening Metavision Event Camera...\n";
-        Metavision::Camera camera = Metavision::Camera::from_first_available();
+        std::unique_ptr<Metavision::Device> device;
+        const int width = 1280;
+        const int height = 720;
+        std::string cam_serial = is_replay ? "offline_replay" : "unknown";
+        std::string cam_format = "EVT21";
 
-        int width = camera.geometry().get_width();
-        int height = camera.geometry().get_height();
-        std::cout << "[INFO] Camera initialized! Resolution: " << width << " x " << height << "\n";
-
-        // Configure IMX636 Sensor Biases for 12mm f/2.0 Optics (Adaptive Shade & Solar Flux Tuning)
-        try {
-            auto *biases = camera.get_device().get_facility<Metavision::I_LL_Biases>();
-            if (biases) {
-                // Support environment overrides for shade or high-flux tuning (defaults: diff_on=6, diff_off=6 for 80-115ft sensitivity)
-                int diff_on = 6;
-                int diff_off = 6;
-                const char* env_on = std::getenv("PREDATOR_BIAS_DIFF_ON");
-                const char* env_off = std::getenv("PREDATOR_BIAS_DIFF_OFF");
-                if (env_on) diff_on = std::stoi(env_on);
-                if (env_off) diff_off = std::stoi(env_off);
-                biases->set("bias_diff_on", diff_on);
-                biases->set("bias_diff_off", diff_off);
-                biases->set("bias_refr", 20);
-                biases->set("bias_fo", -8);
-                std::cout << "[INFO] Adaptive IMX636 biases active: diff_on=" << diff_on 
-                          << ", diff_off=" << diff_off << ", refr=+20, fo=-8.\n";
+        if (is_replay) {
+            if (!std::ifstream(input_file).good()) {
+                std::fprintf(stderr, "[ERROR] Input replay file does not exist: %s\n", input_file.c_str());
+                return 2;
             }
-        } catch (const std::exception &e) {
-            std::cout << "[WARN] Could not set analog biases: " << e.what() << "\n";
+
+            if (input_file.size() >= 4 && input_file.rfind(".raw") == input_file.size() - 4) {
+                try {
+                    device = Metavision::DeviceDiscovery::open_raw_file(input_file);
+                    if (device) {
+                        auto* hwid = device->get_facility<Metavision::I_HW_Identification>();
+                        cam_serial = hwid ? hwid->get_serial() : "raw_file";
+                        cam_format = hwid ? hwid->get_current_data_encoding_format() : "raw";
+                        std::cout << "[INFO] Opened HAL raw file: Serial=" << cam_serial << ", Format=" << cam_format << "\n";
+                    }
+                } catch (const std::exception& e) {
+                    std::cout << "[WARN] HAL open_raw_file failed: " << e.what() << "; falling back to direct RawPipeline replay.\n";
+                }
+            }
+            std::cout << "[INFO] Offline Replay Source: " << input_file << " (" << width << " x " << height << ")\n";
+        } else {
+            std::cout << "[INFO] Opening Metavision Event Camera with EVT21 format...\n";
+            Metavision::DeviceConfig dev_cfg;
+            dev_cfg.set_format("EVT21");
+            device = Metavision::DeviceDiscovery::open("", dev_cfg);
+            if (!device) {
+                throw std::runtime_error("No Metavision event camera found");
+            }
+
+            auto* hwid = device->get_facility<Metavision::I_HW_Identification>();
+            cam_serial = hwid ? hwid->get_serial() : "unknown";
+            cam_format = hwid ? hwid->get_current_data_encoding_format() : "unknown";
+
+            std::cout << "[INFO] Camera initialized! Serial: " << cam_serial << ", Format: " << cam_format 
+                      << ", Resolution: " << width << " x " << height << "\n";
+        }
+
+        // Configure IMX636 Sensor Biases for 12mm f/2.5 Optics (Adaptive Shade & Solar Flux Tuning)
+        if (device) {
+            try {
+                auto *biases = device->get_facility<Metavision::I_LL_Biases>();
+                if (biases) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_bias_mutex);
+                        g_ll_biases = biases;
+                    }
+                    int diff_on = 7;
+                    int diff_off = 8;
+                    int refr = 25;
+                    int fo = -10;
+                    const char* env_on = std::getenv("PREDATOR_BIAS_DIFF_ON");
+                    const char* env_off = std::getenv("PREDATOR_BIAS_DIFF_OFF");
+                    const char* env_refr = std::getenv("PREDATOR_BIAS_REFR");
+                    const char* env_fo = std::getenv("PREDATOR_BIAS_FO");
+                    if (env_on) diff_on = std::stoi(env_on);
+                    if (env_off) diff_off = std::stoi(env_off);
+                    if (env_refr) refr = std::stoi(env_refr);
+                    if (env_fo) fo = std::stoi(env_fo);
+                    biases->set("bias_diff_on", diff_on);
+                    biases->set("bias_diff_off", diff_off);
+                    biases->set("bias_refr", refr);
+                    biases->set("bias_fo", fo);
+                    std::cout << "[INFO] Adaptive IMX636 biases active: diff_on=" << diff_on 
+                              << ", diff_off=" << diff_off << ", refr=" << refr << ", fo=" << fo << ".\n";
+                }
+            } catch (const std::exception &e) {
+                std::cout << "[WARN] Could not set analog biases: " << e.what() << "\n";
+            }
+        } else {
+            std::cout << "[INFO] Offline replay: Hardware analog biases bypassed.\n";
+        }
+
+        // Phase 33.7a: Configure IMX636 Hardware Pixel Mask (I_DigitalEventMask)
+        if (device) {
+            try {
+                const char* mask_file_env = std::getenv("PREDATOR_HOT_PIXELS_FILE");
+                std::string mask_filepath = mask_file_env ? mask_file_env : "hot_pixels.txt";
+
+                // If default file doesn't exist in current working directory, check /home/orin/ev_deploy/hot_pixels.txt
+                if (!mask_file_env && !std::ifstream(mask_filepath).good()) {
+                    if (std::ifstream("/home/orin/ev_deploy/hot_pixels.txt").good()) {
+                        mask_filepath = "/home/orin/ev_deploy/hot_pixels.txt";
+                    }
+                }
+
+                predator::HotPixelMaskConfig mask_cfg;
+                mask_cfg.sensor_width = static_cast<uint16_t>(width);
+                mask_cfg.sensor_height = static_cast<uint16_t>(height);
+
+                auto parse_res = predator::parse_hot_pixels_file(mask_filepath, mask_cfg);
+                if (parse_res.success) {
+                    for (const auto& w : parse_res.warnings) {
+                        std::cout << "[WARN] Hot pixel mask: " << w << "\n";
+                    }
+                    auto mask_status = predator::apply_hardware_pixel_mask(*device, parse_res.pixels);
+                    std::cout << "[INFO] " << mask_status.message << "\n";
+                    if (mask_status.applied) {
+                        g_hardware_mask_applied = true;
+                        g_hardware_mask_facility = mask_status.facility_name;
+                        g_masked_hot_pixels = parse_res.pixels;
+                        for (const auto& p : g_masked_hot_pixels) {
+                            std::cout << "  -> Masked hot pixel (" << p.x << ", " << p.y
+                                      << ") with baseline rate " << p.rate << " ev/s\n";
+                        }
+                    }
+                } else if (mask_file_env) {
+                    std::cout << "[WARN] Hot pixel mask file requested but could not be parsed: " << parse_res.error << "\n";
+                } else {
+                    std::cout << "[INFO] No hot_pixels.txt found; running with all hardware pixel masks clear.\n";
+                }
+            } catch (const std::exception &e) {
+                std::cout << "[WARN] Could not apply hardware pixel mask: " << e.what() << "\n";
+            }
         }
 
         predator::LensParameters lens_params;
@@ -1016,12 +1559,28 @@ int main(int argc, char* argv[]) {
         // High-Performance GPU Flicker & cuFFT Core (1152 parallel channels on Jetson Orin Nano)
         predator::CudaFlickerCore cuda_core(width, height, 32, 18, 4000.0, 512);
 
+        // Phase 33.5 CFAR gate: the only detector knob is the field-wide false-alarm budget.
+        {
+            predator::SpectralGateConfig gate_cfg;
+            gate_cfg.false_alarms_per_hour = env_positive_float("PREDATOR_CFAR_FA_PER_HOUR", gate_cfg.false_alarms_per_hour);
+            cuda_core.set_spectral_gate_config(gate_cfg);
+            const auto& g = cuda_core.spectral_gate_config();
+            g_cfar_fa_per_hour = g.false_alarms_per_hour;
+            g_cfar_threshold_db = g.cfar_threshold_db;
+            std::cout << "[INFO] CFAR gate: band " << g.min_freq_hz << "-" << g.max_freq_hz << " Hz (bins "
+                      << g.min_bin << "-" << g.max_bin << "), FA budget " << g.false_alarms_per_hour
+                      << "/h -> Pfa/window " << g.pfa_per_window << ", threshold " << g.cfar_threshold
+                      << " (" << g.cfar_threshold_db << " dB), min_sharpness " << g.min_sharpness << "\n";
+        }
+
         // Continuous Gyroscope Warper & Stabilization Engine
         predator::ContinuousGyroWarper gyro_warper(lens_params);
 
-        // Connect to Arduino Nicla Sense ME IMU reader on /dev/ttyACM0
+        // Connect to Arduino Nicla Sense ME IMU reader on /dev/ttyACM0 (live mode only)
         predator::NiclaSerialReader imu_reader(gyro_warper, "/dev/ttyACM0");
-        imu_reader.start();
+        if (!is_replay) {
+            imu_reader.start();
+        }
 
         // Start High-Rate Diagnostic Logger
         g_diag_logger.start();
@@ -1037,77 +1596,68 @@ int main(int argc, char* argv[]) {
             std::cout << "[WARN] SpectralCombNet TRT Engine not loaded, continuing with cuFFT peak detector.\n";
         }
 
-        // Configurable Ego-Motion Stabilization
-        // Default to active 200 Hz IMU homography de-rotation with calibrated rad/s scaling
-        bool enable_ego_warp = true;
-        const char* env_warp = std::getenv("PREDATOR_ENABLE_EGO_WARP");
-        if (env_warp && std::string(env_warp) == "0") enable_ego_warp = false;
+        // Configurable Ego-Motion Stabilization (Phase 33: default OFF, opt in with PREDATOR_ENABLE_EGO_WARP=1).
+        // Rationale: re-anchoring has no GPU ring-buffer remap, so any warp jump corrupts per-cell
+        // FFT histories. Ego-motion is out of scope until that remap exists (see Phase 34 plan).
+        const bool enable_ego_warp = g_ego_warp_enabled;
         std::cout << "[INFO] Pipeline Ingestion Mode: Ego-Warp=" << (enable_ego_warp ? "ACTIVE (Nicla 200Hz)" : "BYPASS (Identity)")
+                  << ", CombNet-Prune=" << (g_combnet_prune_enabled ? "ON" : "OFF")
+                  << ", CombNet-Rescue=" << (g_combnet_rescue_enabled ? "ON" : "OFF")
+                  << ", Focus-Mode=" << (g_focus_mode_enabled ? "ON" : "OFF")
                   << ", Pure Frequency-Domain Harmonic Pipeline Active.\n";
 
-        std::atomic<uint64_t> total_raw_counter{0};
-        std::atomic<uint64_t> retained_counter{0};
-        std::atomic<uint64_t> current_epoch_ref_us{0};
+        // Zero-CPU GPU-Resident Raw Tap Ingestion Pipeline (Phase 33.4b.c)
+        predator::RawPipelineConfig pipe_cfg;
+        pipe_cfg.sensor_width = width;
+        pipe_cfg.sensor_height = height;
+        pipe_cfg.enable_ego_warp = enable_ego_warp;
+        pipe_cfg.enable_ui_frame_gen = true;
+        pipe_cfg.ui_fps = 30.0;
 
-        // Visual frame generation for UI (30 FPS)
-        Metavision::PeriodicFrameGenerationAlgorithm frame_gen(width, height, 25000, 30.0, Metavision::ColorPalette::Dark);
+        predator::RawPipeline raw_pipeline(pipe_cfg, cuda_core, gyro_warper);
+        if (device) {
+            raw_pipeline.connect_device(device.get());
+        } else {
+            raw_pipeline.connect_file(input_file, loop_playback, playback_rate);
+        }
 
-        frame_gen.set_output_callback([&](Metavision::timestamp ts, cv::Mat& frame) {
-            g_frame_mgr.push_frame(frame);
+        // Connect synthesized GPU UI frame callback (Phase 33.4b.e)
+        raw_pipeline.set_frame_callback([&](const uint8_t* gray_data, int w, int h, uint64_t ts) {
+            cv::Mat gray(h, w, CV_8UC1, const_cast<uint8_t*>(gray_data));
+            cv::Mat bgr;
+            cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
+            g_frame_mgr.push_frame(bgr);
         });
 
         // Start background display & JPEG encoder thread
         std::thread encoder_thread(display_encoder_thread_func, width, height);
 
-        // Fast CD callback: direct GPU batch ingestion with continuous Ego-Motion Stabilization
-        camera.cd().add_callback([&](const Metavision::EventCD* begin, const Metavision::EventCD* end) {
-            if (begin == end) return;
-            size_t batch_size = std::distance(begin, end);
-
-            uint64_t host_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            gyro_warper.update_camera_time_anchor(begin->t, host_now_us);
-
-            frame_gen.process_events(begin, end);
-
-            uint64_t t_ref = current_epoch_ref_us.load();
-            if (t_ref == 0) {
-                t_ref = begin->t;
-                current_epoch_ref_us.store(t_ref);
-            }
-
-            predator::Matrix3x3 batch_H = predator::Matrix3x3::identity();
-            if (enable_ego_warp) {
-                uint64_t mid_t = (begin->t + (end - 1)->t) / 2;
-                batch_H = gyro_warper.compute_homography(t_ref, mid_t);
-            }
-
-            // Direct GPU Ingestion, Homography Warping, SAE Sieve, and Ring Buffer Accumulation
-            uint64_t raw_count = 0;
-            uint64_t retained_count = 0;
-            cuda_core.ingest_event_batch(begin, batch_size, batch_H, raw_count, retained_count,
-                                         nullptr, 0.35f, false);
-
-            total_raw_counter.fetch_add(raw_count, std::memory_order_relaxed);
-        });
-
         // Launch HTTP Server
         std::thread server_thread(http_server_thread_func, port);
 
-        camera.start();
-        std::cout << "[INFO] Real-time propeller flicker detector active with CUDA acceleration & ego-motion compensation.\n";
+        raw_pipeline.start();
+        std::cout << "[INFO] Real-time propeller flicker detector active with Zero-CPU Raw Tap & GPU pipeline.\n";
 
         // Main analysis loop: 25 Hz deterministic analysis cycle with precision monotonic cadence timer
         auto next_cycle_epoch = std::chrono::steady_clock::now();
         const auto cycle_interval = std::chrono::milliseconds(40);
 
-        while (g_running && camera.is_running()) {
+        uint64_t last_total_decoded = 0;
+        uint64_t last_total_retained = 0;
+        std::atomic<uint64_t> current_epoch_ref_us{0};
+        while (g_running && raw_pipeline.is_running()) {
             next_cycle_epoch += cycle_interval;
 
             // 2. Snapshot metrics
-            uint64_t total_events = total_raw_counter.exchange(0);
-            uint64_t retained_events = cuda_core.get_and_reset_retained_count();
+            uint64_t current_decoded = raw_pipeline.total_decoded_events();
+            uint64_t total_events = (current_decoded >= last_total_decoded) ? (current_decoded - last_total_decoded) : current_decoded;
+            last_total_decoded = current_decoded;
+            uint64_t current_retained = raw_pipeline.total_retained_events();
+            uint64_t retained_events = (current_retained >= last_total_retained) ? (current_retained - last_total_retained) : current_retained;
+            last_total_retained = current_retained;
             double suppressed_pct = (total_events > 0) ? (100.0 * (1.0 - (static_cast<double>(retained_events) / total_events))) : 0.0;
+
+            g_detection_mgr.update_raw_stats(raw_pipeline.get_stats());
 
             predator::Vector3d omega = gyro_warper.get_latest_angular_velocity();
             double gyro_speed_deg_s = std::sqrt(omega.x * omega.x + omega.y * omega.y + omega.z * omega.z) * (180.0 / M_PI);
@@ -1135,6 +1685,10 @@ int main(int argc, char* argv[]) {
             uint64_t t_now_host = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             uint64_t t_now_cam = gyro_warper.host_to_camera_time(t_now_host);
+            if (t_anchor == 0 && t_now_cam > 0) {
+                current_epoch_ref_us.store(t_now_cam);
+                t_anchor = t_now_cam;
+            }
 
             predator::Matrix3x3 H_world_to_cam = (t_now_cam > 0 && t_anchor > 0) ?
                 gyro_warper.compute_forward_homography(t_anchor, t_now_cam) : predator::Matrix3x3::identity();
@@ -1153,7 +1707,7 @@ int main(int argc, char* argv[]) {
 
             // 3. Batched cuFFT and GPU Spectral Harmonic Analysis across all 1152 cells in parallel (<0.4 ms)
             std::vector<predator::FlickerDetectionResult> raw_detections;
-            cuda_core.execute_batched_spectral_analysis(75.0, 1000.0, 2.5, 7.0, gyro_speed_deg_s, raw_detections);
+            cuda_core.execute_batched_spectral_analysis(gyro_speed_deg_s, raw_detections);
 
             // 3b. TensorRT SpectralCombNet Neural Classification on Active Cells (Shade & Weak Signal Boost)
             int spectral_eval_cells = 0;
@@ -1173,7 +1727,7 @@ int main(int argc, char* argv[]) {
                         ptrs[i] = active_spectra[i].data();
                     }
                     std::vector<predator::SpectralPrediction> neural_preds;
-                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.55f);
+                    spectral_engine.infer_spectra(ptrs, active_cell_indices, neural_preds, 0.0f);
 
                     for (const auto& np : neural_preds) {
                         top_neural_prob = std::max(top_neural_prob, np.drone_prob);
@@ -1181,6 +1735,26 @@ int main(int argc, char* argv[]) {
                         int base_cell = is_pooled ? (np.cell_idx - 576) : np.cell_idx;
                         int patch_col = base_cell % 32;
                         int patch_row = base_cell / 32;
+
+                        if (np.drone_prob < 0.35f) {
+                            // Neural Clutter Rejection (Phase 33: opt-in via PREDATOR_COMBNET_PRUNE=1).
+                            // Disabled by default: the deployed v2 engine outputs ~0 on every real
+                            // spectrum (training/runtime preprocessing mismatch), so pruning would
+                            // erase weak distant candidates. Re-enable only after CombNet v3 passes its gate.
+                            // Prune ONLY weak/ambiguous physical candidates (SNR < 10 dB AND no micro-sieve periodic lock AND not a sharp physical blade spike).
+                            // NEVER prune high-SNR, micro-sieve-locked, or sharp high-Q physical blade harmonics!
+                            if (g_combnet_prune_enabled) {
+                                raw_detections.erase(
+                                    std::remove_if(raw_detections.begin(), raw_detections.end(),
+                                        [&](const predator::FlickerDetectionResult& rd) {
+                                            bool is_sharp_blade = (rd.spectral_q_factor >= 4.0 && rd.peak_power >= 60.0);
+                                            return rd.patch_x == patch_col && rd.patch_y == patch_row &&
+                                                   rd.max_sieve_hits < 2 && !is_sharp_blade;
+                                        }),
+                                    raw_detections.end());
+                            }
+                            continue;
+                        }
 
                         bool already_detected = false;
                         for (auto& rd : raw_detections) {
@@ -1195,9 +1769,9 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Neural Weak-Signal Rescue: ONLY rescue if cell has true physical peak validity!
-                        if (!already_detected && np.has_valid_peak && np.physical_snr_db >= 5.0f && np.drone_prob >= 0.55f &&
-                            np.fund_freq_hz >= 75.0f && np.fund_freq_hz <= 1000.0f) {
+                        // Neural Weak-Signal Rescue: ONLY rescue if cell has true physical peak validity AND rescue is enabled!
+                        if (g_combnet_rescue_enabled && !already_detected && np.has_valid_peak && np.physical_snr_db >= 8.0f && np.drone_prob >= 0.80f &&
+                            np.fund_freq_hz >= 110.0f && np.fund_freq_hz <= 1000.0f) {
                             predator::FlickerDetectionResult res;
                             res.is_drone_detected = true;
                             res.fundamental_bpf_hz = np.fund_freq_hz;
@@ -1370,16 +1944,21 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+
+            // Reset sieve hit accumulators every 3 analysis cycles (~120ms) so slow hover blade chops (75-120 Hz)
+            // have sufficient window to accumulate periodic micro-sieve hits
+            if (s_frame_idx % 3 == 0) {
+                cuda_core.reset_sieve_hit_accumulators();
+            }
         }
 
         std::cout << "[INFO] Shutting down camera, IMU reader, and diagnostics logger...\n";
         g_running = false;
         g_diag_logger.stop();
         imu_reader.stop();
+        raw_pipeline.stop();
         g_frame_mgr.notify_all();
         g_stream_broadcaster.notify_all();
-
-        camera.stop();
 
         if (encoder_thread.joinable()) {
             encoder_thread.join();

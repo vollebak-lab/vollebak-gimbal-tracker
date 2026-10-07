@@ -64,9 +64,17 @@ target_link_libraries(test_cuda_flicker PRIVATE
     pthread
 )
 
+# Test suites rely on assert(). Release adds -DNDEBUG globally, which silently compiled every
+# assertion away (Phase 33.5 finding); keep -O3 but re-enable assertions for the test targets.
+foreach(test_target test_flicker_dsp test_ego_motion test_cuda_flicker)
+    target_compile_options(${test_target} PRIVATE -UNDEBUG)
+endforeach()
+
 # 7. Build Real-Time Propeller Flicker Detector Engine (with Ego-Motion Suppression & TensorRT FP16)
-add_executable(ev_flicker_detector ev_flicker_detector.cpp cuda_flicker_core.cu)
+add_executable(ev_flicker_detector ev_flicker_detector.cpp cuda_flicker_core.cu raw_pipeline.cu evt21_gpu_decoder.cu gpu_sieve.cu)
 target_link_libraries(ev_flicker_detector PRIVATE 
+    Metavision::HAL
+    Metavision::HAL_discovery
     MetavisionSDK::stream 
     MetavisionSDK::core
     ${OpenCV_LIBS}
@@ -76,6 +84,86 @@ target_link_libraries(ev_flicker_detector PRIVATE
     cudart
     pthread
 )
+# Build provenance: deploy script passes -DPREDATOR_BUILD_ID=<git>-<src sha256 prefix>
+set(PREDATOR_BUILD_ID "unstamped" CACHE STRING "Build provenance stamp (git rev + source hash)")
+target_compile_definitions(ev_flicker_detector PRIVATE PREDATOR_BUILD_ID="${PREDATOR_BUILD_ID}")
+
+# 7b. Phase 33.4b ingest microbenchmark (opt-in: `cmake --build . --target bench_ingest`).
+# Times OpenEB EVT3 decode, frame generation and ingest_event_batch per event, after verifying the
+# reference EVT3 encoder round-trips bit-exactly through OpenEB's decoder.
+find_package(MetavisionHAL REQUIRED)
+add_executable(bench_ingest EXCLUDE_FROM_ALL bench_ingest.cpp cuda_flicker_core.cu)
+target_link_libraries(bench_ingest PRIVATE
+    Metavision::HAL
+    MetavisionSDK::core
+    ${OpenCV_LIBS}
+    cufft
+    cudart
+    pthread
+)
+
+# 7c. Phase 33.4b EVT2.1 live capture + layout verification. Writes raw + OpenEB-decoded
+# fixtures used by the GPU decoder parity test and corpus recording tool.
+add_executable(evt21_capture evt21_capture.cpp)
+target_link_libraries(evt21_capture PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core pthread)
+
+# 7d. Phase 33.4b.b GPU EVT2.1 decoder parity test against OpenEB's EVT21LegacyDecoder. The synthetic suite
+# runs in the deploy script; `--fixture <prefix>` replays an evt21_capture recording and reports timing.
+add_executable(test_evt21_decoder test_evt21_decoder.cpp evt21_gpu_decoder.cu)
+target_link_libraries(test_evt21_decoder PRIVATE Metavision::HAL MetavisionSDK::core cudart pthread)
+target_compile_options(test_evt21_decoder PRIVATE -UNDEBUG)
+
+# 7e. Phase 33.7a Hot pixel mask unit tests and survey tool (IMX636 I_DigitalEventMask)
+add_executable(test_hot_pixel_mask test_hot_pixel_mask.cpp)
+target_link_libraries(test_hot_pixel_mask PRIVATE Metavision::HAL MetavisionSDK::core pthread)
+target_compile_options(test_hot_pixel_mask PRIVATE -UNDEBUG)
+
+add_executable(hot_pixel_survey EXCLUDE_FROM_ALL hot_pixel_survey.cpp)
+target_link_libraries(hot_pixel_survey PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core pthread)
+
+# 7f. Phase 33.4b.d GPU Micro-Neighborhood Periodicity Sieve parity test & benchmark
+add_executable(test_gpu_sieve test_gpu_sieve.cpp gpu_sieve.cu)
+target_link_libraries(test_gpu_sieve PRIVATE cudart pthread)
+target_compile_options(test_gpu_sieve PRIVATE -UNDEBUG)
+
+# 7g. Phase 33.4b.c Zero-CPU GPU-Resident Raw Tap Ingestion Pipeline parity & benchmark
+add_executable(test_raw_pipeline test_raw_pipeline.cpp raw_pipeline.cu evt21_gpu_decoder.cu gpu_sieve.cu cuda_flicker_core.cu)
+target_link_libraries(test_raw_pipeline PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core cufft cudart pthread)
+target_compile_options(test_raw_pipeline PRIVATE -UNDEBUG)
+
+# 7h. Phase 33.6a Preprocessing Parity Spectrum Dump Tool
+add_executable(dump_spectrum dump_spectrum.cpp cuda_flicker_core.cu)
+target_link_libraries(dump_spectrum PRIVATE MetavisionSDK::core cufft cudart pthread)
+
+# 7i. Phase 33.6c Real Orin Spectra Extractor
+add_executable(extract_real_spectra extract_real_spectra.cpp cuda_flicker_core.cu)
+target_link_libraries(extract_real_spectra PRIVATE MetavisionSDK::core cufft cudart pthread)
+
+# 7j. Phase 33.7b IMX636 Sensor Bias Optimization & Sweep Tool
+add_executable(bias_sweep bias_sweep.cpp)
+target_link_libraries(bias_sweep PRIVATE pthread)
+
+# 7k. Phase 33.8 Offline Replay & Corpus Evaluation Harness
+add_executable(replay_harness replay_harness.cpp cuda_flicker_core.cu raw_pipeline.cu evt21_gpu_decoder.cu gpu_sieve.cu)
+target_link_libraries(replay_harness PRIVATE 
+    Metavision::HAL
+    Metavision::HAL_discovery
+    MetavisionSDK::stream 
+    MetavisionSDK::core 
+    ${OpenCV_LIBS}
+    OpenMP::OpenMP_CXX
+    nvinfer
+    cufft
+    cudart
+    pthread
+)
+
+# 7l. Phase 33.8d Synthetic Standoff Corpus Generator
+add_executable(generate_corpus generate_corpus.cpp)
+target_link_libraries(generate_corpus PRIVATE pthread)
+
+
+
 
 # 8. Optional ONNX Runtime Ingestion Binary
 find_package(onnxruntime QUIET)

@@ -7,13 +7,13 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from .calibration import Calibration
 from .config import GimbalConfig, TrackingConfig
-from .control import SafeAngleController, clamp
+from .control import SafeAngleController
 from .drivers.base import GimbalDriver
 from .models import Angles, Detection
 
@@ -36,7 +36,7 @@ class AutonomousTrackerConfig:
     coast_timeout_s: float = 0.35
     park_after_s: float = 0.75
     laser_gpio: int = 17
-    laser_auto_engage: bool = True
+    laser_auto_engage: bool = False
     laser_max_continuous_s: float = 10.0
     command_hz: float = 50.0
 
@@ -67,7 +67,9 @@ class LaserHardwareInterface:
     def set_state(self, enabled: bool) -> None:
         with self._lock:
             if not self._pinctrl:
-                self._state = enabled
+                if enabled:
+                    LOGGER.error("Laser enable refused because pinctrl is unavailable")
+                self._state = False
                 return
             level = "dh" if enabled else "dl"
             try:

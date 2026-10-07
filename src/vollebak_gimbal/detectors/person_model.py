@@ -89,7 +89,7 @@ def decode_yolo_output(
         # If axis 0 is a known feature dimension (e.g. 5, 6, 84) and axis 1 is candidates
         tensor = tensor.T
 
-    n_candidates, channels = tensor.shape
+    _n_candidates, channels = tensor.shape
     if channels < 5:
         return []
 
@@ -244,7 +244,7 @@ class PersonModelDetector:
                 self._active_backend = "onnxruntime"
                 LOGGER.info("PersonModelDetector initialized with ONNX Runtime: %s", path_str)
                 return
-            except (ImportError, Exception) as exc:
+            except Exception as exc:  # noqa: BLE001 - backend libraries raise varied errors
                 LOGGER.warning("ONNX Runtime initialization failed (%s); falling back to cv2.dnn", exc)
 
         # Attempt OpenCV DNN
@@ -255,7 +255,7 @@ class PersonModelDetector:
                 self._net.setPreferableTarget(self.cv2.dnn.DNN_TARGET_CPU)
                 self._active_backend = "opencv"
                 LOGGER.info("PersonModelDetector initialized with OpenCV DNN: %s", path_str)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - OpenCV error types vary by build
                 LOGGER.error("Failed to load model with OpenCV DNN: %s", exc)
                 self._active_backend = "mock"
 

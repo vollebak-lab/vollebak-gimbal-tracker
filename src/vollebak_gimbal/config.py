@@ -67,6 +67,19 @@ class LaserTestConfig:
 
 
 @dataclass(slots=True)
+class AutonomousTrackerSettings:
+    enabled: bool = False
+    laser_auto_engage: bool = False
+    lock_tolerance_deg: float = 1.2
+    lock_consecutive_frames: int = 3
+    max_engagement_slew_dps: float = 25.0
+    laser_max_continuous_s: float = 10.0
+    coast_timeout_s: float = 0.35
+    park_after_s: float = 1.0
+    laser_gpio: int = 17
+
+
+@dataclass(slots=True)
 class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     event_camera: EventCameraConfig = field(default_factory=EventCameraConfig)
@@ -75,6 +88,9 @@ class AppConfig:
     gimbal: GimbalConfig = field(default_factory=GimbalConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     laser_test: LaserTestConfig = field(default_factory=LaserTestConfig)
+    autonomous_tracker: AutonomousTrackerSettings = field(
+        default_factory=AutonomousTrackerSettings
+    )
     config_dir: Path = field(default_factory=Path.cwd, repr=False)
 
     def resolve(self, value: str) -> Path:
@@ -106,6 +122,7 @@ def load_config(path: str | Path) -> AppConfig:
         gimbal=GimbalConfig(**_section(data, "gimbal")),
         tracking=TrackingConfig(**_section(data, "tracking")),
         laser_test=LaserTestConfig(**_section(data, "laser_test")),
+        autonomous_tracker=AutonomousTrackerSettings(**_section(data, "autonomous_tracker")),
         config_dir=config_path.parent,
     )
     _validate(config)
@@ -138,6 +155,17 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("laser_test.pulse_s must be between 0.02 and 0.1 seconds")
     if laser.cooldown_s < 1.0:
         raise ValueError("laser_test.cooldown_s must be at least 1 second")
+    autonomous = config.autonomous_tracker
+    if not (0 <= autonomous.laser_gpio <= 27):
+        raise ValueError("autonomous_tracker.laser_gpio must be a Raspberry Pi GPIO (0-27)")
+    if autonomous.lock_tolerance_deg <= 0 or autonomous.lock_consecutive_frames < 1:
+        raise ValueError("autonomous tracker lock settings must be positive")
+    if autonomous.max_engagement_slew_dps <= 0:
+        raise ValueError("autonomous_tracker.max_engagement_slew_dps must be positive")
+    if autonomous.laser_max_continuous_s <= 0:
+        raise ValueError("autonomous_tracker.laser_max_continuous_s must be positive")
+    if autonomous.coast_timeout_s < 0 or autonomous.park_after_s < autonomous.coast_timeout_s:
+        raise ValueError("autonomous tracker park_after_s must be >= coast_timeout_s")
     e = config.event_camera
     if not e.base_url.startswith(("http://", "https://")):
         raise ValueError("event_camera.base_url must be an HTTP(S) URL")

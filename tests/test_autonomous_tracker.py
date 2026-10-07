@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from vollebak_gimbal.autonomous_tracker import (
     AutonomousLaserTracker,
@@ -10,9 +9,9 @@ from vollebak_gimbal.autonomous_tracker import (
     TrackerState,
 )
 from vollebak_gimbal.calibration import Calibration
-from vollebak_gimbal.config import GimbalConfig, TrackingConfig
+from vollebak_gimbal.config import GimbalConfig, TrackingConfig, load_config
 from vollebak_gimbal.drivers.mock import MockGimbal
-from vollebak_gimbal.models import Angles, Detection
+from vollebak_gimbal.models import Detection
 
 
 class MockLaserHardware(LaserHardwareInterface):
@@ -80,40 +79,40 @@ def create_test_tracker(laser: MockLaserHardware | None = None) -> tuple[Autonom
 
 
 def test_tracker_initial_state():
-    tracker, laser, driver = create_test_tracker()
+    tracker, laser, _driver = create_test_tracker()
     assert tracker.state == TrackerState.SEARCHING
     assert laser.is_on is False
 
 
 def test_tracker_lock_and_laser_engagement():
-    tracker, laser, driver = create_test_tracker()
+    tracker, laser, _driver = create_test_tracker()
     t = 100.0
 
     # Person at center (320, 240) -> maps to (0.0, 0.0)
     det = Detection(x=280.0, y=200.0, width=80.0, height=80.0, custom_center=(320.0, 240.0))
 
     # Frame 1: Initial detection -> ACQUIRING, laser OFF
-    angles, state, laser_on = tracker.update(det, 640, 480, current_time=t)
+    _angles, state, laser_on = tracker.update(det, 640, 480, current_time=t)
     assert state == TrackerState.ACQUIRING
     assert laser_on is False
     assert laser.is_on is False
 
     # Frame 2: Still ACQUIRING (2 consecutive locks)
     t += 0.02
-    angles, state, laser_on = tracker.update(det, 640, 480, current_time=t)
+    _angles, state, laser_on = tracker.update(det, 640, 480, current_time=t)
     assert state == TrackerState.ACQUIRING
     assert laser_on is False
 
     # Frame 3: 3 consecutive locks reached -> LOCKED_ENGAGED, Laser fires!
     t += 0.02
-    angles, state, laser_on = tracker.update(det, 640, 480, current_time=t)
+    _angles, state, laser_on = tracker.update(det, 640, 480, current_time=t)
     assert state == TrackerState.LOCKED_ENGAGED
     assert laser_on is True
     assert laser.is_on is True
 
 
 def test_tracker_laser_failsafe_on_target_jump():
-    tracker, laser, driver = create_test_tracker()
+    tracker, laser, _driver = create_test_tracker()
     t = 100.0
 
     # Person at center
@@ -130,7 +129,7 @@ def test_tracker_laser_failsafe_on_target_jump():
     # Target suddenly jumps to x=500 -> maps to pan = +18 deg
     det_jump = Detection(x=460.0, y=200.0, width=80.0, height=80.0, custom_center=(500.0, 240.0))
     t += 0.02
-    angles, state, laser_on = tracker.update(det_jump, 640, 480, current_time=t)
+    _angles, state, laser_on = tracker.update(det_jump, 640, 480, current_time=t)
 
     # Laser must immediately drop to False!
     assert state == TrackerState.ACQUIRING
@@ -139,7 +138,7 @@ def test_tracker_laser_failsafe_on_target_jump():
 
 
 def test_tracker_coasting_and_parking():
-    tracker, laser, driver = create_test_tracker()
+    tracker, laser, _driver = create_test_tracker()
     t = 100.0
 
     det_center = Detection(x=280.0, y=200.0, width=80.0, height=80.0, custom_center=(320.0, 240.0))
@@ -150,24 +149,24 @@ def test_tracker_coasting_and_parking():
 
     # Target disappears
     t += 0.05
-    angles, state, laser_on = tracker.update(None, 640, 480, current_time=t)
+    _angles, state, laser_on = tracker.update(None, 640, 480, current_time=t)
     assert state == TrackerState.COASTING
     assert laser_on is False  # Immediately extinguished
     assert laser.is_on is False
 
     # After coast timeout (0.3s)
     t += 0.35
-    angles, state, laser_on = tracker.update(None, 640, 480, current_time=t)
+    _angles, state, laser_on = tracker.update(None, 640, 480, current_time=t)
     assert state == TrackerState.LOST
 
     # After park timeout (0.6s)
     t += 0.35
-    angles, state, laser_on = tracker.update(None, 640, 480, current_time=t)
+    _angles, state, laser_on = tracker.update(None, 640, 480, current_time=t)
     assert state == TrackerState.SEARCHING
 
 
 def test_tracker_laser_thermal_duration_cutoff():
-    tracker, laser, driver = create_test_tracker()
+    tracker, laser, _driver = create_test_tracker()
     t = 100.0
 
     det_center = Detection(x=280.0, y=200.0, width=80.0, height=80.0, custom_center=(320.0, 240.0))
@@ -179,14 +178,14 @@ def test_tracker_laser_thermal_duration_cutoff():
 
     # Advance beyond max continuous duration (5.0s)
     t += 5.1
-    angles, state, laser_on = tracker.update(det_center, 640, 480, current_time=t)
+    _angles, _state, laser_on = tracker.update(det_center, 640, 480, current_time=t)
     # Laser should cut off due to thermal/safety limit
     assert laser_on is False
     assert laser.is_on is False
 
 
 def test_tracker_emergency_stop():
-    tracker, laser, driver = create_test_tracker()
+    tracker, laser, _driver = create_test_tracker()
     t = 100.0
     det_center = Detection(x=280.0, y=200.0, width=80.0, height=80.0, custom_center=(320.0, 240.0))
     for _ in range(4):
@@ -197,3 +196,9 @@ def test_tracker_emergency_stop():
     tracker.emergency_stop()
     assert laser.is_on is False
     assert tracker.state == TrackerState.LOST
+
+
+def test_person_tracking_profile_keeps_automatic_laser_disabled():
+    config = load_config("config/pi.person_tracking.yaml")
+    assert config.autonomous_tracker.enabled is True
+    assert config.autonomous_tracker.laser_auto_engage is False

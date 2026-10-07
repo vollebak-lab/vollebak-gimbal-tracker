@@ -51,7 +51,7 @@ laser_test:
 
 autonomous_tracker:
   enabled: true
-  laser_auto_engage: true
+  laser_auto_engage: false
   lock_tolerance_deg: 1.2
   lock_consecutive_frames: 3
   max_engagement_slew_dps: 25.0

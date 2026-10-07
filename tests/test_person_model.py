@@ -8,7 +8,6 @@ from vollebak_gimbal.detectors.person_model import (
     compute_anatomical_com,
     decode_yolo_output,
 )
-from vollebak_gimbal.models import Detection
 
 
 def test_compute_anatomical_com_torso_chest():

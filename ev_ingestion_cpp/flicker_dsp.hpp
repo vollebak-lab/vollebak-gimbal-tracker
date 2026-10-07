@@ -215,7 +215,7 @@ public:
 class MicroNeighborhoodPeriodicitySieve {
 public:
     MicroNeighborhoodPeriodicitySieve(int width = 1280, int height = 720,
-                                      double min_freq_hz = 70.0, double max_freq_hz = 800.0,
+                                      double min_freq_hz = 110.0, double max_freq_hz = 800.0,
                                       uint8_t min_consecutive_hits = 2)
         : width_(width), height_(height),
           tile_w_((width + 1) / 2), tile_h_((height + 1) / 2),
@@ -237,9 +237,21 @@ public:
      * @return true if event is periodic within [min_freq_hz, max_freq_hz], false if aperiodic/clutter
      */
     inline bool is_periodic_event(int x, int y, uint64_t timestamp_us) {
+        return periodic_hits(x, y, timestamp_us) > 0;
+    }
+
+    /**
+     * @brief Same state machine as is_periodic_event(), but returns the tile's consecutive
+     *        periodic-hit count when the event is periodic (>= min_consecutive_hits), else 0.
+     *
+     * Events MUST be presented in non-decreasing timestamp order (OpenEB CD batches are
+     * time-ordered). This is why the sieve runs on the CPU: a parallel GPU evaluation
+     * scrambles per-tile ordering and made the hit counts race-dependent (Phase 33.4).
+     */
+    inline uint8_t periodic_hits(int x, int y, uint64_t timestamp_us) {
         int tx = x >> 1;
         int ty = y >> 1;
-        if (tx < 0 || tx >= tile_w_ || ty < 0 || ty >= tile_h_) return false;
+        if (tx < 0 || tx >= tile_w_ || ty < 0 || ty >= tile_h_) return 0;
 
         size_t idx = static_cast<size_t>(ty * tile_w_ + tx);
         uint32_t t_cur = static_cast<uint32_t>(timestamp_us);
@@ -249,7 +261,7 @@ public:
             last_timestamp_us_[idx] = t_cur;
             consecutive_hits_[idx] = 0;
             last_dt_us_[idx] = 0;
-            return false;
+            return 0;
         }
 
         uint32_t dt = t_cur - t_last;
@@ -258,9 +270,9 @@ public:
         if (dt < min_period_us_) {
             // If this tile has already achieved periodic lock, pass all events within the blade pass!
             if (consecutive_hits_[idx] >= min_consecutive_hits_) {
-                return true;
+                return consecutive_hits_[idx];
             }
-            return false;
+            return 0;
         }
 
         // 2. Inter-sweep recurrence (min_period <= dt <= max_period): a new periodic blade chop has arrived!
@@ -277,12 +289,12 @@ public:
                 if (h < 255) h++;
                 consecutive_hits_[idx] = h;
                 if (h >= min_consecutive_hits_) {
-                    return true;
+                    return h;
                 }
             } else {
                 consecutive_hits_[idx] = 1;
             }
-            return false;
+            return 0;
         }
 
         // 3. Cross-tile boundary check (in case blade tip crossed into adjacent 2x2 tile)
@@ -308,9 +320,9 @@ public:
                             last_dt_us_[idx] = static_cast<uint16_t>(std::min(ndt, (uint32_t)65535));
                             last_timestamp_us_[idx] = t_cur;
                             if (h >= min_consecutive_hits_) {
-                                return true;
+                                return h;
                             }
-                            return false;
+                            return 0;
                         }
                     }
                 }
@@ -321,7 +333,7 @@ public:
         last_timestamp_us_[idx] = t_cur;
         consecutive_hits_[idx] = 0;
         last_dt_us_[idx] = 0;
-        return false;
+        return 0;
     }
 
     void reset() {
@@ -819,13 +831,19 @@ public:
             if (cands.empty()) continue;
 
             double freq_hz = cands[0].fundamental_bpf_hz;
-            bool is_ac_carrier = (std::abs(freq_hz - 100.0) < 4.0) ||
-                                 (std::abs(freq_hz - 120.0) < 4.0) ||
-                                 (std::abs(freq_hz - 150.0) < 4.0) ||
-                                 (std::abs(freq_hz - 180.0) < 4.0) ||
-                                 (std::abs(freq_hz - 200.0) < 4.0) ||
-                                 (std::abs(freq_hz - 240.0) < 4.0) ||
-                                 (std::abs(freq_hz - 300.0) < 4.0);
+            bool is_ac_carrier = ((freq_hz >= 94.0 && freq_hz <= 106.0) ||   // 100 Hz band (50 Hz grid 2x)
+                                  (freq_hz >= 114.0 && freq_hz <= 130.0) ||  // 120 Hz band (60 Hz grid 2x)
+                                  (freq_hz >= 234.0 && freq_hz <= 256.0));  // 240 Hz band (60 Hz grid 4x / 120 Hz 2x)
+
+            auto get_coord = [](const FlickerDetectionResult& c, double& x, double& y) {
+                if (c.patch_x > 0 || c.patch_y > 0) {
+                    x = c.patch_x * 40.0 + 20.0;
+                    y = c.patch_y * 40.0 + 20.0;
+                } else {
+                    x = c.centroid_px_x;
+                    y = c.centroid_px_y;
+                }
+            };
 
             // Group candidates into spatial clusters (neighbors within 160px)
             std::vector<std::vector<FlickerDetectionResult>> clusters;
@@ -835,13 +853,17 @@ public:
                 if (visited[i]) continue;
                 visited[i] = true;
                 std::vector<FlickerDetectionResult> cluster = { cands[i] };
+                double xi, yi;
+                get_coord(cands[i], xi, yi);
 
                 for (size_t j = i + 1; j < cands.size(); ++j) {
                     if (visited[j]) continue;
-                    double dx = (cands[i].patch_x - cands[j].patch_x) * 40.0;
-                    double dy = (cands[i].patch_y - cands[j].patch_y) * 40.0;
+                    double xj, yj;
+                    get_coord(cands[j], xj, yj);
+                    double dx = xi - xj;
+                    double dy = yi - yj;
                     double dist = std::sqrt(dx * dx + dy * dy);
-                    if (dist <= 160.0) {
+                    if (dist <= 240.0) {
                         visited[j] = true;
                         cluster.push_back(cands[j]);
                     }
@@ -849,19 +871,45 @@ public:
                 clusters.push_back(cluster);
             }
 
-            // For each spatial cluster:
-            // 1. Suppress widespread AC powerline flutter (100/120/150/180/200/240/300 Hz across multiple locations)
-            // 2. Suppress isolated single-point AC powerline glints (cl.size() <= 2 on AC harmonic)
-            // 3. Suppress isolated single-cell diffuse flutter (cl.size() == 1 with low confidence)
-            // 4. Retain real localized multi-rotor drone clusters and high-confidence rotor hits
-            bool diffuse_flutter = (clusters.size() >= 5);
+            // Spatial Extent of All Candidates in this Frequency Bin
+            double min_x = 1e6, max_x = -1e6, min_y = 1e6, max_y = -1e6;
+            for (const auto& c : cands) {
+                double px, py;
+                get_coord(c, px, py);
+                min_x = std::min(min_x, px);
+                max_x = std::max(max_x, px);
+                min_y = std::min(min_y, py);
+                max_y = std::max(max_y, py);
+            }
+            double span_x = max_x - min_x;
+            double span_y = max_y - min_y;
+
+            // Sensor-wide diffuse carrier / wide-area foliage clutter rejection:
+            // On a 12mm lens, a heavy quadcopter (DJI Matrice 300, 895mm wheelbase) at 25-30ft standoff
+            // spans up to ~320-360px tip-to-tip across blade tips. Diffuse canopy sway and AC lighting
+            // span >= 500px across the sensor or form >= 5 disjoint spatial clusters.
+            bool is_sensor_wide_diffuse = (span_x > 450.0 || span_y > 380.0) || (clusters.size() >= 5);
+            if (is_sensor_wide_diffuse) {
+                continue; // Suppress sensor-wide diffuse carriers unconditionally
+            }
+
             for (const auto& cl : clusters) {
-                if (is_ac_carrier && (clusters.size() >= 2 || cl.size() <= 2)) {
-                    continue; // Suppress global AC mains lighting and single-point AC powerline glints
+                // Drone Signature Protection: periodic micro-sieve locked => retain
+                bool is_drone_signature = false;
+                for (const auto& c : cl) {
+                    if (c.max_sieve_hits >= 2) {
+                        is_drone_signature = true;
+                        break;
+                    }
                 }
+
+                if (is_ac_carrier && !is_drone_signature) {
+                    continue; // Suppress AC mains lighting, lamps, and powerline flicker unconditionally unless micro-sieve locked
+                }
+
                 // For extreme-range standoff targets (100m - 300m), all rotors fall into a single 40x40 cell (cl.size() == 1).
-                // Retain single-cell candidates if confirmed by low DDHF spectral flatness (gamma <= 0.18) or high confidence.
-                if (diffuse_flutter && cl.size() == 1 && cl[0].confidence < 0.70 && cl[0].spectral_flatness > 0.18) {
+                // Retain single-cell candidates if confirmed by drone signature, low DDHF spectral flatness (gamma <= 0.18) or high confidence.
+                if (cl.size() == 1 && !is_drone_signature && cl[0].confidence < 0.70 && cl[0].spectral_flatness > 0.18) {
                     continue; // Suppress isolated single-cell diffuse background noise
                 }
                 for (const auto& c : cl) {
@@ -882,6 +930,9 @@ public:
                 double sum_x = cluster.centroid_px_x * cluster.confidence;
                 double sum_y = cluster.centroid_px_y * cluster.confidence;
                 double max_snr = cluster.peak_snr_db;
+                float max_neural_prob = cluster.neural_drone_prob;
+                uint32_t max_sieve = cluster.max_sieve_hits;
+                bool any_neural = cluster.is_neural_detection;
                 int rotor_hits = 1;
 
                 for (size_t j = i + 1; j < localized_candidates.size(); ++j) {
@@ -892,13 +943,16 @@ public:
                     double dy = cluster.centroid_px_y - b.centroid_px_y;
                     double dist = std::sqrt(dx * dx + dy * dy);
 
-                    // Airframe cluster radius (140 pixels spans the full quadcopter frame at 15-60ft)
-                    if (dist < 140.0) {
+                    // Airframe cluster radius (240 pixels spans the full quadcopter frame at 15-60ft)
+                    if (dist < 240.0) {
                         merged[j] = true;
                         sum_x += b.centroid_px_x * b.confidence;
                         sum_y += b.centroid_px_y * b.confidence;
                         weight_sum += b.confidence;
                         max_snr = std::max(max_snr, b.peak_snr_db);
+                        max_neural_prob = std::max(max_neural_prob, b.neural_drone_prob);
+                        max_sieve = std::max(max_sieve, b.max_sieve_hits);
+                        any_neural |= b.is_neural_detection;
                         rotor_hits++;
                     }
                 }
@@ -908,6 +962,9 @@ public:
                     cluster.centroid_px_y = static_cast<int>(std::round(sum_y / weight_sum));
                 }
                 cluster.peak_snr_db = max_snr;
+                cluster.neural_drone_prob = max_neural_prob;
+                cluster.max_sieve_hits = max_sieve;
+                cluster.is_neural_detection = any_neural;
                 // Multi-rotor confidence fusion: combining signals across rotors elevates confidence
                 cluster.confidence = std::min(1.0, cluster.confidence + (rotor_hits - 1) * 0.18);
                 fused_results.push_back(cluster);
@@ -919,6 +976,7 @@ public:
 
     static void reset_tracker() {
         get_tracks().clear();
+        get_next_id() = 1;
     }
 
 private:
@@ -927,9 +985,14 @@ private:
         return s_tracks;
     }
 
+    static int& get_next_id() {
+        static int s_next_id = 1;
+        return s_next_id;
+    }
+
     static std::vector<FlickerDetectionResult> update_tracker(const std::vector<FlickerDetectionResult>& current_dets) {
         auto& s_tracks = get_tracks();
-        static int s_next_id = 1;
+        auto& s_next_id = get_next_id();
 
         const int M_HITS_FOR_CONFIRM = 3;  // Robust 3 frame confirmation
         const int MAX_COAST_FRAMES   = 5;  // Coast 5 frames (200ms) across sparse blade sweeps
@@ -975,7 +1038,21 @@ private:
                     assoc_gate_px = 220.0; // Expand to 5.1 degrees to maintain lock during fast camera tracking and hover drift
                 }
 
-                if (min_assoc_dist < assoc_gate_px && std::abs(track.last_detection.fundamental_bpf_hz - d.fundamental_bpf_hz) < 8.0) {
+                double f_track = track.last_detection.fundamental_bpf_hz;
+                double f_cand  = d.fundamental_bpf_hz;
+                bool freq_match = (std::abs(f_track - f_cand) < 18.0) ||
+                                  (std::abs(f_track - 2.0 * f_cand) < 18.0) ||
+                                  (std::abs(2.0 * f_track - f_cand) < 18.0) ||
+                                  (std::abs(f_track - 3.0 * f_cand) < 22.0) ||
+                                  (std::abs(3.0 * f_track - f_cand) < 22.0) ||
+                                  (std::abs(f_track - 4.0 * f_cand) < 28.0) ||
+                                  (std::abs(4.0 * f_track - f_cand) < 28.0) ||
+                                  (std::abs(f_track - 5.0 * f_cand) < 32.0) ||
+                                  (std::abs(5.0 * f_track - f_cand) < 32.0) ||
+                                  (std::abs(2.0 * f_track - 3.0 * f_cand) < 22.0) ||
+                                  (std::abs(3.0 * f_track - 2.0 * f_cand) < 22.0);
+
+                if (min_assoc_dist < assoc_gate_px && freq_match) {
                     if (min_assoc_dist < min_dist) {
                         min_dist = min_assoc_dist;
                         best_det_idx = i;
@@ -989,15 +1066,32 @@ private:
                 const auto& d = current_dets[best_det_idx];
 
                 // Update track state
+                double prev_bpf = track.last_detection.fundamental_bpf_hz;
                 track.last_detection = d;
+                // Preserve fundamental if current hit was a 2x/3x/4x/5x harmonic or 0.5x subharmonic
+                if (std::abs(2.0 * prev_bpf - d.fundamental_bpf_hz) < 18.0 ||
+                    std::abs(3.0 * prev_bpf - d.fundamental_bpf_hz) < 22.0 ||
+                    std::abs(4.0 * prev_bpf - d.fundamental_bpf_hz) < 28.0 ||
+                    std::abs(5.0 * prev_bpf - d.fundamental_bpf_hz) < 32.0 ||
+                    std::abs(0.5 * prev_bpf - d.fundamental_bpf_hz) < 18.0) {
+                    track.last_detection.fundamental_bpf_hz = prev_bpf;
+                    track.last_detection.estimated_rpm = (prev_bpf * 60.0) / 2.0;
+                } else if (std::abs(prev_bpf - 2.0 * d.fundamental_bpf_hz) < 18.0 ||
+                           std::abs(prev_bpf - 3.0 * d.fundamental_bpf_hz) < 22.0 ||
+                           std::abs(prev_bpf - 4.0 * d.fundamental_bpf_hz) < 28.0 ||
+                           std::abs(prev_bpf - 5.0 * d.fundamental_bpf_hz) < 32.0 ||
+                           std::abs(prev_bpf - 0.5 * d.fundamental_bpf_hz) < 18.0) {
+                    // Previous was higher harmonic or subharmonic, current is closer to fundamental
+                    track.last_detection.fundamental_bpf_hz = d.fundamental_bpf_hz;
+                    track.last_detection.estimated_rpm = (d.fundamental_bpf_hz * 60.0) / 2.0;
+                }
                 track.last_detection.track_id = track.track_id;
                 track.hit_count++;
                 track.miss_count = 0;
                 track.total_age++;
 
                 if (track.state == TrackState::TENTATIVE) {
-                    if (track.hit_count >= M_HITS_FOR_CONFIRM || 
-                        (track.hit_count >= 2 && (track.last_detection.peak_snr_db >= 10.0f || track.last_detection.is_neural_detection))) {
+                    if (track.hit_count >= M_HITS_FOR_CONFIRM) {
                         track.state = TrackState::CONFIRMED;
                     }
                 }
@@ -1049,10 +1143,10 @@ private:
         std::vector<Track> confirmed_tracks;
         for (const auto& t : s_tracks) {
             if (t.state == TrackState::CONFIRMED && t.last_detection.confidence >= 0.55) {
-                // Filter unreinforced optical border noise (X < 60 or X > 1220, Y < 40 or Y > 680)
+                // Filter unreinforced optical border noise (X < 80 or X > 1200, Y < 60 or Y > 660)
                 int cx = t.last_detection.centroid_px_x;
                 int cy = t.last_detection.centroid_px_y;
-                bool is_border = (cx < 60 || cx > 1220 || cy < 40 || cy > 680);
+                bool is_border = (cx < 80 || cx > 1200 || cy < 60 || cy > 660);
                 if (is_border && t.last_detection.confidence < 0.70) {
                     continue; // Suppress extreme edge noise
                 }

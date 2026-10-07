@@ -1,0 +1,3 @@
+# Predator deploy: allow the orin user to manage ONLY the detector service without a password.
+# Installed by install_sudoers.sh (validated with visudo -cf). Remove this file to revoke.
+orin ALL=(root) NOPASSWD: /usr/bin/systemctl restart predator-camera.service, /usr/bin/systemctl stop predator-camera.service, /usr/bin/systemctl start predator-camera.service, /usr/bin/systemctl status predator-camera.service

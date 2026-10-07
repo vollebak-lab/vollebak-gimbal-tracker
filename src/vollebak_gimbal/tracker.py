@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from .calibration import Calibration
 from .camera import OpenCVCamera, require_cv2
@@ -110,6 +111,10 @@ def run_autonomous_tracker(
     """Run closed-loop person center-of-mass detection and autonomous laser tracking."""
     from .autonomous_tracker import AutonomousLaserTracker, AutonomousTrackerConfig
 
+    settings = config.autonomous_tracker
+    if not settings.enabled:
+        raise RuntimeError("autonomous_tracker.enabled must be true to use auto-track")
+
     calibration_path = config.resolve(config.calibration.path)
     if not calibration_path.exists():
         raise RuntimeError(
@@ -120,10 +125,14 @@ def run_autonomous_tracker(
     driver = build_driver(config.gimbal)
 
     tracker_config = AutonomousTrackerConfig(
-        lock_tolerance_deg=float(config.tracking.deadband_deg or 1.2),
-        lock_consecutive_frames=3,
-        laser_auto_engage=True,
-        laser_max_continuous_s=10.0,
+        lock_tolerance_deg=settings.lock_tolerance_deg,
+        lock_consecutive_frames=settings.lock_consecutive_frames,
+        max_engagement_slew_dps=settings.max_engagement_slew_dps,
+        coast_timeout_s=settings.coast_timeout_s,
+        park_after_s=settings.park_after_s,
+        laser_gpio=settings.laser_gpio,
+        laser_auto_engage=settings.laser_auto_engage,
+        laser_max_continuous_s=settings.laser_max_continuous_s,
         command_hz=config.tracking.command_hz,
     )
     tracker = AutonomousLaserTracker(
