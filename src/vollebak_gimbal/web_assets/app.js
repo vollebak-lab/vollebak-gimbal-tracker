@@ -6,6 +6,7 @@ const ui = {
   target: $("targetValue"), calibration: $("calibrationValue"), mode: $("modeChip"),
   pan: $("panValue"), tilt: $("tiltValue"), panTrack: $("panTrack"), tiltTrack: $("tiltTrack"),
   panLimits: $("panLimits"), tiltLimits: $("tiltLimits"), tracking: $("trackingButton"),
+  laserTest: $("laserTestButton"),
   panRange: $("panRange"), tiltRange: $("tiltRange"), panOutput: $("panOutput"),
   tiltOutput: $("tiltOutput"), log: $("eventLog"), toast: $("toast"), cameraStage: $("cameraStage"),
   safetyMode: $("safetyMode"), l1Status: $("l1Status"), l1Sensor: $("l1Sensor"),
@@ -163,6 +164,12 @@ function updateUI(next) {
   ui.tilt.textContent = signed(next.tilt);
   ui.tracking.textContent = next.tracking_enabled ? "PAUSE TRACKING" : "START TRACKING";
   ui.tracking.classList.toggle("button-primary", next.tracking_enabled);
+  const laserTest = next.laser_test || {available: false, pulse_ms: 100, cooldown_remaining_s: 0};
+  const laserCoolingDown = Number(laserTest.cooldown_remaining_s) > 0;
+  ui.laserTest.disabled = !laserTest.available || next.tracking_enabled || laserCoolingDown;
+  ui.laserTest.textContent = laserCoolingDown
+    ? `LASER COOLDOWN · ${Number(laserTest.cooldown_remaining_s).toFixed(1)} S`
+    : `LASER TEST PULSE · ${(Number(laserTest.pulse_ms) / 1000).toFixed(1)} S`;
 
   const limits = next.limits;
   const panPercent = 100 * (next.pan - limits.pan_min) / (limits.pan_max - limits.pan_min);
@@ -262,6 +269,20 @@ ui.tracking.addEventListener("click", async () => {
 $("homeButton").addEventListener("click", async () => {
   try { updateUI(await api("/api/home")); addLog("Return-to-home command sent"); }
   catch (error) { showToast(error.message); }
+});
+
+ui.laserTest.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "Confirm the beam is terminated by a matte nonreflective stop and the path is clear. Fire one 0.1 second test pulse?"
+  );
+  if (!confirmed) return;
+  ui.laserTest.disabled = true;
+  try {
+    updateUI(await api("/api/laser-test/pulse"));
+    addLog("Laser test pulse complete; output OFF");
+  } catch (error) {
+    showToast(error.message);
+  }
 });
 
 $("centerButton").addEventListener("click", async () => {

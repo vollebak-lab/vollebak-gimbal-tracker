@@ -22,6 +22,7 @@ from .control import SafeAngleController, clamp
 from .detectors import build_detector
 from .drivers import build_driver
 from .event_camera import EventCameraMonitor, primary_event_target
+from .laser_test import LaserTestController
 from .models import Angles, Detection
 from .predator_observer import build_observer_telemetry
 from .tracker import choose_target
@@ -81,6 +82,7 @@ class DashboardEngine:
         self.cv2 = require_cv2()
         self.detector = build_detector(config.detector)
         self.event_camera = EventCameraMonitor(config.event_camera)
+        self.laser_test = LaserTestController(config.laser_test)
         self.driver = build_driver(config.gimbal)
         self.controller = SafeAngleController(config.gimbal, config.tracking)
         self.controller.reset(Angles(config.gimbal.home_pan, config.gimbal.home_tilt))
@@ -114,6 +116,7 @@ class DashboardEngine:
             "calibrated": self.calibration is not None,
             "message": "",
             "event_camera": initial_event_camera,
+            "laser_test": self.laser_test.snapshot(),
             "limits": {
                 "pan_min": config.gimbal.pan_min,
                 "pan_max": config.gimbal.pan_max,
@@ -145,10 +148,12 @@ class DashboardEngine:
         if self._thread:
             self._thread.join(timeout=3.0)
         self.event_camera.close()
+        self.laser_test.force_off()
         self.driver.close()
 
     def state(self) -> dict[str, Any]:
         with self._lock:
+            self._state["laser_test"] = self.laser_test.snapshot()
             return json.loads(json.dumps(self._state))
 
     def wait_for_frame(self, previous_id: int, timeout: float = 2.0) -> tuple[int, bytes | None]:
@@ -162,10 +167,20 @@ class DashboardEngine:
         with self._lock:
             if enabled and self.calibration is None:
                 raise ValueError("Tracking requires a saved camera calibration")
+            if enabled:
+                self.laser_test.force_off()
             self._tracking_enabled = enabled
             self._state["tracking_enabled"] = enabled
             self._state["status"] = "SEARCHING" if enabled else "PAUSED"
             self._state["message"] = "Automatic tracking enabled" if enabled else "Manual mode"
+
+    def pulse_laser_test(self) -> None:
+        with self._lock:
+            if self._tracking_enabled:
+                raise ValueError("Pause tracking before using the laser test pulse")
+            self.laser_test.pulse()
+            self._state["laser_test"] = self.laser_test.snapshot()
+            self._state["message"] = "Laser test pulse complete; output forced OFF"
 
     def move(self, pan: float, tilt: float) -> Angles:
         angles = Angles(
@@ -490,12 +505,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.engine.home()
             elif path == "/api/point":
                 self.engine.point(float(body["x"]), float(body["y"]))
+            elif path == "/api/laser-test/pulse":
+                self.engine.pulse_laser_test()
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return
             self._json(HTTPStatus.OK, self.engine.state())
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except RuntimeError as exc:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
 
     def _asset(self, name: str, content_type: str) -> None:
         payload = files("vollebak_gimbal").joinpath("web_assets", name).read_bytes()

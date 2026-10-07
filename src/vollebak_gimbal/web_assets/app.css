@@ -209,7 +209,13 @@ h2 { margin-top: 6px; font-size: 18px; font-weight: 500; }
 .button:hover, .manual-grid button:hover { border-color: var(--acid); color: var(--acid); background: var(--acid-soft); }
 .button-primary { color: #06100b; border-color: var(--acid); background: var(--acid); }
 .button-primary:hover { color: #06100b; background: #79ffc6; }
+.button:disabled { cursor: not-allowed; opacity: 0.38; }
+.button-danger { color: var(--danger); border-color: rgba(255, 123, 123, 0.58); }
+.button-danger:hover:not(:disabled) { color: #160606; border-color: var(--danger); background: var(--danger); }
 .button-wide { width: calc(100% - 32px); margin: 0 16px 15px; }
+.laser-test-control { margin: 0 16px 16px; }
+.laser-test-control .button { width: 100%; }
+.laser-test-control small { display: block; margin-top: 7px; color: var(--warning); font: 600 8px/1.35 monospace; letter-spacing: 0.08em; }
 
 .manual-grid { width: 164px; display: grid; grid-template-columns: repeat(3, 48px); gap: 7px; margin: 4px auto 18px; }
 .manual-grid button { min-height: 46px; font-size: 18px; }

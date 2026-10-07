@@ -48,6 +48,12 @@ tracking:
   lost_hold_s: 0.35
   park_after_s: 0.75
 
+laser_test:
+  enabled: false             # Provisioned operators must explicitly opt into test pulses.
+  gpio: 17
+  pulse_s: 0.1
+  cooldown_s: 2.0
+
 web:
   host: 0.0.0.0
   port: 8080

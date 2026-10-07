@@ -48,3 +48,9 @@ tracking:
   max_step_deg: 4.0
   lost_hold_s: 1.0
   park_after_s: 5.0
+
+laser_test:
+  enabled: false             # Enable only for a physically armed, fixed-board test setup.
+  gpio: 17
+  pulse_s: 0.1              # Hard-limited to 100 ms maximum by configuration validation.
+  cooldown_s: 2.0

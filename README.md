@@ -95,7 +95,9 @@ tests/                     Pi tests plus Bart's 48-test Python suite
 
 ## Safety boundary
 
-`config/predator_system.yaml` is the active integration policy and fixes the runtime to observation-only. The dashboard health response and telemetry both report `engagement_enabled: false`. The app has no laser, firing, scanning, or engagement API. Bart's upstream engagement-oriented source is retained for provenance and analysis but is not imported by the Pi application.
+`config/predator_system.yaml` is the active integration policy and fixes the runtime to observation-only. The dashboard health response and telemetry both report `engagement_enabled: false`. The app has no target-linked laser, firing, scanning, or engagement API. Bart's upstream engagement-oriented source is retained for provenance and analysis but is not imported by the Pi application.
+
+An optional bench-only laser alignment diagnostic is disabled by default. When explicitly enabled in the Pi configuration, it provides a single operator-confirmed pulse capped at 100 ms, enforces a two-second cooldown, refuses requests while tracking is active, and forces the GPIO output low at startup, tracking activation, and shutdown. It requires a physical arm switch and a fixed matte beam stop; it is never activated by target detection.
 
 Bart's original system config and README are preserved as `config/predator_system.upstream.yaml` and `docs/upstream/bart-README.md`; neither is loaded by the Pi application.
 

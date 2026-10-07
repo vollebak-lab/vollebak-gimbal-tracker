@@ -59,6 +59,14 @@ class TrackingConfig:
 
 
 @dataclass(slots=True)
+class LaserTestConfig:
+    enabled: bool = False
+    gpio: int = 17
+    pulse_s: float = 0.1
+    cooldown_s: float = 2.0
+
+
+@dataclass(slots=True)
 class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     event_camera: EventCameraConfig = field(default_factory=EventCameraConfig)
@@ -66,6 +74,7 @@ class AppConfig:
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     gimbal: GimbalConfig = field(default_factory=GimbalConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
+    laser_test: LaserTestConfig = field(default_factory=LaserTestConfig)
     config_dir: Path = field(default_factory=Path.cwd, repr=False)
 
     def resolve(self, value: str) -> Path:
@@ -96,6 +105,7 @@ def load_config(path: str | Path) -> AppConfig:
         calibration=CalibrationConfig(**_section(data, "calibration")),
         gimbal=GimbalConfig(**_section(data, "gimbal")),
         tracking=TrackingConfig(**_section(data, "tracking")),
+        laser_test=LaserTestConfig(**_section(data, "laser_test")),
         config_dir=config_path.parent,
     )
     _validate(config)
@@ -121,6 +131,13 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("command_hz and max_step_deg must be positive")
     if t.park_after_s < t.lost_hold_s:
         raise ValueError("park_after_s must be >= lost_hold_s")
+    laser = config.laser_test
+    if not (0 <= laser.gpio <= 27):
+        raise ValueError("laser_test.gpio must be a Raspberry Pi header GPIO (0-27)")
+    if not (0.02 <= laser.pulse_s <= 0.1):
+        raise ValueError("laser_test.pulse_s must be between 0.02 and 0.1 seconds")
+    if laser.cooldown_s < 1.0:
+        raise ValueError("laser_test.cooldown_s must be at least 1 second")
     e = config.event_camera
     if not e.base_url.startswith(("http://", "https://")):
         raise ValueError("event_camera.base_url must be an HTTP(S) URL")
