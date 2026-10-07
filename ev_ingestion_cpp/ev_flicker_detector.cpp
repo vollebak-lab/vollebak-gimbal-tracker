@@ -28,8 +28,11 @@
 
 #include <metavision/sdk/stream/camera.h>
 #include <metavision/sdk/base/events/event_cd.h>
-#include <metavision/sdk/core/algorithms/periodic_frame_generation_algorithm.h>
-#include <metavision/sdk/core/utils/colors.h>
+#include <metavision/hal/device/device.h>
+#include <metavision/hal/device/device_discovery.h>
+#include <metavision/hal/utils/device_config.h>
+#include <metavision/hal/facilities/i_hw_identification.h>
+#include <metavision/hal/facilities/i_events_stream.h>
 #include <metavision/hal/facilities/i_ll_biases.h>
 #include <opencv2/opencv.hpp>
 
@@ -38,10 +41,14 @@
 #include "spectral_combnet_trt.hpp"
 #include "cuda_flicker_core.cuh"
 #include "hot_pixel_mask.hpp"
+#include "raw_pipeline.cuh"
 #include <omp.h>
 
 // Global shutdown flag
 static std::atomic<bool> g_running{true};
+
+// Demand-gated UI JPEG compression activity timestamp (Phase 33.4b.e)
+static std::atomic<uint64_t> g_last_client_request_ms{0};
 
 // Hardware pixel masking telemetry state (Phase 33.7a)
 static bool g_hardware_mask_applied = false;
@@ -431,6 +438,11 @@ public:
         ego_stats_ = stats;
     }
 
+    void update_raw_stats(const predator::RawPipelineStats& stats) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        raw_stats_ = stats;
+    }
+
     std::vector<predator::FlickerDetectionResult> get_detections() {
         std::lock_guard<std::mutex> lock(mutex_);
         return active_detections_;
@@ -502,6 +514,19 @@ public:
            << "    \"last_encode_us\": " << ui_stats_.last_encode_us << ",\n"
            << "    \"avg_encode_us\": " << ui_stats_.avg_encode_us << "\n"
            << "  },\n"
+           << "  \"raw_pipeline\": {\n"
+           << "    \"total_usb_buffers\": " << raw_stats_.total_usb_buffers << ",\n"
+           << "    \"total_raw_words\": " << raw_stats_.total_raw_words << ",\n"
+           << "    \"total_decoded_events\": " << raw_stats_.total_decoded_events << ",\n"
+           << "    \"total_retained_events\": " << raw_stats_.total_retained_events << ",\n"
+           << "    \"dropped_buffers\": " << raw_stats_.dropped_buffers << ",\n"
+           << "    \"ring_overruns\": " << raw_stats_.ring_overruns << ",\n"
+           << "    \"last_batch_words\": " << raw_stats_.last_batch_words << ",\n"
+           << "    \"last_batch_events\": " << raw_stats_.last_batch_events << ",\n"
+           << "    \"last_gpu_decode_us\": " << raw_stats_.last_gpu_decode_us << ",\n"
+           << "    \"last_gpu_sieve_us\": " << raw_stats_.last_gpu_sieve_us << ",\n"
+           << "    \"last_gpu_ingest_us\": " << raw_stats_.last_gpu_ingest_us << "\n"
+           << "  },\n"
            << "  \"num_targets\": " << active_detections_.size() << ",\n"
            << "  \"num_tracks\": " << all_tracks_.size() << ",\n"
            << "  \"tracks\": [\n";
@@ -551,6 +576,7 @@ private:
     predator::RoiDiagnostics roi_diag_;
     EgoMotionStats ego_stats_;
     UiEncoderStats ui_stats_;
+    predator::RawPipelineStats raw_stats_;
 };
 
 static DetectionManager g_detection_mgr;
@@ -565,6 +591,14 @@ void display_encoder_thread_func(int width, int height) {
 
     while (g_running) {
         if (g_frame_mgr.wait_for_frame(frame, 30)) {
+            // Demand-gated UI JPEG compression (Phase 33.4b.e): only draw HUD and compress JPEG when active clients are connected
+            uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            bool client_active = (now_ms - g_last_client_request_ms.load(std::memory_order_relaxed)) < 2500;
+            if (!client_active) {
+                continue;
+            }
+
             auto t0 = std::chrono::steady_clock::now();
             auto all_tracks = g_detection_mgr.get_all_tracks();
             auto active_dets = g_detection_mgr.get_detections();
@@ -925,6 +959,16 @@ void handle_http_client(int client_fd) {
     buffer[bytes_read] = '\0';
     std::string request(buffer);
 
+    // Record visual streaming request activity for demand-gated encoding (Phase 33.4b.e)
+    if (request.find("/frame.jpg") != std::string::npos ||
+        request.find("/stream.mjpg") != std::string::npos ||
+        request.find("GET / ") != std::string::npos ||
+        request.find("GET /index.html") != std::string::npos) {
+        uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        g_last_client_request_ms.store(now_ms, std::memory_order_relaxed);
+    }
+
     if (request.find("/frame.jpg") != std::string::npos) {
         std::vector<uchar> jpeg_data;
         if (g_stream_broadcaster.get_latest_frame(jpeg_data)) {
@@ -1098,16 +1142,26 @@ int main(int argc, char* argv[]) {
     std::cout << "========================================================\n";
 
     try {
-        std::cout << "[INFO] Opening Metavision Event Camera...\n";
-        Metavision::Camera camera = Metavision::Camera::from_first_available();
+        std::cout << "[INFO] Opening Metavision Event Camera with EVT21 format...\n";
+        Metavision::DeviceConfig dev_cfg;
+        dev_cfg.set_format("EVT21");
+        std::unique_ptr<Metavision::Device> device = Metavision::DeviceDiscovery::open("", dev_cfg);
+        if (!device) {
+            throw std::runtime_error("No Metavision event camera found");
+        }
 
-        int width = camera.geometry().get_width();
-        int height = camera.geometry().get_height();
-        std::cout << "[INFO] Camera initialized! Resolution: " << width << " x " << height << "\n";
+        auto* hwid = device->get_facility<Metavision::I_HW_Identification>();
+        std::string cam_serial = hwid ? hwid->get_serial() : "unknown";
+        std::string cam_format = hwid ? hwid->get_current_data_encoding_format() : "unknown";
+
+        const int width = 1280;
+        const int height = 720;
+        std::cout << "[INFO] Camera initialized! Serial: " << cam_serial << ", Format: " << cam_format 
+                  << ", Resolution: " << width << " x " << height << "\n";
 
         // Configure IMX636 Sensor Biases for 12mm f/2.5 Optics (Adaptive Shade & Solar Flux Tuning)
         try {
-            auto *biases = camera.get_device().get_facility<Metavision::I_LL_Biases>();
+            auto *biases = device->get_facility<Metavision::I_LL_Biases>();
             if (biases) {
                 // Support environment overrides for shade or high-flux tuning (defaults: diff_on=6, diff_off=6 for 80-115ft sensitivity)
                 int diff_on = 6;
@@ -1148,7 +1202,7 @@ int main(int argc, char* argv[]) {
                 for (const auto& w : parse_res.warnings) {
                     std::cout << "[WARN] Hot pixel mask: " << w << "\n";
                 }
-                auto mask_status = predator::apply_hardware_pixel_mask(camera.get_device(), parse_res.pixels);
+                auto mask_status = predator::apply_hardware_pixel_mask(*device, parse_res.pixels);
                 std::cout << "[INFO] " << mask_status.message << "\n";
                 if (mask_status.applied) {
                     g_hardware_mask_applied = true;
@@ -1220,69 +1274,54 @@ int main(int argc, char* argv[]) {
                   << ", CombNet-Prune=" << (g_combnet_prune_enabled ? "ON" : "OFF")
                   << ", Pure Frequency-Domain Harmonic Pipeline Active.\n";
 
-        std::atomic<uint64_t> total_raw_counter{0};
-        std::atomic<uint64_t> retained_counter{0};
-        std::atomic<uint64_t> current_epoch_ref_us{0};
+        // Zero-CPU GPU-Resident Raw Tap Ingestion Pipeline (Phase 33.4b.c)
+        predator::RawPipelineConfig pipe_cfg;
+        pipe_cfg.sensor_width = width;
+        pipe_cfg.sensor_height = height;
+        pipe_cfg.enable_ego_warp = enable_ego_warp;
+        pipe_cfg.enable_ui_frame_gen = true;
+        pipe_cfg.ui_fps = 30.0;
 
-        // Visual frame generation for UI (30 FPS)
-        Metavision::PeriodicFrameGenerationAlgorithm frame_gen(width, height, 25000, 30.0, Metavision::ColorPalette::Dark);
+        predator::RawPipeline raw_pipeline(pipe_cfg, cuda_core, gyro_warper);
+        raw_pipeline.connect_device(device.get());
 
-        frame_gen.set_output_callback([&](Metavision::timestamp ts, cv::Mat& frame) {
-            g_frame_mgr.push_frame(frame);
+        // Connect synthesized GPU UI frame callback (Phase 33.4b.e)
+        raw_pipeline.set_frame_callback([&](const uint8_t* gray_data, int w, int h, uint64_t ts) {
+            cv::Mat gray(h, w, CV_8UC1, const_cast<uint8_t*>(gray_data));
+            cv::Mat bgr;
+            cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
+            g_frame_mgr.push_frame(bgr);
         });
 
         // Start background display & JPEG encoder thread
         std::thread encoder_thread(display_encoder_thread_func, width, height);
 
-        // Fast CD callback: direct GPU batch ingestion with continuous Ego-Motion Stabilization
-        camera.cd().add_callback([&](const Metavision::EventCD* begin, const Metavision::EventCD* end) {
-            if (begin == end) return;
-            size_t batch_size = std::distance(begin, end);
-
-            uint64_t host_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            gyro_warper.update_camera_time_anchor(begin->t, host_now_us);
-
-            frame_gen.process_events(begin, end);
-
-            uint64_t t_ref = current_epoch_ref_us.load();
-            if (t_ref == 0) {
-                t_ref = begin->t;
-                current_epoch_ref_us.store(t_ref);
-            }
-
-            predator::Matrix3x3 batch_H = predator::Matrix3x3::identity();
-            if (enable_ego_warp) {
-                uint64_t mid_t = (begin->t + (end - 1)->t) / 2;
-                batch_H = gyro_warper.compute_homography(t_ref, mid_t);
-            }
-
-            // Direct GPU Ingestion, Homography Warping, SAE Sieve, and Ring Buffer Accumulation
-            uint64_t raw_count = 0;
-            uint64_t retained_count = 0;
-            cuda_core.ingest_event_batch(begin, batch_size, batch_H, raw_count, retained_count,
-                                         nullptr, 0.35f, false);
-
-            total_raw_counter.fetch_add(raw_count, std::memory_order_relaxed);
-        });
-
         // Launch HTTP Server
         std::thread server_thread(http_server_thread_func, port);
 
-        camera.start();
-        std::cout << "[INFO] Real-time propeller flicker detector active with CUDA acceleration & ego-motion compensation.\n";
+        raw_pipeline.start();
+        std::cout << "[INFO] Real-time propeller flicker detector active with Zero-CPU Raw Tap & GPU pipeline.\n";
 
         // Main analysis loop: 25 Hz deterministic analysis cycle with precision monotonic cadence timer
         auto next_cycle_epoch = std::chrono::steady_clock::now();
         const auto cycle_interval = std::chrono::milliseconds(40);
 
-        while (g_running && camera.is_running()) {
+        uint64_t last_total_decoded = 0;
+        uint64_t last_total_retained = 0;
+        std::atomic<uint64_t> current_epoch_ref_us{0};
+        while (g_running && raw_pipeline.is_running()) {
             next_cycle_epoch += cycle_interval;
 
             // 2. Snapshot metrics
-            uint64_t total_events = total_raw_counter.exchange(0);
-            uint64_t retained_events = cuda_core.get_and_reset_retained_count();
+            uint64_t current_decoded = raw_pipeline.total_decoded_events();
+            uint64_t total_events = (current_decoded >= last_total_decoded) ? (current_decoded - last_total_decoded) : current_decoded;
+            last_total_decoded = current_decoded;
+            uint64_t current_retained = raw_pipeline.total_retained_events();
+            uint64_t retained_events = (current_retained >= last_total_retained) ? (current_retained - last_total_retained) : current_retained;
+            last_total_retained = current_retained;
             double suppressed_pct = (total_events > 0) ? (100.0 * (1.0 - (static_cast<double>(retained_events) / total_events))) : 0.0;
+
+            g_detection_mgr.update_raw_stats(raw_pipeline.get_stats());
 
             predator::Vector3d omega = gyro_warper.get_latest_angular_velocity();
             double gyro_speed_deg_s = std::sqrt(omega.x * omega.x + omega.y * omega.y + omega.z * omega.z) * (180.0 / M_PI);
@@ -1310,6 +1349,10 @@ int main(int argc, char* argv[]) {
             uint64_t t_now_host = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             uint64_t t_now_cam = gyro_warper.host_to_camera_time(t_now_host);
+            if (t_anchor == 0 && t_now_cam > 0) {
+                current_epoch_ref_us.store(t_now_cam);
+                t_anchor = t_now_cam;
+            }
 
             predator::Matrix3x3 H_world_to_cam = (t_now_cam > 0 && t_anchor > 0) ?
                 gyro_warper.compute_forward_homography(t_anchor, t_now_cam) : predator::Matrix3x3::identity();
@@ -1577,10 +1620,9 @@ int main(int argc, char* argv[]) {
         g_running = false;
         g_diag_logger.stop();
         imu_reader.stop();
+        raw_pipeline.stop();
         g_frame_mgr.notify_all();
         g_stream_broadcaster.notify_all();
-
-        camera.stop();
 
         if (encoder_thread.joinable()) {
             encoder_thread.join();

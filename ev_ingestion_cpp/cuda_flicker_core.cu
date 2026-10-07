@@ -482,6 +482,53 @@ void CudaFlickerCore::ingest_event_batch(const void* events, size_t count, const
     }
 }
 
+void CudaFlickerCore::ingest_device_events(
+    const CudaRawEvent* d_events,
+    size_t count,
+    const Matrix3x3& H,
+    uint64_t min_t,
+    uint64_t max_t,
+    cudaStream_t stream,
+    const float* d_suppression_mask,
+    float suppression_threshold)
+{
+    if (count == 0 || d_events == nullptr) return;
+    cudaStream_t s = stream ? stream : stream_;
+
+    // 1. Homography matrix (pageable source: copied before cudaMemcpyAsync returns)
+    float h_mat[9];
+    for (int i = 0; i < 9; ++i) h_mat[i] = static_cast<float>(H.m[i]);
+    CUDA_CHECK(cudaMemcpyAsync(d_homography_matrix_, h_mat, 9 * sizeof(float), cudaMemcpyHostToDevice, s));
+
+    // 2. Window alignment: advance temporal ring buffer bins up to max_t
+    if (!window_anchored_) {
+        current_window_start_us_ = (min_t / bin_duration_us_) * bin_duration_us_;
+        window_anchored_ = true;
+    }
+    if (max_t >= current_window_start_us_ + bin_duration_us_) {
+        uint64_t elapsed_us = max_t - current_window_start_us_;
+        uint64_t steps = elapsed_us / bin_duration_us_;
+        if (steps >= history_samples_) {
+            steps = history_samples_;
+            current_window_start_us_ = (max_t / bin_duration_us_) * bin_duration_us_;
+        } else {
+            current_window_start_us_ += steps * bin_duration_us_;
+        }
+        advance_temporal_bins(steps);
+    }
+
+    // 3. Launch accumulation kernel directly on device events
+    int threads = 256;
+    int blocks = (static_cast<int>(count) + threads - 1) / threads;
+    kernel_warp_sieve_ingest<<<blocks, threads, 0, s>>>(
+        d_events, static_cast<int>(count), d_homography_matrix_,
+        d_suppression_mask, suppression_threshold,
+        sensor_width_, sensor_height_,
+        d_ring_buffers_, d_cell_total_events_, d_cell_max_sieve_hits_,
+        head_idx_, current_window_start_us_, static_cast<uint32_t>(bin_duration_us_));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void CudaFlickerCore::set_spectral_gate_config(const SpectralGateConfig& cfg) {
     gate_cfg_ = derive_spectral_gate(cfg, sample_rate_hz_, static_cast<int>(history_samples_), num_total_cells_);
 }
@@ -677,6 +724,11 @@ void CudaFlickerCore::get_active_cells_with_spectra(
             spec[k] = std::log10(1.0f + spec[k] / median_noise);
         }
     }
+}
+
+void CudaFlickerCore::get_cell_total_events(std::vector<float>& out_totals) {
+    out_totals.resize(num_total_cells_);
+    CUDA_CHECK(cudaMemcpy(out_totals.data(), d_cell_total_events_, num_total_cells_ * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 } // namespace predator

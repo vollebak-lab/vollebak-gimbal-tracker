@@ -78,6 +78,33 @@ public:
                             bool sync = false);
 
     /**
+     * @brief Ingests device-resident events (Phase 33.4b.c).
+     * Events have already been decoded and periodic hits evaluated into CudaRawEvent::pad on the GPU.
+     * Advances temporal window up to max_t, applies homography H and optional suppression mask,
+     * and accumulates into cuFFT ring buffers on device stream.
+     *
+     * @param d_events Pointer to device array of CudaRawEvent
+     * @param count Number of events in batch
+     * @param H Homography matrix
+     * @param min_t Minimum event timestamp in batch (us)
+     * @param max_t Maximum event timestamp in batch (us)
+     * @param stream CUDA stream (defaults to internal stream_ if null)
+     * @param d_suppression_mask Optional TensorRT suppression mask on device
+     * @param suppression_threshold Suppression threshold
+     */
+    void ingest_device_events(
+        const CudaRawEvent* d_events,
+        size_t count,
+        const Matrix3x3& H,
+        uint64_t min_t,
+        uint64_t max_t,
+        cudaStream_t stream = nullptr,
+        const float* d_suppression_mask = nullptr,
+        float suppression_threshold = 0.35f);
+
+    cudaStream_t stream() const { return stream_; }
+
+    /**
      * @brief Asynchronously fetches accumulated retained event count from GPU and resets device counter
      */
     uint64_t get_and_reset_retained_count();
@@ -120,6 +147,11 @@ public:
      * @brief Computes detailed diagnostic statistics for a spatial ROI (columns [col_min..col_max], rows [row_min..row_max])
      */
     RoiDiagnostics get_roi_diagnostics(int col_min, int col_max, int row_min, int row_max);
+
+    /**
+     * @brief Reads back current total event counts across all 1152 cells (for testing & parity verification)
+     */
+    void get_cell_total_events(std::vector<float>& out_totals);
 
     /**
      * @brief Fetches active candidate cells and their 257-bin log-normalized power spectra for SpectralCombNet

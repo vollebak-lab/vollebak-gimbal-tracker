@@ -71,8 +71,10 @@ foreach(test_target test_flicker_dsp test_ego_motion test_cuda_flicker)
 endforeach()
 
 # 7. Build Real-Time Propeller Flicker Detector Engine (with Ego-Motion Suppression & TensorRT FP16)
-add_executable(ev_flicker_detector ev_flicker_detector.cpp cuda_flicker_core.cu)
+add_executable(ev_flicker_detector ev_flicker_detector.cpp cuda_flicker_core.cu raw_pipeline.cu evt21_gpu_decoder.cu gpu_sieve.cu)
 target_link_libraries(ev_flicker_detector PRIVATE 
+    Metavision::HAL
+    Metavision::HAL_discovery
     MetavisionSDK::stream 
     MetavisionSDK::core
     ${OpenCV_LIBS}
@@ -123,6 +125,11 @@ target_link_libraries(hot_pixel_survey PRIVATE Metavision::HAL Metavision::HAL_d
 add_executable(test_gpu_sieve test_gpu_sieve.cpp gpu_sieve.cu)
 target_link_libraries(test_gpu_sieve PRIVATE cudart pthread)
 target_compile_options(test_gpu_sieve PRIVATE -UNDEBUG)
+
+# 7g. Phase 33.4b.c Zero-CPU GPU-Resident Raw Tap Ingestion Pipeline parity & benchmark
+add_executable(test_raw_pipeline test_raw_pipeline.cpp raw_pipeline.cu evt21_gpu_decoder.cu gpu_sieve.cu cuda_flicker_core.cu)
+target_link_libraries(test_raw_pipeline PRIVATE Metavision::HAL Metavision::HAL_discovery MetavisionSDK::core cufft cudart pthread)
+target_compile_options(test_raw_pipeline PRIVATE -UNDEBUG)
 
 # 8. Optional ONNX Runtime Ingestion Binary
 find_package(onnxruntime QUIET)

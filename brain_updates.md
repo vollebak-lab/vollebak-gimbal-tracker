@@ -1157,3 +1157,29 @@ Types: 0 = OFF, 1 = ON, 8 = TIME_HIGH, A = EXT_TRIGGER, E = OTHERS, F = CONTINUE
 
 **Deploy Status:**
 - `predator-camera.service` live on Orin with build ID `3a3d9cc-dirty-srcaa041552bd6e` (PID 49916).
+
+---
+
+## 45. Phase 33.4b.c & 33.4b.e: Zero-CPU GPU-Resident Raw Tap & Demand-Gated UI Accumulator (2026-10-07 UTC)
+
+**Architectural Root Cause & Implementation (`raw_pipeline.cuh`, `raw_pipeline.cu`):**
+1. *Hardware HAL Raw Tap:* Replaced `Metavision::Camera` SDK callback and CPU decoding with `Metavision::DeviceDiscovery::open("", dev_cfg)` setting format `"EVT21"`. Ingests directly from `I_EventsStream::get_latest_raw_data()`.
+2. *Mapped Pinned Memory Ring:* Created 16-slot ring of 32,768 words per slot (`cudaHostAllocMapped`). USB transfer thread copies raw Cypress CX3 words without kernel context switches, and the GPU reads the buffer directly over unified memory.
+3. *Coalesced GPU Execution Stream:* Coalesces per ~2.0 ms or 16,384 words into one batch. One CUDA stream executes `GpuEvt21Decoder` -> `GpuPeriodicitySieve` -> `CudaFlickerCore::ingest_device_events` -> `k_accumulate_ui_frame` with 0% CPU event manipulation.
+4. *Demand-Gated UI Frame Generation (Phase 33.4b.e):* Eliminated CPU `PeriodicFrameGenerationAlgorithm`. UI frames are accumulated directly into a GPU grayscale frame (`d_ui_frame_`). OpenCV HUD rendering and Turbo JPEG compression (`cv::imencode`) are gated to active HTTP visual requests within 2.5s (`g_last_client_request_ms`).
+
+**Verification & Deploy Gate (`test_raw_pipeline.cpp`):**
+- Added `test_raw_pipeline` to CMakeLists.txt and deploy gate in `orin_build_install.sh` (7 test suites mandatory).
+- 4/4 tests passed 100% on live Jetson Orin Nano hardware:
+  1. `Synthetic 200 Hz Drone Ingestion & cuFFT Detection`: PASSED (col=16, row=9 detected BPF=200.78 Hz, SNR=65.41 dB).
+  2. `GPU UI Frame Synthesis Delivery`: PASSED (delivered=1, pixel=255).
+  3. `Fixture Parity (Raw EVT2.1 GPU Path vs Reference CD CPU Path)`: PASSED on `darkroom_evt21.{evt21raw,cd}` (20,000 raw words vs 19,763 CPU events, bit-exact cell totals with **0/1152 cells differing**).
+  4. `End-to-End GPU Pipeline Microbenchmark (16k words)`: PASSED (34.34 MEv/s throughput, p50 latency = 462.6 us, 0.0% CPU work).
+
+**Live Hardware Measurements (Jetson Orin Nano 8GB, PID 55045, Build `9ceeffe-dirty-src38e4485b5abe`):**
+- *Display Encoder Thread CPU:* Dropped from **29.1%** down to **0.7% - 1.4%** when idle (**95% reduction**). Wakes on-demand when `/frame.jpg` or `/stream.mjpg` is requested.
+- *USB Ingest Thread CPU (`raw_reader`):* **0.2% CPU** (down from ~9.1% with old SDK CD dispatch).
+- *GPU Worker Thread CPU (`gpu_worker`):* **9.2% CPU** at steady 250 Hz dispatch.
+- *Total Service CPU:* Dropped from ~44-50% down to **~23-26%** of one core.
+- *Ring Overruns & Dropped Buffers:* Exactly **0 dropped buffers, 0 ring overruns** across >22,000 USB buffers and 9.3M raw words.
+- *Dark Room Target Suppression:* 0 confirmed targets, 0 tracks. All 7 test suites pass in the deploy gate.
