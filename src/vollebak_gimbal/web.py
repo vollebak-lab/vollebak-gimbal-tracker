@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 import numpy as np
 
+from .autonomous_tracker import LaserHardwareInterface
 from .calibration import Calibration
 from .camera import OpenCVCamera, require_cv2
 from .config import AppConfig
@@ -83,6 +84,17 @@ class DashboardEngine:
         self.detector = build_detector(config.detector)
         self.event_camera = EventCameraMonitor(config.event_camera)
         self.laser_test = LaserTestController(config.laser_test)
+        laser_gpio = int(
+            getattr(config.autonomous_tracker, "laser_gpio", 17)
+            if hasattr(config, "autonomous_tracker")
+            else getattr(config.laser_test, "gpio", 17)
+        )
+        self.laser_hardware = LaserHardwareInterface(gpio=laser_gpio)
+        self.auto_laser_enabled = bool(
+            hasattr(config, "autonomous_tracker")
+            and config.autonomous_tracker.enabled
+            and config.autonomous_tracker.laser_auto_engage
+        )
         self.driver = build_driver(config.gimbal)
         self.controller = SafeAngleController(config.gimbal, config.tracking)
         self.controller.reset(Angles(config.gimbal.home_pan, config.gimbal.home_tilt))
@@ -106,6 +118,8 @@ class DashboardEngine:
             "camera": "CONNECTING",
             "camera_mode": "unknown",
             "tracking_enabled": self._tracking_enabled,
+            "auto_laser_enabled": self.auto_laser_enabled,
+            "laser_active": False,
             "driver": config.gimbal.driver,
             "pan": config.gimbal.home_pan,
             "tilt": config.gimbal.home_tilt,
@@ -149,6 +163,7 @@ class DashboardEngine:
             self._thread.join(timeout=3.0)
         self.event_camera.close()
         self.laser_test.force_off()
+        self.laser_hardware.set_state(False)
         self.driver.close()
 
     def state(self) -> dict[str, Any]:
@@ -169,10 +184,24 @@ class DashboardEngine:
                 raise ValueError("Tracking requires a saved camera calibration")
             if enabled:
                 self.laser_test.force_off()
+            else:
+                self.laser_hardware.set_state(False)
             self._tracking_enabled = enabled
             self._state["tracking_enabled"] = enabled
+            self._state["laser_active"] = False
             self._state["status"] = "SEARCHING" if enabled else "PAUSED"
             self._state["message"] = "Automatic tracking enabled" if enabled else "Manual mode"
+
+    def set_auto_laser(self, enabled: bool) -> None:
+        with self._lock:
+            self.auto_laser_enabled = enabled
+            if not enabled:
+                self.laser_hardware.set_state(False)
+            self._state["auto_laser_enabled"] = enabled
+            self._state["laser_active"] = False
+            self._state["message"] = (
+                "Autonomous laser engagement armed" if enabled else "Autonomous laser disarmed"
+            )
 
     def pulse_laser_test(self) -> None:
         with self._lock:
@@ -197,8 +226,10 @@ class DashboardEngine:
             self.controller.reset(angles)
         with self._lock:
             self._tracking_enabled = False
+            self.laser_hardware.set_state(False)
             self._state.update(
                 tracking_enabled=False,
+                laser_active=False,
                 status="MANUAL",
                 pan=angles.pan,
                 tilt=angles.tilt,
@@ -248,6 +279,9 @@ class DashboardEngine:
             last_camera_probe = time.monotonic()
             previous_frame_time = time.monotonic()
             fps = 0.0
+            consecutive_locks = 0
+            laser_engaged_time: float | None = None
+            laser_active = False
             while not self._stop.is_set():
                 frame_started = time.monotonic()
                 if (
@@ -351,6 +385,49 @@ class DashboardEngine:
                     last_command_time = now
 
                 current = self.controller.current or Angles(0.0, 0.0)
+
+                # Closed-loop tracking error evaluation and auto laser engagement
+                laser_active = False
+                with self._lock:
+                    auto_laser_on = self.auto_laser_enabled
+                if (
+                    tracking_enabled
+                    and auto_laser_on
+                    and desired is not None
+                    and target is not None
+                ):
+                    err_deg = math.hypot(
+                        desired.pan - current.pan, desired.tilt - current.tilt
+                    )
+                    tolerance = getattr(
+                        self.config.autonomous_tracker, "lock_tolerance_deg", 1.2
+                    )
+                    req_locks = getattr(
+                        self.config.autonomous_tracker, "lock_consecutive_frames", 3
+                    )
+                    max_continuous_s = getattr(
+                        self.config.autonomous_tracker, "laser_max_continuous_s", 10.0
+                    )
+                    if err_deg <= tolerance:
+                        consecutive_locks += 1
+                    else:
+                        consecutive_locks = 0
+
+                    if consecutive_locks >= req_locks:
+                        if laser_engaged_time is None:
+                            laser_engaged_time = now
+                        if now - laser_engaged_time <= max_continuous_s:
+                            laser_active = True
+                        else:
+                            laser_active = False
+                    else:
+                        laser_engaged_time = None
+                else:
+                    consecutive_locks = 0
+                    laser_engaged_time = None
+
+                self.laser_hardware.set_state(laser_active)
+
                 if not tracking_enabled:
                     status = "MANUAL"
                 elif parked:
@@ -358,10 +435,12 @@ class DashboardEngine:
                 elif event_target is not None and self.config.event_camera.track_targets:
                     status = "EVENT TRACKING"
                 elif target is not None:
-                    status = "TRACKING"
+                    status = "LOCKED // LASER ENGAGED" if laser_active else "TRACKING"
                 else:
                     status = "SEARCHING"
-                self._draw_overlay(frame, detections, target, current, status, mode)
+                self._draw_overlay(
+                    frame, detections, target, current, status, mode, laser_active
+                )
                 ok, encoded = self.cv2.imencode(
                     ".jpg", frame, [int(self.cv2.IMWRITE_JPEG_QUALITY), 82]
                 )
@@ -403,6 +482,8 @@ class DashboardEngine:
                         frame_width=width,
                         frame_height=height,
                         event_camera=event_camera,
+                        laser_active=laser_active,
+                        auto_laser_enabled=auto_laser_on,
                         predator=build_observer_telemetry(
                             self.config,
                             camera_mode=mode,
@@ -425,6 +506,7 @@ class DashboardEngine:
             with self._lock:
                 self._state.update(status="FAULT", camera="OFFLINE", message=str(exc))
         finally:
+            self.laser_hardware.set_state(False)
             if camera is not None:
                 camera.close()
 
@@ -436,14 +518,20 @@ class DashboardEngine:
         angles: Angles,
         status: str,
         mode: str,
+        laser_active: bool = False,
     ) -> None:
         for detection in detections:
             x, y = int(detection.x), int(detection.y)
             right = int(detection.x + detection.width)
             bottom = int(detection.y + detection.height)
-            color = (73, 248, 174) if detection is target else (125, 125, 125)
+            if detection is target:
+                color = (0, 0, 255) if laser_active else (73, 248, 174)
+            else:
+                color = (125, 125, 125)
             self.cv2.rectangle(frame, (x, y), (right, bottom), color, 2)
             label_text = f"{detection.label.upper()} {int(detection.confidence * 100)}%"
+            if detection is target and laser_active:
+                label_text += " [LASER ON]"
             self.cv2.putText(
                 frame,
                 label_text,
@@ -458,22 +546,28 @@ class DashboardEngine:
                 self.cv2.drawMarker(frame, center, color, self.cv2.MARKER_CROSS, 20, 2)
                 self.cv2.circle(frame, center, 14, color, 1)
         self.cv2.rectangle(frame, (0, 0), (frame.shape[1], 48), (5, 7, 7), -1)
+        hud_color = (0, 0, 255) if laser_active else (73, 248, 174)
         self.cv2.putText(
             frame,
             f"{status}  PAN {angles.pan:+06.1f}  TILT {angles.tilt:+05.1f}",
             (15, 30),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
-            (73, 248, 174),
+            hud_color,
             2,
+        )
+        mode_text = (
+            f"{mode.upper()} / LASER ARMED"
+            if laser_active
+            else f"{mode.upper()} / OBSERVE ONLY"
         )
         self.cv2.putText(
             frame,
-            f"{mode.upper()} / OBSERVE ONLY",
-            (max(frame.shape[1] - 210, 10), 30),
+            mode_text,
+            (max(frame.shape[1] - 250, 10), 30),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (220, 225, 222),
+            hud_color if laser_active else (220, 225, 222),
             1,
         )
 
@@ -518,6 +612,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.engine.point(float(body["x"]), float(body["y"]))
             elif path == "/api/laser-test/pulse":
                 self.engine.pulse_laser_test()
+            elif path == "/api/laser-auto":
+                self.engine.set_auto_laser(bool(body.get("enabled")))
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return

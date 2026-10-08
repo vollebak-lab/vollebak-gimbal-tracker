@@ -6,7 +6,7 @@ const ui = {
   target: $("targetValue"), calibration: $("calibrationValue"), mode: $("modeChip"),
   pan: $("panValue"), tilt: $("tiltValue"), panTrack: $("panTrack"), tiltTrack: $("tiltTrack"),
   panLimits: $("panLimits"), tiltLimits: $("tiltLimits"), tracking: $("trackingButton"),
-  laserTest: $("laserTestButton"),
+  laserTest: $("laserTestButton"), autoLaser: $("autoLaserButton"),
   panRange: $("panRange"), tiltRange: $("tiltRange"), panOutput: $("panOutput"),
   tiltOutput: $("tiltOutput"), log: $("eventLog"), toast: $("toast"), cameraStage: $("cameraStage"),
   safetyMode: $("safetyMode"), l1Status: $("l1Status"), l1Sensor: $("l1Sensor"),
@@ -170,6 +170,12 @@ function updateUI(next) {
   ui.laserTest.textContent = laserCoolingDown
     ? `LASER COOLDOWN · ${Number(laserTest.cooldown_remaining_s).toFixed(1)} S`
     : `LASER TEST PULSE · ${(Number(laserTest.pulse_ms) / 1000).toFixed(1)} S`;
+  if (ui.autoLaser) {
+    ui.autoLaser.textContent = next.auto_laser_enabled
+      ? (next.laser_active ? "LASER ENGAGED [ACTIVE]" : "AUTO LASER: ARMED")
+      : "AUTO LASER: OFF";
+    ui.autoLaser.classList.toggle("button-danger", Boolean(next.auto_laser_enabled));
+  }
 
   const limits = next.limits;
   const panPercent = 100 * (next.pan - limits.pan_min) / (limits.pan_max - limits.pan_min);
@@ -284,6 +290,18 @@ ui.laserTest.addEventListener("click", async () => {
     showToast(error.message);
   }
 });
+
+if (ui.autoLaser) {
+  ui.autoLaser.addEventListener("click", async () => {
+    try {
+      const nextEnabled = !(state && state.auto_laser_enabled);
+      updateUI(await api("/api/laser-auto", {enabled: nextEnabled}));
+      addLog(`Auto laser engagement ${nextEnabled ? "ARMED" : "DISARMED"}`);
+    } catch (error) {
+      showToast(error.message);
+    }
+  });
+}
 
 $("centerButton").addEventListener("click", async () => {
   try { updateUI(await api("/api/move", {pan: 0, tilt: 0})); }
