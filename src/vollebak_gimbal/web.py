@@ -443,9 +443,20 @@ class DashboardEngine:
             bottom = int(detection.y + detection.height)
             color = (73, 248, 174) if detection is target else (125, 125, 125)
             self.cv2.rectangle(frame, (x, y), (right, bottom), color, 2)
+            label_text = f"{detection.label.upper()} {int(detection.confidence * 100)}%"
+            self.cv2.putText(
+                frame,
+                label_text,
+                (x, max(18, y - 6)),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+            )
             if detection is target:
                 center = tuple(int(value) for value in detection.center)
                 self.cv2.drawMarker(frame, center, color, self.cv2.MARKER_CROSS, 20, 2)
+                self.cv2.circle(frame, center, 14, color, 1)
         self.cv2.rectangle(frame, (0, 0), (frame.shape[1], 48), (5, 7, 7), -1)
         self.cv2.putText(
             frame,
