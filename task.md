@@ -253,3 +253,11 @@
   - [x] Add person-model and autonomous-tracker tests.
   - [x] Keep automatic laser engagement disabled during integration and dry-run validation.
 
+- [x] **Phase 34: Laser-Camera Extrinsic Parallax Calibration & Live Alignment Trim**
+  - [x] 34.1 Implement `ExtrinsicParallaxModel` in `src/vollebak_gimbal/alignment.py` with 3D baseline geometry ($\Delta X = +7\text{ in}$, $\Delta Y = +1\text{ in}$) and pinhole bounding-box range estimation.
+  - [x] 34.2 Integrate alignment engine into `src/vollebak_gimbal/web.py`, configuration in `src/vollebak_gimbal/config.py`, and default config in `config/pi.yaml`.
+  - [x] 34.3 Add `/api/alignment` REST endpoint and interactive Pan/Tilt Trim and Standoff controls in `index.html`, `app.js`, and `app.css`.
+  - [x] 34.4 Implement comprehensive unit tests (`tests/test_alignment.py`) covering parallax calculations, range boundary clamps, and alignment API payloads (37/37 tests passing).
+  - [x] 34.5 Deploy code to Raspberry Pi 5 (`100.90.113.112`), execute remote test suite, restart `vollebak-gimbal.service`, and verify alignment.
+
+

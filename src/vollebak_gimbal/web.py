@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 import numpy as np
 
+from .alignment import AlignmentResult, ExtrinsicAlignmentConfig, ExtrinsicParallaxModel
 from .autonomous_tracker import LaserHardwareInterface
 from .calibration import Calibration
 from .camera import OpenCVCamera, require_cv2
@@ -100,6 +101,7 @@ class DashboardEngine:
         self.controller.reset(Angles(config.gimbal.home_pan, config.gimbal.home_tilt))
         calibration_path = config.resolve(config.calibration.path)
         self.calibration = Calibration.load(calibration_path) if calibration_path.exists() else None
+        self.alignment_model = ExtrinsicParallaxModel(config.alignment)
 
         self._lock = threading.RLock()
         self._command_lock = threading.Lock()
@@ -131,6 +133,16 @@ class DashboardEngine:
             "message": "",
             "event_camera": initial_event_camera,
             "laser_test": self.laser_test.snapshot(),
+            "alignment": self.config.alignment.to_dict(),
+            "alignment_live": {
+                "distance_m": round(self.config.alignment.nominal_distance_m, 2),
+                "distance_ft": round(self.config.alignment.nominal_distance_m / 0.3048, 1),
+                "distance_source": "nominal",
+                "parallax_pan_deg": 0.0,
+                "parallax_tilt_deg": 0.0,
+                "trim_pan_deg": round(self.config.alignment.trim_pan_deg, 2),
+                "trim_tilt_deg": round(self.config.alignment.trim_tilt_deg, 2),
+            },
             "limits": {
                 "pan_min": config.gimbal.pan_min,
                 "pan_max": config.gimbal.pan_max,
@@ -245,8 +257,54 @@ class DashboardEngine:
             raise ValueError("Click-to-aim requires a saved camera calibration")
         x = clamp(float(normalized_x), 0.0, 1.0) * self.calibration.camera_width
         y = clamp(float(normalized_y), 0.0, 1.0) * self.calibration.camera_height
-        desired = self.calibration.map_pixel(x, y)
-        return self.move(desired.pan, desired.tilt)
+        cam_angles = self.calibration.map_pixel(x, y)
+        compensated = self.alignment_model.compute_compensated_angles(cam_angles)
+        return self.move(compensated.angles.pan, compensated.angles.tilt)
+
+    def get_alignment(self) -> dict[str, Any]:
+        with self._lock:
+            return self.alignment_model.config.to_dict()
+
+    def update_alignment(self, updates: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            cfg = self.alignment_model.config
+            if "enabled" in updates:
+                cfg.enabled = bool(updates["enabled"])
+            if "auto_range" in updates:
+                cfg.auto_range = bool(updates["auto_range"])
+            if "trim_pan_deg" in updates:
+                cfg.trim_pan_deg = float(updates["trim_pan_deg"])
+            if "trim_tilt_deg" in updates:
+                cfg.trim_tilt_deg = float(updates["trim_tilt_deg"])
+            if "offset_x_m" in updates:
+                cfg.offset_x_m = float(updates["offset_x_m"])
+            elif "offset_x_in" in updates:
+                cfg.offset_x_m = float(updates["offset_x_in"]) * 0.0254
+            if "offset_y_m" in updates:
+                cfg.offset_y_m = float(updates["offset_y_m"])
+            elif "offset_y_in" in updates:
+                cfg.offset_y_m = float(updates["offset_y_in"]) * 0.0254
+            if "offset_z_m" in updates:
+                cfg.offset_z_m = float(updates["offset_z_m"])
+            if "nominal_distance_m" in updates:
+                cfg.nominal_distance_m = float(updates["nominal_distance_m"])
+            elif "nominal_distance_ft" in updates:
+                cfg.nominal_distance_m = float(updates["nominal_distance_ft"]) * 0.3048
+            if "camera_vfov_deg" in updates:
+                cfg.camera_vfov_deg = float(updates["camera_vfov_deg"])
+            if "human_height_m" in updates:
+                cfg.human_height_m = float(updates["human_height_m"])
+
+            snapshot = cfg.to_dict()
+            self._state["alignment"] = snapshot
+            if "alignment_live" in self._state:
+                self._state["alignment_live"]["trim_pan_deg"] = snapshot["trim_pan_deg"]
+                self._state["alignment_live"]["trim_tilt_deg"] = snapshot["trim_tilt_deg"]
+            self._state["message"] = (
+                f"Alignment updated: Pan trim {cfg.trim_pan_deg:+.1f} deg, "
+                f"Tilt trim {cfg.trim_tilt_deg:+.1f} deg"
+            )
+            return snapshot
 
     def _run(self) -> None:
         camera: OpenCVCamera | None = None
@@ -338,6 +396,7 @@ class DashboardEngine:
 
                 with self._lock:
                     tracking_enabled = self._tracking_enabled
+                latest_alignment: AlignmentResult | None = None
                 if (
                     event_target is not None
                     and self.config.event_camera.track_targets
@@ -359,10 +418,14 @@ class DashboardEngine:
                     if tracking_enabled and self.calibration is not None:
                         height, width = frame.shape[:2]
                         pixel_x, pixel_y = target.center
-                        target_angles = self.calibration.map_pixel(
+                        cam_angles = self.calibration.map_pixel(
                             pixel_x * self.calibration.camera_width / width,
                             pixel_y * self.calibration.camera_height / height,
                         )
+                        latest_alignment = self.alignment_model.compute_compensated_angles(
+                            cam_angles, target=target, frame_height_px=height
+                        )
+                        target_angles = latest_alignment.angles
                         desired = target_angles
                 elif (
                     tracking_enabled
@@ -439,7 +502,7 @@ class DashboardEngine:
                 else:
                     status = "SEARCHING"
                 self._draw_overlay(
-                    frame, detections, target, current, status, mode, laser_active
+                    frame, detections, target, current, status, mode, laser_active, latest_alignment
                 )
                 ok, encoded = self.cv2.imencode(
                     ".jpg", frame, [int(self.cv2.IMWRITE_JPEG_QUALITY), 82]
@@ -470,6 +533,44 @@ class DashboardEngine:
                         "confidence": target.confidence,
                         "source": "rgb",
                     }
+                alignment_live = {
+                    "distance_m": round(
+                        latest_alignment.distance_m
+                        if latest_alignment
+                        else self.config.alignment.nominal_distance_m,
+                        2,
+                    ),
+                    "distance_ft": round(
+                        (
+                            latest_alignment.distance_m
+                            if latest_alignment
+                            else self.config.alignment.nominal_distance_m
+                        )
+                        / 0.3048,
+                        1,
+                    ),
+                    "distance_source": (
+                        latest_alignment.distance_source if latest_alignment else "nominal"
+                    ),
+                    "parallax_pan_deg": round(
+                        latest_alignment.parallax_pan_deg if latest_alignment else 0.0, 2
+                    ),
+                    "parallax_tilt_deg": round(
+                        latest_alignment.parallax_tilt_deg if latest_alignment else 0.0, 2
+                    ),
+                    "trim_pan_deg": round(
+                        latest_alignment.trim_pan_deg
+                        if latest_alignment
+                        else self.config.alignment.trim_pan_deg,
+                        2,
+                    ),
+                    "trim_tilt_deg": round(
+                        latest_alignment.trim_tilt_deg
+                        if latest_alignment
+                        else self.config.alignment.trim_tilt_deg,
+                        2,
+                    ),
+                }
                 with self._frame_ready:
                     self._frame = encoded.tobytes()
                     self._frame_id += 1
@@ -484,6 +585,7 @@ class DashboardEngine:
                         event_camera=event_camera,
                         laser_active=laser_active,
                         auto_laser_enabled=auto_laser_on,
+                        alignment_live=alignment_live,
                         predator=build_observer_telemetry(
                             self.config,
                             camera_mode=mode,
@@ -519,6 +621,7 @@ class DashboardEngine:
         status: str,
         mode: str,
         laser_active: bool = False,
+        alignment: AlignmentResult | None = None,
     ) -> None:
         for detection in detections:
             x, y = int(detection.x), int(detection.y)
@@ -571,6 +674,33 @@ class DashboardEngine:
             1,
         )
 
+        # Bottom HUD bar for distance estimation, parallax compensation, and manual trim
+        frame_h, frame_w = frame.shape[:2]
+        self.cv2.rectangle(frame, (0, frame_h - 26), (frame_w, frame_h), (5, 7, 7), -1)
+        if alignment is not None:
+            dist_str = f"RNG {alignment.distance_m:.1f}m ({alignment.distance_m / 0.3048:.1f}ft)"
+            par_str = (
+                f"PARALLAX P{alignment.parallax_pan_deg:+05.1f} T{alignment.parallax_tilt_deg:+04.1f}"
+            )
+            trim_str = f"TRIM P{alignment.trim_pan_deg:+04.1f} T{alignment.trim_tilt_deg:+04.1f}"
+            hud_align_text = f"{dist_str}  |  {par_str}  |  {trim_str}"
+        else:
+            cfg = self.alignment_model.config
+            hud_align_text = (
+                f"NOMINAL {cfg.nominal_distance_m:.1f}m ({cfg.nominal_distance_m / 0.3048:.1f}ft)  |  "
+                f"TRIM P{cfg.trim_pan_deg:+04.1f} T{cfg.trim_tilt_deg:+04.1f}"
+            )
+
+        self.cv2.putText(
+            frame,
+            hud_align_text,
+            (12, frame_h - 8),
+            self.cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (180, 200, 190),
+            1,
+        )
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
     engine: DashboardEngine
@@ -586,6 +716,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._asset("app.js", "text/javascript; charset=utf-8")
         elif path == "/api/state":
             self._json(HTTPStatus.OK, self.engine.state())
+        elif path == "/api/alignment":
+            self._json(HTTPStatus.OK, self.engine.get_alignment())
         elif path == "/api/health":
             self._json(
                 HTTPStatus.OK,
@@ -614,6 +746,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.engine.pulse_laser_test()
             elif path == "/api/laser-auto":
                 self.engine.set_auto_laser(bool(body.get("enabled")))
+            elif path == "/api/alignment":
+                result = self.engine.update_alignment(body)
+                self._json(HTTPStatus.OK, result)
+                return
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return

@@ -7,6 +7,9 @@ from typing import Any
 import yaml
 
 
+from .alignment import ExtrinsicAlignmentConfig
+
+
 @dataclass(slots=True)
 class CameraConfig:
     source: int | str = 0
@@ -91,6 +94,9 @@ class AppConfig:
     autonomous_tracker: AutonomousTrackerSettings = field(
         default_factory=AutonomousTrackerSettings
     )
+    alignment: ExtrinsicAlignmentConfig = field(
+        default_factory=ExtrinsicAlignmentConfig
+    )
     config_dir: Path = field(default_factory=Path.cwd, repr=False)
 
     def resolve(self, value: str) -> Path:
@@ -123,6 +129,7 @@ def load_config(path: str | Path) -> AppConfig:
         tracking=TrackingConfig(**_section(data, "tracking")),
         laser_test=LaserTestConfig(**_section(data, "laser_test")),
         autonomous_tracker=AutonomousTrackerSettings(**_section(data, "autonomous_tracker")),
+        alignment=ExtrinsicAlignmentConfig.from_dict(_section(data, "alignment")),
         config_dir=config_path.parent,
     )
     _validate(config)

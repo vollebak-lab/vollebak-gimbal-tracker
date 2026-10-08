@@ -100,6 +100,42 @@
           <small>PHYSICAL ARM REQUIRED / TRACKING MUST BE PAUSED / AUTOMATIC OFF</small>
         </div>
 
+        <div class="alignment-box" aria-labelledby="alignmentTitle">
+          <div class="alignment-header">
+            <span class="panel-index" id="alignmentTitle">ALIGNMENT // PARALLAX TRIM</span>
+            <div class="alignment-badges">
+              <span class="trim-badge" id="alignmentDistanceBadge">12.0 FT</span>
+              <span class="trim-badge" id="alignmentParallaxBadge">P -2.8&deg; T -0.4&deg;</span>
+            </div>
+          </div>
+          <div class="trim-control-row">
+            <div class="slider-control trim-slider">
+              <label for="trimPanRange"><span>PAN TRIM</span><output id="trimPanOutput">0.0&deg;</output></label>
+              <div class="slider-with-nudges">
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="-0.5">-0.5&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="-0.1">-0.1&deg;</button>
+                <input id="trimPanRange" type="range" min="-15" max="15" step="0.1" value="0">
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="0.1">+0.1&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="0.5">+0.5&deg;</button>
+              </div>
+            </div>
+            <div class="slider-control trim-slider">
+              <label for="trimTiltRange"><span>TILT TRIM</span><output id="trimTiltOutput">0.0&deg;</output></label>
+              <div class="slider-with-nudges">
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="-0.5">-0.5&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="-0.1">-0.1&deg;</button>
+                <input id="trimTiltRange" type="range" min="-10" max="10" step="0.1" value="0">
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="0.1">+0.1&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="0.5">+0.5&deg;</button>
+              </div>
+            </div>
+          </div>
+          <div class="alignment-meta">
+            <small>BASELINE: &Delta;X +7.0" (RIGHT) / &Delta;Y +1.0" (UP) &middot; <span id="alignmentSource">AUTO BBOX RANGE</span></small>
+            <button class="button button-subtle" id="resetTrimButton" type="button">ZERO TRIM</button>
+          </div>
+        </div>
+
         <div class="manual-grid" aria-label="Manual gimbal nudges">
           <span></span><button data-pan="0" data-tilt="5" aria-label="Tilt up 5 degrees">&uarr;</button><span></span>
           <button data-pan="-5" data-tilt="0" aria-label="Pan left 5 degrees">&larr;</button>

@@ -65,3 +65,18 @@ web:
   port: 8080
   jpeg_quality: 82
   fallback_demo: true
+
+alignment:
+  enabled: true
+  auto_range: true
+  offset_x_m: 0.1778  # 7.0 inches right
+  offset_y_m: 0.0254  # 1.0 inch above
+  offset_z_m: 0.0
+  nominal_distance_m: 3.6576  # 12.0 ft
+  min_distance_m: 1.0
+  max_distance_m: 15.0
+  human_height_m: 1.70
+  camera_vfov_deg: 52.0
+  trim_pan_deg: 0.0
+  trim_tilt_deg: 0.0
+

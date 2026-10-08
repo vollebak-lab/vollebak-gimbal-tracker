@@ -21,6 +21,12 @@ const ui = {
   cameraFeed: $("cameraFeed"), rgbFeed: $("rgbFeedButton"),
   eventFeed: $("eventFeedButton"), eventRate: $("eventRateValue"),
   clickHint: $("clickHint"), targetReticle: $("targetReticle"),
+  trimPanRange: $("trimPanRange"), trimTiltRange: $("trimTiltRange"),
+  trimPanOutput: $("trimPanOutput"), trimTiltOutput: $("trimTiltOutput"),
+  alignmentDistanceBadge: $("alignmentDistanceBadge"),
+  alignmentParallaxBadge: $("alignmentParallaxBadge"),
+  alignmentSource: $("alignmentSource"),
+  resetTrimButton: $("resetTrimButton"),
 };
 
 const canvas = $("twinCanvas");
@@ -30,6 +36,8 @@ let priorSignature = "";
 let priorMessage = "";
 let toastTimer = null;
 let selectedFeed = "rgb";
+let isDraggingTrimPan = false;
+let isDraggingTrimTilt = false;
 
 function signed(value, digits = 1) {
   return `${value >= 0 ? "+" : "\u2212"}${Math.abs(value).toFixed(digits)}\u00b0`;
@@ -189,6 +197,23 @@ function updateUI(next) {
   updateTargetOverlay(next.target, next.frame_width, next.frame_height);
   updatePredatorUI(next.predator);
 
+  if (next.alignment_live && ui.alignmentDistanceBadge) {
+    const al = next.alignment_live;
+    ui.alignmentDistanceBadge.textContent = `${al.distance_ft} FT (${al.distance_m} M)`;
+    ui.alignmentParallaxBadge.textContent = `P ${signed(al.parallax_pan_deg)} / T ${signed(al.parallax_tilt_deg)}`;
+    if (ui.alignmentSource) {
+      ui.alignmentSource.textContent = al.distance_source.toUpperCase();
+    }
+    if (!isDraggingTrimPan && ui.trimPanRange) {
+      ui.trimPanRange.value = al.trim_pan_deg;
+      ui.trimPanOutput.textContent = signed(al.trim_pan_deg);
+    }
+    if (!isDraggingTrimTilt && ui.trimTiltRange) {
+      ui.trimTiltRange.value = al.trim_tilt_deg;
+      ui.trimTiltOutput.textContent = signed(al.trim_tilt_deg);
+    }
+  }
+
   const signature = `${next.status}|${next.camera_mode}|${Boolean(next.target)}|${next.tracking_enabled}|${eventCamera.connected}`;
   if (signature !== priorSignature) {
     addLog(`${next.status} \u00b7 ${next.target ? "target acquired" : "no target"}`);
@@ -324,6 +349,79 @@ $("sendButton").addEventListener("click", async () => {
   try { updateUI(await api("/api/move", {pan: Number(ui.panRange.value), tilt: Number(ui.tiltRange.value)})); }
   catch (error) { showToast(error.message); }
 });
+
+if (ui.trimPanRange) {
+  ui.trimPanRange.addEventListener("mousedown", () => { isDraggingTrimPan = true; });
+  ui.trimPanRange.addEventListener("touchstart", () => { isDraggingTrimPan = true; }, {passive: true});
+  ui.trimPanRange.addEventListener("input", () => {
+    ui.trimPanOutput.textContent = signed(Number(ui.trimPanRange.value));
+  });
+  ui.trimPanRange.addEventListener("change", async () => {
+    isDraggingTrimPan = false;
+    try {
+      await api("/api/alignment", { trim_pan_deg: Number(ui.trimPanRange.value) });
+      addLog(`Pan trim set to ${signed(Number(ui.trimPanRange.value))}`);
+    } catch (e) { showToast(e.message); }
+  });
+}
+
+if (ui.trimTiltRange) {
+  ui.trimTiltRange.addEventListener("mousedown", () => { isDraggingTrimTilt = true; });
+  ui.trimTiltRange.addEventListener("touchstart", () => { isDraggingTrimTilt = true; }, {passive: true});
+  ui.trimTiltRange.addEventListener("input", () => {
+    ui.trimTiltOutput.textContent = signed(Number(ui.trimTiltRange.value));
+  });
+  ui.trimTiltRange.addEventListener("change", async () => {
+    isDraggingTrimTilt = false;
+    try {
+      await api("/api/alignment", { trim_tilt_deg: Number(ui.trimTiltRange.value) });
+      addLog(`Tilt trim set to ${signed(Number(ui.trimTiltRange.value))}`);
+    } catch (e) { showToast(e.message); }
+  });
+}
+
+document.querySelectorAll(".nudge-btn").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const axis = btn.dataset.axis;
+    const step = Number(btn.dataset.step);
+    if (axis === "pan" && ui.trimPanRange) {
+      const cur = Number(ui.trimPanRange.value);
+      const nextVal = Math.round((cur + step) * 10) / 10;
+      ui.trimPanRange.value = nextVal;
+      ui.trimPanOutput.textContent = signed(nextVal);
+      try {
+        await api("/api/alignment", { trim_pan_deg: nextVal });
+        addLog(`Pan trim nudged to ${signed(nextVal)}`);
+      } catch (e) { showToast(e.message); }
+    } else if (axis === "tilt" && ui.trimTiltRange) {
+      const cur = Number(ui.trimTiltRange.value);
+      const nextVal = Math.round((cur + step) * 10) / 10;
+      ui.trimTiltRange.value = nextVal;
+      ui.trimTiltOutput.textContent = signed(nextVal);
+      try {
+        await api("/api/alignment", { trim_tilt_deg: nextVal });
+        addLog(`Tilt trim nudged to ${signed(nextVal)}`);
+      } catch (e) { showToast(e.message); }
+    }
+  });
+});
+
+if (ui.resetTrimButton) {
+  ui.resetTrimButton.addEventListener("click", async () => {
+    if (ui.trimPanRange) {
+      ui.trimPanRange.value = 0.0;
+      ui.trimPanOutput.textContent = signed(0.0);
+    }
+    if (ui.trimTiltRange) {
+      ui.trimTiltRange.value = 0.0;
+      ui.trimTiltOutput.textContent = signed(0.0);
+    }
+    try {
+      await api("/api/alignment", { trim_pan_deg: 0.0, trim_tilt_deg: 0.0 });
+      addLog("Trim reset to 0.0° / 0.0°");
+    } catch (e) { showToast(e.message); }
+  });
+}
 
 ui.cameraStage.addEventListener("click", async (event) => {
   if (selectedFeed === "event") {
