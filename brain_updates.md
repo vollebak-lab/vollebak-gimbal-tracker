@@ -1424,3 +1424,19 @@ All 12 evaluation corpus fixtures passed every quantitative acceptance gate on t
 - Added focused person-model and autonomous-tracker unit tests.
 - Automatic laser engagement remains disabled for integration and dry-run testing until an operator completes hardware and optical safety validation.
 
+
+
+## [2026-10-08] Phase 34.6: Manual-to-Tracking Seamless Handoff & Aim Lock Calibration
+- **Target Node**: Raspberry Pi 5 (`vollebak@100.90.113.112:8080`)
+- **Git Commit**: `ca41ed5` on branch `integration/pi5-gimbal-event-camera` (PR #1 updated)
+- **Problem Statement**: Gimbal laser jumped/reset back to uncalibrated position when operator clicked "START TRACKING" after manually nudging the laser onto the target crosshair.
+- **Root Cause**: Manual nudge commands operated open-loop. When tracking engaged, closed-loop setpoints were calculated purely from uncalibrated polynomial calibration with zero trim, ignoring the manual position.
+- **Solution & Changes**:
+  1. `ExtrinsicParallaxModel`: Added `apply_trim: bool = True` to `compute_compensated_angles()`.
+  2. `DashboardEngine`: Added `lock_current_aim()` computing exact trim offsets:
+     $$\Delta\theta_{\text{pan}} = \text{pan}_{\text{current}} - \text{pan}_{\text{untrimmed}}$$
+     $$\Delta\theta_{\text{tilt}} = \text{tilt}_{\text{current}} - \text{tilt}_{\text{untrimmed}}$$
+  3. Seamless Tracking Auto-Lock: In `set_tracking(True)`, if `_manual_aim_active` is True and `_latest_target` is present, `lock_current_aim()` is invoked automatically before starting tracking. Zero jump occurs when tracking begins.
+  4. Real-time Trim Preview: In `update_alignment()`, when tracking is paused, moving Pan/Tilt Trim sliders moves the physical servos live.
+  5. UI: Added `[CALIBRATE TO CROSSHAIR]` button to `web_assets/index.html` and wired event listener in `web_assets/app.js`.
+  6. Tests: Added `test_lock_current_aim_exact_trim_transfer`, `test_seamless_handoff_on_set_tracking`, and `test_lock_current_aim_requires_target`. All 40/40 tests passing on Raspberry Pi 5 (100%).
