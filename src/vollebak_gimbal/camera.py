@@ -34,7 +34,9 @@ class OpenCVCamera:
             if backend is not None and isinstance(source, int)
             else self.cv2.VideoCapture(source)
         )
-        if config.backend == "dshow" and hasattr(self.cv2, "VideoWriter_fourcc"):
+        if config.backend in {"dshow", "v4l2"} and hasattr(
+            self.cv2, "VideoWriter_fourcc"
+        ):
             self.capture.set(self.cv2.CAP_PROP_FOURCC, self.cv2.VideoWriter_fourcc(*"MJPG"))
         self.capture.set(self.cv2.CAP_PROP_FRAME_WIDTH, config.width)
         self.capture.set(self.cv2.CAP_PROP_FRAME_HEIGHT, config.height)
