@@ -259,5 +259,9 @@
   - [x] 34.3 Add `/api/alignment` REST endpoint and interactive Pan/Tilt Trim and Standoff controls in `index.html`, `app.js`, and `app.css`.
   - [x] 34.4 Implement comprehensive unit tests (`tests/test_alignment.py`) covering parallax calculations, range boundary clamps, and alignment API payloads (37/37 tests passing).
   - [x] 34.5 Deploy code to Raspberry Pi 5 (`100.90.113.112`), execute remote test suite, restart `vollebak-gimbal.service`, and verify alignment.
+  - [x] 34.6 Implement manual-to-tracking seamless hand-off and aim lock calibration (`lock_current_aim`):
+    - Root Cause Analysis: Manual nudge commands actuate the gimbal open-loop in Pipeline 1. When clicking "START TRACKING", Pipeline 2 engaged and wiped out the manual alignment by commanding uncalibrated setpoints, resetting the gimbal.
+    - Solution: Added `lock_current_aim()` computing exact trim $\Delta\theta_{\text{trim}} = \theta_{\text{current}} - \theta_{\text{untrimmed}}$, added auto-locking on `set_tracking(True)` when manual aim is active, added real-time trim preview actuation while tracking is paused, and added `[CALIBRATE TO CROSSHAIR]` button to the dashboard.
+    - Verification: 40/40 tests passing (100%), verified on live Raspberry Pi 5 hardware with zero position jump.
 
 

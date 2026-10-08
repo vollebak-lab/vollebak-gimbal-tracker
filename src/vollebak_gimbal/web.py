@@ -102,6 +102,9 @@ class DashboardEngine:
         calibration_path = config.resolve(config.calibration.path)
         self.calibration = Calibration.load(calibration_path) if calibration_path.exists() else None
         self.alignment_model = ExtrinsicParallaxModel(config.alignment)
+        self._manual_aim_active = False
+        self._latest_target: Detection | None = None
+        self._latest_frame_shape: tuple[int, int] = (config.camera.height, config.camera.width)
 
         self._lock = threading.RLock()
         self._command_lock = threading.Lock()
@@ -196,6 +199,13 @@ class DashboardEngine:
                 raise ValueError("Tracking requires a saved camera calibration")
             if enabled:
                 self.laser_test.force_off()
+                # If operator manually steered gimbal onto target, auto-lock aim so position does not reset
+                if self._manual_aim_active and self._latest_target is not None:
+                    try:
+                        self.lock_current_aim()
+                    except Exception as exc:
+                        LOGGER.warning("Could not auto-lock manual aim: %s", exc)
+                self._manual_aim_active = False
             else:
                 self.laser_hardware.set_state(False)
             self._tracking_enabled = enabled
@@ -238,6 +248,7 @@ class DashboardEngine:
             self.controller.reset(angles)
         with self._lock:
             self._tracking_enabled = False
+            self._manual_aim_active = True
             self.laser_hardware.set_state(False)
             self._state.update(
                 tracking_enabled=False,
@@ -250,7 +261,10 @@ class DashboardEngine:
         return angles
 
     def home(self) -> Angles:
-        return self.move(self.config.gimbal.home_pan, self.config.gimbal.home_tilt)
+        angles = self.move(self.config.gimbal.home_pan, self.config.gimbal.home_tilt)
+        with self._lock:
+            self._manual_aim_active = False
+        return angles
 
     def point(self, normalized_x: float, normalized_y: float) -> Angles:
         if self.calibration is None:
@@ -259,7 +273,68 @@ class DashboardEngine:
         y = clamp(float(normalized_y), 0.0, 1.0) * self.calibration.camera_height
         cam_angles = self.calibration.map_pixel(x, y)
         compensated = self.alignment_model.compute_compensated_angles(cam_angles)
-        return self.move(compensated.angles.pan, compensated.angles.tilt)
+        angles = self.move(compensated.angles.pan, compensated.angles.tilt)
+        with self._lock:
+            self._manual_aim_active = True
+        return angles
+
+    def lock_current_aim(self) -> dict[str, Any]:
+        """Lock current physical gimbal position to match the detected target crosshair.
+
+        Computes the exact trim delta between the gimbal's current physical angles and
+        the un-trimmed optical/parallax model angles, updating trim_pan_deg and trim_tilt_deg
+        so tracking engages seamlessly with zero position jump.
+        """
+        with self._lock:
+            if self.calibration is None:
+                raise ValueError("Aim lock requires a saved camera calibration")
+            if self._latest_target is None:
+                raise ValueError("No target currently detected to align against")
+
+            current = self.controller.current or Angles(
+                self.config.gimbal.home_pan, self.config.gimbal.home_tilt
+            )
+            height, width = self._latest_frame_shape
+            pixel_x, pixel_y = self._latest_target.center
+            cam_angles = self.calibration.map_pixel(
+                pixel_x * self.calibration.camera_width / width,
+                pixel_y * self.calibration.camera_height / height,
+            )
+            untrimmed = self.alignment_model.compute_compensated_angles(
+                cam_angles,
+                target=self._latest_target,
+                frame_height_px=height,
+                apply_trim=False,
+            )
+            trim_pan = round(current.pan - untrimmed.angles.pan, 2)
+            trim_tilt = round(current.tilt - untrimmed.angles.tilt, 2)
+
+            self.alignment_model.config.trim_pan_deg = trim_pan
+            self.alignment_model.config.trim_tilt_deg = trim_tilt
+            self._manual_aim_active = False
+
+            snapshot = self.alignment_model.config.to_dict()
+            self._state["alignment"] = snapshot
+            if "alignment_live" in self._state:
+                self._state["alignment_live"]["trim_pan_deg"] = trim_pan
+                self._state["alignment_live"]["trim_tilt_deg"] = trim_tilt
+            self._state["message"] = (
+                f"Aim locked to crosshair: Pan trim {trim_pan:+.1f} deg, "
+                f"Tilt trim {trim_tilt:+.1f} deg"
+            )
+            LOGGER.info(
+                "Aim locked to crosshair: target=(%.1f, %.1f), current=(%.2f, %.2f), "
+                "untrimmed=(%.2f, %.2f) -> trim=(%.2f, %.2f)",
+                pixel_x,
+                pixel_y,
+                current.pan,
+                current.tilt,
+                untrimmed.angles.pan,
+                untrimmed.angles.tilt,
+                trim_pan,
+                trim_tilt,
+            )
+            return snapshot
 
     def get_alignment(self) -> dict[str, Any]:
         with self._lock:
@@ -267,15 +342,21 @@ class DashboardEngine:
 
     def update_alignment(self, updates: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            if updates.get("lock_current"):
+                return self.lock_current_aim()
+
             cfg = self.alignment_model.config
+            trim_changed = False
             if "enabled" in updates:
                 cfg.enabled = bool(updates["enabled"])
             if "auto_range" in updates:
                 cfg.auto_range = bool(updates["auto_range"])
             if "trim_pan_deg" in updates:
                 cfg.trim_pan_deg = float(updates["trim_pan_deg"])
+                trim_changed = True
             if "trim_tilt_deg" in updates:
                 cfg.trim_tilt_deg = float(updates["trim_tilt_deg"])
+                trim_changed = True
             if "offset_x_m" in updates:
                 cfg.offset_x_m = float(updates["offset_x_m"])
             elif "offset_x_in" in updates:
@@ -294,6 +375,28 @@ class DashboardEngine:
                 cfg.camera_vfov_deg = float(updates["camera_vfov_deg"])
             if "human_height_m" in updates:
                 cfg.human_height_m = float(updates["human_height_m"])
+
+            # Live preview of trim actuation when tracking is paused and target is in view
+            if trim_changed and not self._tracking_enabled:
+                if self._latest_target is not None and self.calibration is not None:
+                    height, width = self._latest_frame_shape
+                    pixel_x, pixel_y = self._latest_target.center
+                    cam_angles = self.calibration.map_pixel(
+                        pixel_x * self.calibration.camera_width / width,
+                        pixel_y * self.calibration.camera_height / height,
+                    )
+                    comp = self.alignment_model.compute_compensated_angles(
+                        cam_angles, target=self._latest_target, frame_height_px=height
+                    )
+                    with self._command_lock:
+                        self.driver.move(
+                            comp.angles.pan,
+                            comp.angles.tilt,
+                            self.config.gimbal.speed,
+                            self.config.gimbal.acceleration,
+                        )
+                        self.controller.reset(comp.angles)
+                    self._state.update(pan=round(comp.angles.pan, 2), tilt=round(comp.angles.tilt, 2))
 
             snapshot = cfg.to_dict()
             self._state["alignment"] = snapshot
@@ -415,8 +518,11 @@ class DashboardEngine:
                     last_seen = now
                 elif target is not None:
                     last_seen = now
-                    if tracking_enabled and self.calibration is not None:
-                        height, width = frame.shape[:2]
+                    height, width = frame.shape[:2]
+                    with self._lock:
+                        self._latest_target = target
+                        self._latest_frame_shape = (height, width)
+                    if self.calibration is not None:
                         pixel_x, pixel_y = target.center
                         cam_angles = self.calibration.map_pixel(
                             pixel_x * self.calibration.camera_width / width,
@@ -426,7 +532,8 @@ class DashboardEngine:
                             cam_angles, target=target, frame_height_px=height
                         )
                         target_angles = latest_alignment.angles
-                        desired = target_angles
+                        if tracking_enabled:
+                            desired = target_angles
                 elif (
                     tracking_enabled
                     and last_seen is not None
@@ -434,6 +541,10 @@ class DashboardEngine:
                 ):
                     desired = Angles(self.config.gimbal.home_pan, self.config.gimbal.home_tilt)
                     parked = True
+
+                if target is None and (last_seen is None or now - last_seen >= 1.0):
+                    with self._lock:
+                        self._latest_target = None
 
                 interval = 1.0 / self.config.tracking.command_hz
                 if desired is not None and now - last_command_time >= interval:
@@ -746,8 +857,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.engine.pulse_laser_test()
             elif path == "/api/laser-auto":
                 self.engine.set_auto_laser(bool(body.get("enabled")))
-            elif path == "/api/alignment":
-                result = self.engine.update_alignment(body)
+            elif path in {"/api/alignment", "/api/alignment/lock", "/api/alignment/calibrate"}:
+                if path != "/api/alignment" or body.get("lock_current"):
+                    result = self.engine.lock_current_aim()
+                else:
+                    result = self.engine.update_alignment(body)
                 self._json(HTTPStatus.OK, result)
                 return
             else:

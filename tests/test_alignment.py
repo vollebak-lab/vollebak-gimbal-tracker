@@ -153,3 +153,94 @@ def test_dashboard_engine_alignment_methods(monkeypatch):
         assert state["alignment_live"]["trim_pan_deg"] == -1.2
     finally:
         engine.close()
+
+
+def test_lock_current_aim_exact_trim_transfer(monkeypatch):
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        from unittest.mock import MagicMock
+        mock_cv2 = MagicMock()
+        monkeypatch.setattr("vollebak_gimbal.camera.require_cv2", lambda: mock_cv2)
+        monkeypatch.setattr("vollebak_gimbal.web.require_cv2", lambda: mock_cv2)
+
+    config = load_config("config/dev.yaml")
+    engine = DashboardEngine(config, force_demo=True)
+    try:
+        # Simulate target detected at center of frame
+        engine._latest_target = Detection(x=100.0, y=70.0, width=120.0, height=100.0, label="person")
+        engine._latest_frame_shape = (240, 320)
+
+        # Operator manually aims laser at target
+        target_pan, target_tilt = 12.5, -4.2
+        engine.move(target_pan, target_tilt)
+        assert engine._manual_aim_active is True
+
+        # Lock current aim
+        res = engine.lock_current_aim()
+        assert engine._manual_aim_active is False
+
+        # Verify that computing compensated angles with trim now yields EXACT target angles
+        cam_angles = engine.calibration.map_pixel(
+            160.0 * engine.calibration.camera_width / 320,
+            120.0 * engine.calibration.camera_height / 240,
+        )
+        comp = engine.alignment_model.compute_compensated_angles(
+            cam_angles, target=engine._latest_target, frame_height_px=240, apply_trim=True
+        )
+        assert math.isclose(comp.angles.pan, target_pan, abs_tol=1e-2)
+        assert math.isclose(comp.angles.tilt, target_tilt, abs_tol=1e-2)
+        assert math.isclose(res["trim_pan_deg"], engine.alignment_model.config.trim_pan_deg, abs_tol=1e-2)
+    finally:
+        engine.close()
+
+
+def test_seamless_handoff_on_set_tracking(monkeypatch):
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        from unittest.mock import MagicMock
+        mock_cv2 = MagicMock()
+        monkeypatch.setattr("vollebak_gimbal.camera.require_cv2", lambda: mock_cv2)
+        monkeypatch.setattr("vollebak_gimbal.web.require_cv2", lambda: mock_cv2)
+
+    config = load_config("config/dev.yaml")
+    config.tracking.start_enabled = False
+    engine = DashboardEngine(config, force_demo=True)
+    try:
+        engine._latest_target = Detection(x=120.0, y=80.0, width=80.0, height=80.0, label="person")
+        engine._latest_frame_shape = (240, 320)
+
+        # Operator nudges gimbal
+        engine.move(7.5, -2.5)
+        assert engine._manual_aim_active is True
+
+        # Operator clicks "START TRACKING"
+        engine.set_tracking(True)
+        assert engine.state()["tracking_enabled"] is True
+        assert engine._manual_aim_active is False
+
+        # Trim was automatically locked
+        assert engine.alignment_model.config.trim_pan_deg != 0.0 or engine.alignment_model.config.trim_tilt_deg != 0.0
+    finally:
+        engine.close()
+
+
+def test_lock_current_aim_requires_target(monkeypatch):
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        from unittest.mock import MagicMock
+        mock_cv2 = MagicMock()
+        monkeypatch.setattr("vollebak_gimbal.camera.require_cv2", lambda: mock_cv2)
+        monkeypatch.setattr("vollebak_gimbal.web.require_cv2", lambda: mock_cv2)
+
+    config = load_config("config/dev.yaml")
+    engine = DashboardEngine(config, force_demo=True)
+    try:
+        engine._latest_target = None
+        with pytest.raises(ValueError, match="No target currently detected"):
+            engine.lock_current_aim()
+    finally:
+        engine.close()
+

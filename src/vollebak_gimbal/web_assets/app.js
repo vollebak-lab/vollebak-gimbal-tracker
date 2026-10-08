@@ -27,6 +27,7 @@ const ui = {
   alignmentParallaxBadge: $("alignmentParallaxBadge"),
   alignmentSource: $("alignmentSource"),
   resetTrimButton: $("resetTrimButton"),
+  lockAimButton: $("lockAimButton"),
 };
 
 const canvas = $("twinCanvas");
@@ -420,6 +421,25 @@ if (ui.resetTrimButton) {
       await api("/api/alignment", { trim_pan_deg: 0.0, trim_tilt_deg: 0.0 });
       addLog("Trim reset to 0.0° / 0.0°");
     } catch (e) { showToast(e.message); }
+  });
+}
+
+if (ui.lockAimButton) {
+  ui.lockAimButton.addEventListener("click", async () => {
+    try {
+      const res = await api("/api/alignment", { lock_current: true });
+      if (ui.trimPanRange && res.trim_pan_deg !== undefined) {
+        ui.trimPanRange.value = res.trim_pan_deg;
+        ui.trimPanOutput.textContent = signed(res.trim_pan_deg);
+      }
+      if (ui.trimTiltRange && res.trim_tilt_deg !== undefined) {
+        ui.trimTiltRange.value = res.trim_tilt_deg;
+        ui.trimTiltOutput.textContent = signed(res.trim_tilt_deg);
+      }
+      addLog(`Aim calibrated to crosshair! Pan ${signed(res.trim_pan_deg)}, Tilt ${signed(res.trim_tilt_deg)}`);
+    } catch (e) {
+      showToast(e.message);
+    }
   });
 }
 

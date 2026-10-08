@@ -111,6 +111,7 @@ class ExtrinsicParallaxModel:
         cam_angles: Angles,
         target: Detection | None = None,
         frame_height_px: int = 480,
+        apply_trim: bool = True,
     ) -> AlignmentResult:
         """Apply extrinsic parallax correction and manual trim to camera-space angles.
 
@@ -118,21 +119,25 @@ class ExtrinsicParallaxModel:
             cam_angles: Angles(pan, tilt) computed from camera pixel coordinates.
             target: Optional target detection (used for bounding-box height range estimation).
             frame_height_px: Camera frame height in pixels.
+            apply_trim: Whether to include trim_pan_deg and trim_tilt_deg.
 
         Returns:
             AlignmentResult with final commanded Angles, estimated distance, and deltas.
         """
+        trim_p = self.config.trim_pan_deg if apply_trim else 0.0
+        trim_t = self.config.trim_tilt_deg if apply_trim else 0.0
+
         if not self.config.enabled:
-            final_pan = cam_angles.pan + self.config.trim_pan_deg
-            final_tilt = cam_angles.tilt + self.config.trim_tilt_deg
+            final_pan = cam_angles.pan + trim_p
+            final_tilt = cam_angles.tilt + trim_t
             return AlignmentResult(
                 angles=Angles(final_pan, final_tilt),
                 distance_m=self.config.nominal_distance_m,
                 distance_source="disabled",
                 parallax_pan_deg=0.0,
                 parallax_tilt_deg=0.0,
-                trim_pan_deg=self.config.trim_pan_deg,
-                trim_tilt_deg=self.config.trim_tilt_deg,
+                trim_pan_deg=trim_p,
+                trim_tilt_deg=trim_t,
             )
 
         distance_m, source = self.estimate_distance(target, frame_height_px)
@@ -158,9 +163,9 @@ class ExtrinsicParallaxModel:
         parallax_pan = gimbal_pan_deg - cam_angles.pan
         parallax_tilt = gimbal_tilt_deg - cam_angles.tilt
 
-        # Add user fine-tune trim
-        final_pan = gimbal_pan_deg + self.config.trim_pan_deg
-        final_tilt = gimbal_tilt_deg + self.config.trim_tilt_deg
+        # Add user fine-tune trim if requested
+        final_pan = gimbal_pan_deg + trim_p
+        final_tilt = gimbal_tilt_deg + trim_t
 
         return AlignmentResult(
             angles=Angles(final_pan, final_tilt),
@@ -168,6 +173,6 @@ class ExtrinsicParallaxModel:
             distance_source=source,
             parallax_pan_deg=parallax_pan,
             parallax_tilt_deg=parallax_tilt,
-            trim_pan_deg=self.config.trim_pan_deg,
-            trim_tilt_deg=self.config.trim_tilt_deg,
+            trim_pan_deg=trim_p,
+            trim_tilt_deg=trim_t,
         )
