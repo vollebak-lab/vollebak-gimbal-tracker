@@ -1,0 +1,82 @@
+camera:
+  source: 0
+  width: 640
+  height: 480
+  fps: 30
+  backend: v4l2
+
+detector:
+  type: person_model
+  model_path: models/yolov8n.onnx
+  backend: auto
+  input_width: 320
+  input_height: 320
+  confidence_threshold: 0.45
+  nms_threshold: 0.45
+  person_class_id: 0
+  center_of_mass_mode: torso_chest
+  torso_y_offset_ratio: 0.38
+  min_area: 800
+
+calibration:
+  path: calibration.json
+
+gimbal:
+  driver: waveshare_serial
+  serial_port: /dev/ttyUSB0
+  baud: 115200
+  pan_min: -30.0
+  pan_max: 30.0
+  tilt_min: -10.0
+  tilt_max: 15.0
+  home_pan: 0.0
+  home_tilt: 0.0
+  speed: 0
+  acceleration: 0
+
+tracking:
+  start_enabled: false
+  command_hz: 50.0
+  smoothing_alpha: 0.85
+  deadband_deg: 0.5
+  max_step_deg: 60.0
+  lost_hold_s: 0.35
+  park_after_s: 1.0
+
+laser_test:
+  enabled: true
+  gpio: 17
+  pulse_s: 0.1
+  cooldown_s: 2.0
+
+autonomous_tracker:
+  enabled: true
+  laser_auto_engage: false
+  lock_tolerance_deg: 1.2
+  lock_consecutive_frames: 3
+  max_engagement_slew_dps: 25.0
+  laser_max_continuous_s: 10.0
+  coast_timeout_s: 0.35
+  park_after_s: 1.0
+  laser_gpio: 17
+
+web:
+  host: 0.0.0.0
+  port: 8080
+  jpeg_quality: 82
+  fallback_demo: true
+
+alignment:
+  enabled: true
+  auto_range: true
+  offset_x_m: 0.1778  # 7.0 inches right
+  offset_y_m: 0.0254  # 1.0 inch above
+  offset_z_m: 0.0
+  nominal_distance_m: 3.6576  # 12.0 ft
+  min_distance_m: 1.0
+  max_distance_m: 15.0
+  human_height_m: 1.70
+  camera_vfov_deg: 52.0
+  trim_pan_deg: 0.0
+  trim_tilt_deg: 0.0
+

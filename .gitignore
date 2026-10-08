@@ -21,6 +21,9 @@ env/
 
 # Pytest
 .pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Rust
 target/
@@ -33,6 +36,7 @@ Thumbs.db
 # Model weights (large files — use Git LFS or download separately)
 models/*.pt
 models/*.onnx
+!models/spectral_combnet.onnx
 models/*.pth
 models/*.engine
 !models/.gitkeep
@@ -42,7 +46,22 @@ event_camera/
 *.tar.gz
 *.deb
 *.zip
+*.bin
+*.cd
+*.raw
 
 # Logs
 *.log
+logs/
 engagement_logs/
+
+# Local camera/gimbal state
+config/calibration.json
+captures/
+*.avi
+*.mp4
+.env
+.pi-ssh/
+.runtime/
+.edge-qa*/
+dashboard-qa*.png

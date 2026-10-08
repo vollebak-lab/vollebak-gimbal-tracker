@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vollebak-gimbal-tracker"
+version = "0.1.0"
+description = "Fixed-camera target tracking for a Waveshare two-axis serial gimbal on Raspberry Pi 5"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24,<3",
+  "pyserial>=3.5,<4",
+  "PyYAML>=6,<7",
+  "scipy>=1.11,<2",
+]
+
+[project.optional-dependencies]
+vision = [
+  "opencv-python>=4.8,<5",
+  "pygrabber==0.2; platform_system == 'Windows'",
+]
+dev = ["pytest>=8,<9", "ruff>=0.8,<1"]
+
+[project.scripts]
+gimbal-tracker = "vollebak_gimbal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vollebak_gimbal = ["web_assets/*.html", "web_assets/*.css", "web_assets/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+  "models",
+  "src/imu",
+  "src/layer1_neuromorphic",
+  "src/layer2_radar",
+  "src/layer3_fusion",
+  "src/layer4_engagement",
+  "src/layer5_cooperative",
+  "tests/test_predator_pipeline.py",
+]

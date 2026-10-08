@@ -1,0 +1,53 @@
+camera:
+  source: 0
+  width: 640
+  height: 480
+  fps: 30
+  backend: dshow             # More stable than Windows Media Foundation for MX Brio.
+
+event_camera:
+  enabled: true
+  base_url: http://127.0.0.1:8081
+  poll_interval_s: 0.25
+  timeout_s: 1.0
+  track_targets: true       # Safe here because the development gimbal driver is mock.
+  pan_offset_deg: 0.0
+  tilt_offset_deg: 0.0
+
+detector:
+  type: motion
+  min_area: 1400
+  history: 300
+  threshold: 32
+  warmup_frames: 20
+
+calibration:
+  path: mock-calibration.json
+
+gimbal:
+  driver: mock
+  serial_port: COM3
+  baud: 115200
+  pan_min: -180.0
+  pan_max: 180.0
+  tilt_min: -30.0
+  tilt_max: 90.0
+  home_pan: 0.0
+  home_tilt: 0.0
+  speed: 60
+  acceleration: 20
+
+tracking:
+  start_enabled: true       # Development uses the mock driver, so auto-start is safe.
+  command_hz: 10.0
+  smoothing_alpha: 0.30
+  deadband_deg: 1.0
+  max_step_deg: 5.0
+  lost_hold_s: 1.0
+  park_after_s: 4.0
+
+laser_test:
+  enabled: false
+  gpio: 17
+  pulse_s: 0.1
+  cooldown_s: 2.0

@@ -3,7 +3,10 @@
 #include <cmath>
 #include <random>
 #include <cassert>
+#include <complex>
+#include <stdexcept>
 #include "flicker_dsp.hpp"
+#include "spectral_gate.hpp"
 
 // Unit test 1: Drone Blade Passage Frequency (4000 Hz sampling, 140 Hz BPF / 4200 RPM, 512 samples)
 void test_pure_harmonic_signal() {
@@ -202,31 +205,33 @@ void test_global_common_mode_and_tracking() {
     predator::SpatialFlickerClusterer::reset_tracker();
 
     std::vector<predator::FlickerDetectionResult> raw_detections;
-    
-    // Simulate 20 patches across the entire screen all reporting ~120 Hz (e.g. 120Hz LED ambient light spanning 600px)
-    for (int i = 0; i < 20; ++i) {
+
+    // Candidates as emitted by the Phase 33.5 GPU detector: every one passed the CFAR gate, so
+    // SNR >= ~13 dB and confidence ~0.7; patch indices are consistent with the centroid (40 px grid).
+    auto make_candidate = [](double f_hz, int cx, int cy) {
         predator::FlickerDetectionResult d;
         d.is_drone_detected = true;
-        d.fundamental_bpf_hz = 120.0 + (i % 2) * 0.5;
-        d.centroid_px_x = (i % 5) * 200; // Spans 0 to 800 px
-        d.centroid_px_y = (i / 5) * 150; // Spans 0 to 450 px
-        raw_detections.push_back(d);
+        d.fundamental_bpf_hz = f_hz;
+        d.centroid_px_x = cx;
+        d.centroid_px_y = cy;
+        d.patch_x = cx / 40;
+        d.patch_y = cy / 40;
+        d.peak_snr_db = 14.0;
+        d.confidence = 0.70;
+        d.spectral_flatness = 0.30;
+        return d;
+    };
+
+    // Simulate 20 patches across the entire screen all reporting ~120 Hz (e.g. 120Hz LED ambient light spanning 600px)
+    for (int i = 0; i < 20; ++i) {
+        raw_detections.push_back(make_candidate(120.0 + (i % 2) * 0.5,
+                                                100 + (i % 5) * 200,    // Spans 100 to 900 px
+                                                100 + (i / 5) * 150));  // Spans 100 to 550 px
     }
 
-    // Add 2 overlapping pooled patches from the same localized drone rotor at 260 Hz
-    predator::FlickerDetectionResult drone1, drone2;
-    drone1.is_drone_detected = true;
-    drone1.fundamental_bpf_hz = 260.0;
-    drone1.centroid_px_x = 400;
-    drone1.centroid_px_y = 300;
-    
-    drone2.is_drone_detected = true;
-    drone2.fundamental_bpf_hz = 261.0;
-    drone2.centroid_px_x = 420; // 20 pixels away
-    drone2.centroid_px_y = 310;
-
-    raw_detections.push_back(drone1);
-    raw_detections.push_back(drone2);
+    // Add 2 overlapping pooled patches from the same localized drone rotor at 260 Hz (20 px apart)
+    raw_detections.push_back(make_candidate(260.0, 400, 300));
+    raw_detections.push_back(make_candidate(261.0, 420, 310));
 
     // Frame 1: Tentative (0 confirmed)
     auto f1 = predator::SpatialFlickerClusterer::filter_and_cluster(raw_detections, 6);
@@ -249,12 +254,12 @@ void test_global_common_mode_and_tracking() {
     std::cout << "PASSED! (Spatial dispersion rejected ambient light, 3-hit confirmation validated, and coasted across dropout)\n";
 }
 
-// Unit test 9: Lens Bearing Geometry
+// Unit test 9: Lens Bearing Geometry (12mm f/2.0 M12 Lens)
 void test_lens_bearing_geometry() {
-    std::cout << "[TEST 9] Testing Edmund Optics 8mm f/8 M12 Lens Bearing Geometry... ";
+    std::cout << "[TEST 9] Testing 12mm f/2.0 M12 Lens Bearing Geometry... ";
     
     predator::LensParameters lens;
-    lens.focal_length_mm = 8.0;
+    lens.focal_length_mm = 12.0;
     lens.pixel_pitch_um = 4.86;
     lens.sensor_width = 1280;
     lens.sensor_height = 720;
@@ -265,10 +270,10 @@ void test_lens_bearing_geometry() {
     assert(std::abs(az) < 1e-4);
     assert(std::abs(el) < 1e-4);
 
-    // Top-Right corner (1280, 0)
+    // Top-Right corner (1280, 0) -> HFOV/2 = ~14.53 deg, VFOV/2 = ~8.29 deg
     lens.pixel_to_angles(1280.0, 0.0, az, el);
-    assert(az > 20.0 && az < 23.0); // Expect ~21.2 deg
-    assert(el > 11.0 && el < 14.0); // Expect ~12.3 deg
+    assert(az > 13.5 && az < 15.5); // Expect ~14.53 deg
+    assert(el > 7.5 && el < 9.0);   // Expect ~8.29 deg
 
     std::cout << "PASSED! (Center: [0, 0] deg | Corner: [" << az << ", " << el << "] deg)\n";
 }
@@ -381,6 +386,246 @@ void test_shaded_multirotor_fusion() {
               << "] | Unified Confidence: " << f3[0].confidence << ")\n";
 }
 
+// Unit test 12: Micro-Neighborhood Recurrent Periodicity Sieve (HelixTrack / FrequencyCam Core)
+void test_micro_neighborhood_periodicity_sieve() {
+    std::cout << "[TEST 12] Testing Micro-Neighborhood Periodicity Sieve (Rotor vs Ego-Motion Edge vs Wind Trees)... ";
+    
+    predator::MicroNeighborhoodPeriodicitySieve sieve(1280, 720, 70.0, 800.0);
+
+    // 1. Test Drone Rotor Blade Chops (140 Hz BPF => T = 7142 us)
+    int drone_x = 640;
+    int drone_y = 360;
+    int drone_passed = 0;
+    int drone_total = 50; // 50 blade passages = ~350ms
+    for (int i = 0; i < drone_total; ++i) {
+        uint64_t t = 1000000 + i * 7142;
+        // Blade tip micro-jitter (+- 1 pixel)
+        int px = drone_x + (i % 2);
+        int py = drone_y + ((i + 1) % 2);
+        if (sieve.is_periodic_event(px, py, t)) {
+            drone_passed++;
+        }
+    }
+    // After 1 initial priming event, 100% of periodic blade sweeps must pass
+    assert(drone_passed >= 48);
+
+    // 2. Test Single-Shot Ego-Motion Moving Contrast Edge (Sweeping across sensor at 20 deg/s)
+    sieve.reset();
+    int edge_passed = 0;
+    int edge_total = 100;
+    for (int i = 0; i < edge_total; ++i) {
+        // Edge moves horizontally: pixel changes every 1ms (1000 us)
+        int ex = 100 + i * 4; // moves to next tile
+        int ey = 200;
+        uint64_t t = 2000000 + i * 1000;
+        // Each tile sees only 1 edge entry
+        if (sieve.is_periodic_event(ex, ey, t)) {
+            edge_passed++;
+        }
+    }
+    // Moving edge non-repeating steps must be 100% rejected!
+    assert(edge_passed == 0);
+
+    // 3. Test Windblown Foliage Sway (3 Hz sway => T = 333,333 us)
+    sieve.reset();
+    int tree_passed = 0;
+    int tree_total = 30;
+    for (int i = 0; i < tree_total; ++i) {
+        int tx = 800;
+        int ty = 400;
+        uint64_t t = 3000000 + i * 333333; // 3 Hz leaf flutter
+        if (sieve.is_periodic_event(tx, ty, t)) {
+            tree_passed++;
+        }
+    }
+    // Slow foliage sway (> 14.3ms period) must be 100% rejected!
+    assert(tree_passed == 0);
+
+    // 4. Test Sparse Random Thermal Shot Noise
+    sieve.reset();
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> rand_x(0, 1279);
+    std::uniform_int_distribution<int> rand_y(0, 719);
+    std::uniform_int_distribution<uint64_t> rand_dt(50, 50000);
+    int noise_passed = 0;
+    int noise_total = 1000;
+    uint64_t cur_t = 4000000;
+    for (int i = 0; i < noise_total; ++i) {
+        cur_t += rand_dt(rng);
+        if (sieve.is_periodic_event(rand_x(rng), rand_y(rng), cur_t)) {
+            noise_passed++;
+        }
+    }
+    // Random shot noise should have < 2% accidental pass rate
+    assert(noise_passed < 20);
+
+    std::cout << "PASSED! (Drone Pass: " << drone_passed << "/" << drone_total 
+              << " | Ego-Motion Edge Rej: " << (edge_total - edge_passed) << "/" << edge_total
+              << " | Tree Sway Rej: " << (tree_total - tree_passed) << "/" << tree_total
+              << " | Noise Rej: " << (noise_total - noise_passed) << "/" << noise_total << ")\n";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 33.5: CFAR gate statistics. Spectra are produced exactly like the runtime: 512 bins of
+// 250 us event counts -> symmetric Hann (N-1 = 511) -> rFFT -> |X|^2.
+// ---------------------------------------------------------------------------------------------
+namespace cfar_test {
+
+/// In-place iterative radix-2 complex FFT (n must be a power of two).
+static void fft_inplace(std::vector<std::complex<double>>& a) {
+    const size_t n = a.size();
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    for (size_t len = 2; len <= n; len <<= 1) {
+        const double ang = -2.0 * M_PI / static_cast<double>(len);
+        const std::complex<double> wl(std::cos(ang), std::sin(ang));
+        for (size_t i = 0; i < n; i += len) {
+            std::complex<double> w(1.0, 0.0);
+            for (size_t k = 0; k < len / 2; ++k) {
+                const std::complex<double> u = a[i + k], v = a[i + k + len / 2] * w;
+                a[i + k] = u + v;
+                a[i + k + len / 2] = u - v;
+                w *= wl;
+            }
+        }
+    }
+}
+
+/// Power spectrum (257 bins) of a 512-sample count series, runtime-identical windowing.
+static std::vector<float> power_spectrum(const std::vector<double>& counts) {
+    std::vector<std::complex<double>> a(512);
+    for (int i = 0; i < 512; ++i) {
+        const double w = 0.5 * (1.0 - std::cos(2.0 * M_PI * i / 511.0));
+        a[i] = std::complex<double>(counts[i] * w, 0.0);
+    }
+    fft_inplace(a);
+    std::vector<float> p(predator::kSpectrumBins);
+    for (int k = 0; k < predator::kSpectrumBins; ++k) p[k] = static_cast<float>(std::norm(a[k]));
+    return p;
+}
+
+/// Poisson background with optional rate modulation lambda(t) = bg + sum_h amp_h * (1 + cos(2 pi h f t)).
+static std::vector<double> poisson_counts(std::mt19937& rng, double bg_per_bin, double f_hz,
+                                          const std::vector<double>& harmonic_amps) {
+    std::vector<double> c(512);
+    for (int i = 0; i < 512; ++i) {
+        const double t = i * 250e-6;
+        double lam = bg_per_bin;
+        for (size_t h = 0; h < harmonic_amps.size(); ++h) {
+            lam += harmonic_amps[h] * (1.0 + std::cos(2.0 * M_PI * (h + 1) * f_hz * t));
+        }
+        std::poisson_distribution<int> pd(lam);
+        c[i] = pd(rng);
+    }
+    return c;
+}
+
+}  // namespace cfar_test
+
+void test_cfar_gate_statistics() {
+    std::cout << "[TEST 13] CFAR Gate: False-Alarm Bound & Detection (Phase 33.5)... ";
+    using namespace predator;
+
+    // (a) Default derivation: 6 FA/h over 1152 cells x bins 14..128 (110-1000 Hz) at 4 kHz / 512. The OS-CFAR
+    // threshold must exceed the known-noise-mean threshold ln(N/Pfa) (estimator loss is real) and
+    // stay within a few dB of it.
+    const SpectralGateConfig def = derive_spectral_gate(SpectralGateConfig{}, 4000.0, 512, 1152);
+    assert(def.min_bin == 14 && def.max_bin == 128);
+    const double n_search_bins = static_cast<double>(def.max_bin - def.min_bin + 1);
+    const double known_noise_eta = std::log(1152.0 * n_search_bins / (6.0 * 0.128 / 3600.0));
+    assert(def.cfar_threshold > known_noise_eta);
+    assert(def.cfar_threshold_db < 10.0 * std::log10(known_noise_eta) + 4.0);
+
+    // Invalid configurations are rejected, not silently clamped.
+    bool threw = false;
+    try { SpectralGateConfig bad; bad.false_alarms_per_hour = 0.0f; derive_spectral_gate(bad, 4000.0, 512, 1152); }
+    catch (const std::invalid_argument&) { threw = true; }
+    assert(threw);
+
+    // (b) Empirical FA vs analytic bound. Budget chosen so the per-cell bound is 5% (measurable):
+    // per-cell P(pass) <= N_bins * exp(-eta) = 0.05 with min_sharpness = 1 (pure CFAR statistic).
+    std::mt19937 rng(1234);
+    const int n_trials = 4000;
+    SpectralGateConfig loose;
+    loose.min_sharpness = 1.0f;
+    loose.false_alarms_per_hour = static_cast<float>(0.05 * 3600.0 / 0.128);  // per-window Pfa = 0.05
+    loose = derive_spectral_gate(loose, 4000.0, 512, 1);
+    int loose_pass = 0, default_pass = 0, legacy_5p5db = 0;
+    for (int i = 0; i < n_trials; ++i) {
+        const auto p = cfar_test::power_spectrum(cfar_test::poisson_counts(rng, 0.5, 0.0, {}));
+        const auto gl = evaluate_spectral_gate(p.data(), 256.0f, 0, 0.0f, loose);
+        if (gl.verdict == GateVerdict::Pass) ++loose_pass;
+        if (gl.snr_db >= 5.5f) ++legacy_5p5db;  // Phase 32 effective threshold (D3)
+        if (evaluate_spectral_gate(p.data(), 256.0f, 0, 0.0f, def).verdict == GateVerdict::Pass) ++default_pass;
+    }
+    const double loose_rate = static_cast<double>(loose_pass) / n_trials;
+    const double sigma = std::sqrt(0.05 * 0.95 / n_trials);
+    assert(loose_rate <= 0.05 + 3.0 * sigma);   // union bound holds on real Hann/Poisson spectra
+    assert(default_pass == 0);                  // default budget: silent on pure noise
+    assert(legacy_5p5db > n_trials / 2);        // documents why Phase 32 flooded with candidates
+
+    // Expected periodogram SNR for lambda(t) = bg + A (1 + cos 2 pi f t), Hann (sum w = 255.5,
+    // sum w^2 = 191.6): peak ~ (A/2 * 255.5)^2 * scallop (0.81 worst case at 0.4-0.6 bin offset),
+    // noise mean ~ (bg + A) * 191.6.
+
+    // (c) Detection: 200 Hz, A = 1.5 on bg 0.5 -> ~29700 / ~383 = ~77 (~19 dB) vs ~14 dB threshold.
+    std::mt19937 rng2(99);
+    int detected = 0;
+    double max_err_hz = 0.0;
+    for (int i = 0; i < 50; ++i) {
+        const auto p = cfar_test::power_spectrum(cfar_test::poisson_counts(rng2, 0.5, 200.0, {1.5}));
+        const auto g = evaluate_spectral_gate(p.data(), 1000.0f, 0, 0.0f, def);
+        if (g.verdict == GateVerdict::Pass) {
+            ++detected;
+            max_err_hz = std::max(max_err_hz, std::abs(g.fundamental_hz - 200.0));
+        }
+    }
+    assert(detected >= 48 && max_err_hz < 4.0);
+
+    // Single-window limit (printed, not asserted): A = 0.25 gives ~7 dB, below any threshold that
+    // meets the false-alarm budget. Such targets need multi-window integration (track-before-detect).
+    std::mt19937 rng_weak(5);
+    int weak_detected = 0;
+    for (int i = 0; i < 50; ++i) {
+        const auto p = cfar_test::power_spectrum(cfar_test::poisson_counts(rng_weak, 0.5, 200.0, {0.25}));
+        if (evaluate_spectral_gate(p.data(), 400.0f, 0, 0.0f, def).verdict == GateVerdict::Pass) ++weak_detected;
+    }
+
+    // (d) 2nd harmonic dominant (common for 2-blade props at off-axis views). 150 Hz (bin 19.2,
+    // scallop ~0.95) A1 = 1.1; 300 Hz (bin 38.4, scallop ~0.81) A2 = 1.6. Harmonic power is ~1.8x
+    // the fundamental (strongest line = detection statistic, ~17 dB); the fundamental line itself
+    // is ~14 dB (>= 10 dB floor) and ~0.55x the peak (>= 0.04), so it must be reported as 150 Hz.
+    std::mt19937 rng3(7);
+    int harm_ok = 0;
+    std::vector<SpectralGateResult> harm_results;
+    for (int i = 0; i < 50; ++i) {
+        const auto p = cfar_test::power_spectrum(cfar_test::poisson_counts(rng3, 0.5, 150.0, {1.1, 1.6}));
+        const auto g = evaluate_spectral_gate(p.data(), 1000.0f, 0, 0.0f, def);
+        harm_results.push_back(g);
+        if (g.verdict == GateVerdict::Pass && std::abs(g.fundamental_hz - 150.0) < 4.0) ++harm_ok;
+    }
+    if (harm_ok < 45) {
+        std::cerr << "\n  harmonic-dominant diagnostics (" << harm_ok << "/50 ok):\n";
+        for (size_t i = 0; i < 12 && i < harm_results.size(); ++i) {
+            const auto& g = harm_results[i];
+            std::cerr << "    " << gate_verdict_name(g.verdict) << " peak_bin=" << g.peak_bin
+                      << " fund_bin=" << g.fund_bin << " f0=" << g.fundamental_hz << " Hz snr=" << g.snr_db
+                      << " dB sharp=" << g.sharpness << "\n";
+        }
+    }
+    assert(harm_ok >= 45);
+
+    std::cout << "PASSED! (eta=" << def.cfar_threshold_db << " dB | noise FA: loose " << loose_rate
+              << " <= 0.05 bound, default " << default_pass << "/" << n_trials
+              << ", legacy 5.5 dB would pass " << legacy_5p5db << "/" << n_trials
+              << " | 200 Hz det " << detected << "/50 (7 dB case " << weak_detected
+              << "/50) | harmonic-dominant " << harm_ok << "/50)\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "  Predator — Frequency-Domain DSP Unit Verification     \n";
@@ -397,9 +642,11 @@ int main() {
     test_lens_bearing_geometry();
     test_floodlight_drone_coexistence();
     test_shaded_multirotor_fusion();
+    test_micro_neighborhood_periodicity_sieve();
+    test_cfar_gate_statistics();
 
     std::cout << "========================================================\n";
-    std::cout << "  ALL 11 MATHEMATICAL DSP UNIT TESTS PASSED SUCCESSFULLY!\n";
+    std::cout << "  ALL 13 MATHEMATICAL DSP UNIT TESTS PASSED SUCCESSFULLY!\n";
     std::cout << "========================================================\n";
     return 0;
 }

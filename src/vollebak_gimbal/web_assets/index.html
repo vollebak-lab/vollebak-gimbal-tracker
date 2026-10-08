@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090b0a">
+    <title>Predator Observation Console</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand" aria-label="Predator Observation Console">
+        <span class="brand-mark">V</span>
+        <div>
+          <span class="eyebrow">VOLLEBAK SYSTEMS / PREDATOR</span>
+          <h1>OBSERVATION CONSOLE <small>/ PI 5</small></h1>
+        </div>
+      </div>
+      <div class="system-badges" aria-live="polite">
+        <span class="badge safe">OBSERVATION ONLY</span>
+        <span class="badge" id="driverBadge">DRIVER &middot; &mdash;</span>
+        <span class="badge" id="cameraBadge">CAMERA &middot; CONNECTING</span>
+        <span class="badge accent" id="statusBadge">SYSTEM &middot; STARTING</span>
+      </div>
+    </header>
+
+    <main class="dashboard">
+      <section class="panel camera-panel" aria-labelledby="cameraTitle">
+        <div class="panel-heading">
+          <div>
+            <span class="panel-index">01 // PASSIVE VISION</span>
+            <h2 id="cameraTitle">Observer camera</h2>
+          </div>
+          <div class="feed-tools">
+            <div class="feed-switch" role="group" aria-label="Camera feed">
+              <button class="active" id="rgbFeedButton" type="button">LOGITECH</button>
+              <button id="eventFeedButton" type="button" disabled>IMX636 EVENT</button>
+            </div>
+            <div class="metric"><span id="fpsValue">0.0</span><small>FPS</small></div>
+          </div>
+        </div>
+        <div class="camera-stage" id="cameraStage">
+          <img id="cameraFeed" src="/stream.mjpg" alt="Live camera with target tracking overlay">
+          <div class="target-reticle" id="targetReticle" aria-hidden="true"><i></i></div>
+          <div class="corner corner-tl"></div><div class="corner corner-tr"></div>
+          <div class="corner corner-bl"></div><div class="corner corner-br"></div>
+          <div class="scanline"></div>
+          <span class="live-label"><i></i><span id="feedMode">WAITING</span></span>
+          <span class="click-hint" id="clickHint">CLICK FEED TO AIM</span>
+        </div>
+        <div class="vision-footer">
+          <div><span>INPUT</span><strong id="resolutionValue">&mdash;</strong></div>
+          <div><span>TARGET</span><strong id="targetValue">NONE</strong></div>
+          <div><span>CALIBRATION</span><strong id="calibrationValue">&mdash;</strong></div>
+          <div><span>EVENT RATE</span><strong id="eventRateValue">OFFLINE</strong></div>
+        </div>
+      </section>
+
+      <section class="panel twin-panel" aria-labelledby="twinTitle">
+        <div class="panel-heading">
+          <div>
+            <span class="panel-index">02 // DIGITAL TWIN</span>
+            <h2 id="twinTitle">Two-axis simulation</h2>
+          </div>
+          <div class="mode-chip" id="modeChip">SAFE / MOCK</div>
+        </div>
+        <canvas id="twinCanvas" width="720" height="390" aria-label="Gimbal pan and tilt visualization"></canvas>
+        <div class="angles">
+          <div class="angle-card">
+            <span>PAN / X</span>
+            <strong id="panValue">+000.0&deg;</strong>
+            <div class="range-track"><i id="panTrack"></i></div>
+            <small id="panLimits">-180&deg; &mdash; +180&deg;</small>
+          </div>
+          <div class="angle-card">
+            <span>TILT / Y</span>
+            <strong id="tiltValue">+00.0&deg;</strong>
+            <div class="range-track"><i id="tiltTrack"></i></div>
+            <small id="tiltLimits">-30&deg; &mdash; +90&deg;</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel control-panel" aria-labelledby="controlTitle">
+        <div class="panel-heading compact">
+          <div>
+            <span class="panel-index">03 // POINTING</span>
+            <h2 id="controlTitle">Gimbal console</h2>
+          </div>
+        </div>
+        <div class="primary-actions">
+          <button class="button button-primary" id="trackingButton" data-testid="tracking-toggle">PAUSE TRACKING</button>
+          <button class="button" id="homeButton" data-testid="home-button">RETURN HOME</button>
+        </div>
+        <div class="primary-actions" style="margin-top: 8px;">
+          <button class="button button-danger" id="autoLaserButton" data-testid="auto-laser-toggle">AUTO LASER: ARMED</button>
+        </div>
+        <div class="laser-test-control">
+          <button class="button button-danger" id="laserTestButton" type="button" disabled>LASER TEST PULSE &middot; 0.1 S</button>
+          <small>PHYSICAL ARM REQUIRED / TRACKING MUST BE PAUSED / AUTOMATIC OFF</small>
+        </div>
+
+        <div class="alignment-box" aria-labelledby="alignmentTitle">
+          <div class="alignment-header">
+            <span class="panel-index" id="alignmentTitle">ALIGNMENT // PARALLAX TRIM</span>
+            <div class="alignment-badges">
+              <span class="trim-badge" id="alignmentDistanceBadge">12.0 FT</span>
+              <span class="trim-badge" id="alignmentParallaxBadge">P -2.8&deg; T -0.4&deg;</span>
+            </div>
+          </div>
+          <div class="trim-control-row">
+            <div class="slider-control trim-slider">
+              <label for="trimPanRange"><span>PAN TRIM</span><output id="trimPanOutput">0.0&deg;</output></label>
+              <div class="slider-with-nudges">
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="-0.5">-0.5&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="-0.1">-0.1&deg;</button>
+                <input id="trimPanRange" type="range" min="-15" max="15" step="0.1" value="0">
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="0.1">+0.1&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="pan" data-step="0.5">+0.5&deg;</button>
+              </div>
+            </div>
+            <div class="slider-control trim-slider">
+              <label for="trimTiltRange"><span>TILT TRIM</span><output id="trimTiltOutput">0.0&deg;</output></label>
+              <div class="slider-with-nudges">
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="-0.5">-0.5&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="-0.1">-0.1&deg;</button>
+                <input id="trimTiltRange" type="range" min="-10" max="10" step="0.1" value="0">
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="0.1">+0.1&deg;</button>
+                <button type="button" class="nudge-btn" data-axis="tilt" data-step="0.5">+0.5&deg;</button>
+              </div>
+            </div>
+          </div>
+          <div class="alignment-actions" style="margin-top: 10px;">
+            <button class="button button-primary" id="lockAimButton" type="button" style="width: 100%; min-height: 38px;" title="Lock current manual gimbal aim directly onto the detected target crosshair">
+              CALIBRATE TO CROSSHAIR
+            </button>
+          </div>
+          <div class="alignment-meta">
+            <small>BASELINE: &Delta;X +7.0" (RIGHT) / &Delta;Y +1.0" (UP) &middot; <span id="alignmentSource">AUTO BBOX RANGE</span></small>
+            <button class="button button-subtle" id="resetTrimButton" type="button">ZERO TRIM</button>
+          </div>
+        </div>
+
+        <div class="manual-grid" aria-label="Manual gimbal nudges">
+          <span></span><button data-pan="0" data-tilt="5" aria-label="Tilt up 5 degrees">&uarr;</button><span></span>
+          <button data-pan="-5" data-tilt="0" aria-label="Pan left 5 degrees">&larr;</button>
+          <button class="center-button" id="centerButton" aria-label="Center gimbal">&#9678;</button>
+          <button data-pan="5" data-tilt="0" aria-label="Pan right 5 degrees">&rarr;</button>
+          <span></span><button data-pan="0" data-tilt="-5" aria-label="Tilt down 5 degrees">&darr;</button><span></span>
+        </div>
+
+        <div class="slider-control">
+          <label for="panRange"><span>PAN SETPOINT</span><output id="panOutput">0&deg;</output></label>
+          <input id="panRange" type="range" min="-180" max="180" step="1" value="0">
+        </div>
+        <div class="slider-control">
+          <label for="tiltRange"><span>TILT SETPOINT</span><output id="tiltOutput">0&deg;</output></label>
+          <input id="tiltRange" type="range" min="-30" max="90" step="1" value="0">
+        </div>
+        <button class="button button-wide" id="sendButton">SEND MANUAL SETPOINT</button>
+
+        <div class="event-log" aria-live="polite">
+          <span class="panel-index">EVENT STREAM</span>
+          <ol id="eventLog"><li><time>--:--:--</time> Waiting for system state...</li></ol>
+        </div>
+      </section>
+
+      <section class="panel telemetry-panel" aria-labelledby="pipelineTitle">
+        <div class="panel-heading">
+          <div>
+            <span class="panel-index">04 // BART PIPELINE INTEGRATION</span>
+            <h2 id="pipelineTitle">Sensor and fusion readiness</h2>
+          </div>
+          <div class="mode-chip safe-mode" id="safetyMode">ENGAGEMENT HARD DISABLED</div>
+        </div>
+        <div class="pipeline-grid">
+          <article class="layer-card">
+            <header><span>L1</span><strong>PASSIVE VISION</strong><i id="l1Status">SEARCH</i></header>
+            <dl>
+              <div><dt>SENSOR</dt><dd id="l1Sensor">USB RGB</dd></div>
+              <div><dt>DETECTOR</dt><dd id="l1Detector">MOTION</dd></div>
+              <div><dt>EVENT CAM</dt><dd id="l1Event">NOT CONNECTED</dd></div>
+              <div><dt>BPF / RPM / SNR</dt><dd id="flickerStats">N/A</dd></div>
+              <div><dt>IMU / COMBNET</dt><dd id="neuralStats">OFFLINE / OFF</dd></div>
+              <div><dt>ROI CELLS / TRACKS</dt><dd id="roiStats">0 / 0</dd></div>
+            </dl>
+          </article>
+          <article class="layer-card muted-layer">
+            <header><span>L2</span><strong>RADAR</strong><i id="l2Status">NOT CONNECTED</i></header>
+            <dl>
+              <div><dt>SENSOR</dt><dd id="l2Sensor">UHNDER S80</dd></div>
+              <div><dt>TELEMETRY</dt><dd>OFFLINE</dd></div>
+              <div><dt>SIMULATION</dt><dd id="l2Simulation">OFF</dd></div>
+              <div><dt>RANGE</dt><dd>N/A</dd></div>
+            </dl>
+          </article>
+          <article class="layer-card">
+            <header><span>L3</span><strong>TRACK FUSION</strong><i id="l3Status">STANDBY</i></header>
+            <dl>
+              <div><dt>MODE</dt><dd id="l3Mode">RGB BEARING-ONLY</dd></div>
+              <div><dt>TRACKS</dt><dd id="trackCount">0</dd></div>
+              <div><dt>AZ / EL</dt><dd id="trackAngles">N/A</dd></div>
+              <div><dt>CONFIDENCE</dt><dd id="trackConfidence">N/A</dd></div>
+            </dl>
+          </article>
+          <article class="layer-card">
+            <header><span>L4</span><strong>GIMBAL POINTING</strong><i id="l4Status">SIMULATED</i></header>
+            <dl>
+              <div><dt>DRIVER</dt><dd id="l4Driver">MOCK</dd></div>
+              <div><dt>CONTROL</dt><dd id="l4Control">STARTING</dd></div>
+              <div><dt>ACTUATOR</dt><dd>2-AXIS GIMBAL</dd></div>
+              <div><dt>ENGAGEMENT</dt><dd class="hard-off">UNAVAILABLE</dd></div>
+            </dl>
+          </article>
+        </div>
+        <div class="integration-strip">
+          <span>PROFILE <b id="profileValue">RASPBERRY_PI_5_OBSERVER</b></span>
+          <span>UPSTREAM <b id="upstreamValue">vollebak-lab/predator @ 032be3d</b></span>
+          <span>RUNTIME <b>LOCAL / NO CLOUD</b></span>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>RASPBERRY PI 5 / WAVESHARE 2-AXIS / LOGITECH + IDS IMX636</span>
+      <span>PASSIVE OBSERVATION + GIMBAL POINTING</span>
+    </footer>
+    <div class="toast" id="toast" role="status"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
