@@ -696,5 +696,32 @@ Because the IDS UE-39B0XCP uses the exact Cypress CX3 Treuzell board streaming p
     - Real-time live log verification: `CombNet: eval=7 det=4 (p_max=1.00)` actively locking shaded tracks (`[TENT+NET] BPF=211.5 Hz, 6345 RPM`).
     - Web telemetry endpoint `/pipeline_stats` reporting `spectral_combnet_active: true`.
 
+---
 
-
+### 34. Laser-Camera Extrinsic Parallax Calibration & Real-Time Alignment Trim (Raspberry Pi 5)
+- **Problem Statement & Physical Geometry**:
+  - The stationary Logitech MX Brio camera detects the human target and paints a center-of-mass crosshair over the upper chest. However, the laser pointer mounted on the Waveshare pan/tilt gimbal was missing the crosshair due to physical mounting baseline displacement:
+    - $\Delta X = +7.0\text{ inches} = +0.1778\text{ m}$ (gimbal mounted to the right of camera lens center).
+    - $\Delta Y = +1.0\text{ inch} = +0.0254\text{ m}$ (gimbal mounted 1.0 inch higher than camera lens center).
+    - $\Delta Z \approx 0.0\text{ m}$ (coplanar mounting).
+    - Nominal standoff range: $12.0\text{ ft} \approx 3.66\text{ m}$.
+  - At $3.66\text{ m}$, baseline displacement generates a horizontal parallax convergence error of $\theta_{\text{pan}} \approx \arctan(-0.1778 / 3.66) \approx -2.78^\circ$ and vertical error of $\theta_{\text{tilt}} \approx \arctan(-0.0254 / 3.66) \approx -0.40^\circ$.
+- **Architectural Implementation**:
+  - Created `ExtrinsicParallaxModel` and `ExtrinsicAlignmentConfig` in `src/vollebak_gimbal/alignment.py`.
+  - Supports dynamic range estimation $Z_{\text{est}} = (f_y \cdot H_{\text{human}}) / h_{\text{bbox}}$ via pinhole model on YOLOv8 bounding boxes, with fallback to configurable `nominal_distance_m`.
+  - Computes 3D convergent ray transform:
+    $$X_g = Z \cdot \tan(\phi_x) - \Delta X, \quad Y_g = Z \cdot \tan(\phi_y) - \Delta Y$$
+    $$\theta_{\text{gimbal\_pan}} = \arctan2(X_g, Z_g) + \Delta\theta_{\text{trim\_pan}}$$
+    $$\theta_{\text{gimbal\_tilt}} = \arctan2(Y_g, Z_g) + \Delta\theta_{\text{trim\_tilt}}$$
+  - Integrated into `DashboardEngine` in `src/vollebak_gimbal/web.py` for continuous tracking and click-to-aim setpoints.
+  - Exposed `GET /api/alignment` and `POST /api/alignment` REST API for dynamic hot-reconfiguration.
+  - Upgraded video stream overlay with bottom status bar displaying live distance estimation, computed parallax angles, and manual trim values.
+  - Implemented interactive Web UI controls in `index.html`, `app.js`, and `app.css`:
+    - Live distance and parallax badges (`12.0 FT`, `P -2.8° T -0.4°`).
+    - Pan Trim and Tilt Trim range sliders with $[-0.5^\circ]$, $[-0.1^\circ]$, $[+0.1^\circ]$, $[+0.5^\circ]$ tactical nudge buttons.
+    - Zero Trim reset button.
+- **Verification & Deployment**:
+  - Added unit test suite `tests/test_alignment.py` covering serialization, convergent angular signs, distance scaling, bounding-box clamping, and dashboard API methods (6/6 tests passing).
+  - Executed full gimbal unit test suite on Raspberry Pi 5 hardware (`100.90.113.112`): **37/37 tests passing (100%)**.
+  - Deployed to `vollebak-gimbal.service` on Pi 5 (active PID 37465), verified live telemetry streaming at 14 FPS with active person detection at 95.4% confidence.
+  - Pushed commit `327a2d2` to branch `integration/pi5-gimbal-event-camera` updating PR #1 on GitHub.
